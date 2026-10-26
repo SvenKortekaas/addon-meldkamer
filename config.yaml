@@ -13,9 +13,8 @@ arch:
 image: "ghcr.io/cyberjunky/addon-meldkamer"
 startup: application
 boot: auto
+# MQTT TLS certificate files (mqtt.tls_ca / tls_cert / tls_keyfile)
 map:
-  - config:rw
-  - share:rw
   - ssl:ro
 udev: true
 usb: true
