@@ -452,7 +452,7 @@ automation:
 
 ## Requirements
 
-- Home Assistant with Supervisor
+- Home Assistant with Supervisor, on a 64-bit system (`amd64` or `aarch64`, e.g. a Raspberry Pi 4/5 running 64-bit Home Assistant OS)
 - RTL-SDR, HackRF One, or network access to rtl_tcp server
 - For zone filters, `distance_km`, events, announcements and health sensors: the add-on's Home Assistant API access (enabled by default)
 - Home Assistant 2026.9 or newer is recommended: the dashboard map loads its OpenStreetMap tiles through Home Assistant's built-in map tile proxy (older versions fall back to fetching tiles from OpenStreetMap via the add-on)

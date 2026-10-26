@@ -1,7 +1,10 @@
-ARG BUILD_FROM
-FROM $BUILD_FROM
+# https://contributors.home-assistant.io/apps/guides/dockerfile/
+ARG BUILD_FROM=ghcr.io/home-assistant/base:3.23
+FROM ${BUILD_FROM}
 
 ENV LANG=C.UTF-8
+# CMake 4 rejects the old cmake_minimum_required() of the SDR projects built below
+ARG CMAKE_POLICY_VERSION_MINIMUM=3.5
 # Time for the app to stop the SDR pipeline cleanly on shutdown (see __main__.py)
 ENV S6_SERVICES_GRACETIME=8000
 
@@ -97,25 +100,8 @@ WORKDIR /app
 # Set shell
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# Labels
-ARG BUILD_ARCH
-ARG BUILD_DATE
-ARG BUILD_DESCRIPTION
-ARG BUILD_NAME
-ARG BUILD_REF
-ARG BUILD_REPOSITORY
-ARG BUILD_VERSION
-
 LABEL \
-    io.hass.name="${BUILD_NAME}" \
-    io.hass.description="${BUILD_DESCRIPTION}" \
-    io.hass.arch="${BUILD_ARCH}" \
-    io.hass.type="addon" \
-    io.hass.version=${BUILD_VERSION} \
-    maintainer="cyberjunky" \
-    org.opencontainers.image.title="${BUILD_NAME}" \
-    org.opencontainers.image.description="${BUILD_DESCRIPTION}" \
-    org.opencontainers.image.source="https://github.com/${BUILD_REPOSITORY}" \
-    org.opencontainers.image.created=${BUILD_DATE} \
-    org.opencontainers.image.revision=${BUILD_REF} \
-    org.opencontainers.image.version=${BUILD_VERSION}
+    org.opencontainers.image.title="Meldkamer" \
+    org.opencontainers.image.description="P2000 FLEX pager decoder dashboard for Home Assistant" \
+    org.opencontainers.image.source="https://github.com/cyberjunky/addon-meldkamer" \
+    org.opencontainers.image.licenses="MIT"
