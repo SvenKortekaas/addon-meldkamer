@@ -1,7 +1,9 @@
 # Changelog
 
-## Unreleased
+## 1.2.2
 
+- The sensor filter in the top bar is a labelled, outlined control like the view tabs, so it stands out in every view.
+- Bigger Wallboard ticker (taller, 15 px message text over up to three lines) and a bigger clock.
 - Removed the unused `/config` and `/share` folder mappings (Supervisor warned about the deprecated `config` mapping); `/ssl` stays for MQTT TLS certificates.
 
 ## 1.2.1
