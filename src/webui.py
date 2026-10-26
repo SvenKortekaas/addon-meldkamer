@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
-import os
+import threading
 import time
 from collections import deque
 from datetime import UTC, datetime
@@ -13,9 +13,10 @@ from pathlib import Path
 import aiohttp
 from aiohttp import web
 
+from . import abbreviation_import, bag_import, capcode_import, vehicle_types
 from .database import Database
 from .decoder import Decoder
-from .ha_client import HAClientError
+from .ha_client import HAClient, HAClientError
 from .message import P2000Message
 from .processor import MessageProcessor
 from .sensor_manager import SensorManager
@@ -35,16 +36,10 @@ PHOTO_MIME_TYPES = ("image/jpeg", "image/png", "image/webp", "image/gif")
 
 ADDON_VERSION = "1.2.0"
 
-# Home Assistant core (2026.9+) proxies OpenStreetMap raster tiles itself via
-# its built-in map_tiles integration, identifying the requests the way OSM's
-# tile usage policy requires. Browsers loading tiles straight from OSM inside
-# the ingress iframe get 403 "Access blocked", so the dashboard asks us for
-# tiles and we fetch them from core through the Supervisor API proxy.
-HA_MAP_TILES_URL = "http://supervisor/core/api/map_tiles/raster/{z}/{x}/{y}.png"
-# Fallback for cores older than 2026.9, which have no map_tiles proxy: fetch
-# from OSM directly with an identifying User-Agent, as the policy asks.
-OSM_TILES_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-OSM_USER_AGENT = f"Meldkamer/{ADDON_VERSION} (+https://github.com/cyberjunky/addon-meldkamer)"
+# The dashboard's map tiles come from Home Assistant's built-in map_tiles proxy:
+# browsers loading tiles straight from OpenStreetMap inside the ingress iframe
+# get 403 "Access blocked", and core identifies its requests the way OSM's
+# tile usage policy requires.
 MAP_MAX_ZOOM = 19
 # OSM asks consumers to cache tiles for at least a week
 MAP_TILE_MAX_AGE = 7 * 24 * 60 * 60
@@ -146,6 +141,7 @@ class WebUI:
         processor: MessageProcessor,
         decoder: Decoder,
         sensor_manager: SensorManager,
+        ha_client: HAClient,
     ):
         self.port = port
         self.database = database
@@ -153,6 +149,7 @@ class WebUI:
         self.processor = processor
         self.decoder = decoder
         self.sensor_manager = sensor_manager
+        self.ha_client = ha_client
         self.app = web.Application(client_max_size=MAX_REQUEST_SIZE)
         self.messages: deque = deque(maxlen=MAX_MESSAGES)
         self.stats_file = get_stats_file()
@@ -160,10 +157,6 @@ class WebUI:
         self._last_stats_save = 0.0
         self._setup_routes()
         self._runner: web.AppRunner | None = None
-        self._tile_session: aiohttp.ClientSession | None = None
-        self._supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
-        # Cleared once core answers 404, i.e. it predates the map_tiles proxy
-        self._ha_map_tiles = bool(self._supervisor_token)
 
     def _tts_changed(self) -> None:
         """Apply edited TTS replacement rules right away."""
@@ -312,8 +305,6 @@ class WebUI:
     async def stop(self) -> None:
         """Stop the web server."""
         self._save_stats()
-        if self._tile_session and not self._tile_session.closed:
-            await self._tile_session.close()
         if self._runner:
             with contextlib.suppress(Exception):
                 await self._runner.cleanup()
@@ -380,7 +371,7 @@ class WebUI:
         }
 
     def update_db_stats(self, places: int, streets: int, capcodes: int, texts: int, geocodes: int) -> None:
-        """Update database statistics for Advanced tab."""
+        """Update database statistics for the Info tab."""
         self.stats["db_places"] = places
         self.stats["db_streets"] = streets
         self.stats["db_capcodes"] = capcodes
@@ -493,7 +484,7 @@ class WebUI:
                 ],
                 "ppm": decoder.ppm,
                 "calibration": decoder.calibration,
-                "can_apply": bool(self._supervisor_token),
+                "can_apply": self.ha_client.available,
             }
         )
 
@@ -746,34 +737,26 @@ class WebUI:
 
     async def _handle_list_provinces(self, request: web.Request) -> web.Response:
         """List available Dutch provinces for BAG import."""
-        from .bag_import import get_provinces
-
-        provinces = get_provinces()
+        provinces = bag_import.get_provinces()
         return web.json_response({"provinces": provinces})
 
     async def _handle_import_province(self, request: web.Request) -> web.Response:
         """Start BAG import for a specific Dutch province in background thread."""
 
         province = request.match_info.get("province", "")
-
-        import threading
-
-        from .bag_import import PROVINCES, get_import_progress, import_province_data, reset_progress
-
-        if province not in PROVINCES:
+        if province not in bag_import.PROVINCES:
             return web.json_response({"error": f"Unknown province '{province}'"}, status=400)
 
         # Check if already running
-        progress = get_import_progress()
-        if progress.get("running"):
+        if bag_import.get_import_progress().get("running"):
             return web.json_response({"error": "Import already in progress"}, status=400)
 
         # Reset progress BEFORE starting thread to avoid race condition
-        reset_progress(province)
+        bag_import.reset_progress(province)
 
         # Start import in background thread
         def run_import():
-            import_province_data(province, self.database)
+            bag_import.import_province_data(province, self.database)
 
         thread = threading.Thread(target=run_import, daemon=True)
         thread.start()
@@ -783,22 +766,16 @@ class WebUI:
 
     async def _handle_import_all_places(self, request: web.Request) -> web.Response:
         """Import ALL Dutch woonplaatsen (places) into database."""
-
-        import threading
-
-        from .bag_import import get_import_progress, import_all_places, reset_progress
-
         # Check if already running
-        progress = get_import_progress()
-        if progress.get("running"):
+        if bag_import.get_import_progress().get("running"):
             return web.json_response({"error": "Import already in progress"}, status=400)
 
         # Reset progress BEFORE starting thread so the first poll can't see the previous run's result
-        reset_progress("all places")
+        bag_import.reset_progress("all places")
 
         # Start import in background thread
         def run_import():
-            import_all_places(self.database)
+            bag_import.import_all_places(self.database)
             # Update stats after import
             stats = self.database.get_stats()
             self.update_db_stats(
@@ -812,30 +789,21 @@ class WebUI:
 
     async def _handle_bag_progress(self, request: web.Request) -> web.Response:
         """Get current BAG import progress."""
-        from .bag_import import get_import_progress
-
-        progress = get_import_progress()
-        return web.json_response(progress)
+        return web.json_response(bag_import.get_import_progress())
 
     async def _handle_import_bommel(self, request: web.Request) -> web.Response:
         """Start capcode import from bommel.net in background thread."""
-
-        import threading
-
-        from .capcode_import import get_import_progress, import_all_capcodes, reset_progress
-
         # Check if already running
-        progress = get_import_progress()
-        if progress.get("running"):
+        if capcode_import.get_import_progress().get("running"):
             return web.json_response({"error": "Import already in progress"}, status=400)
 
         # Reset progress BEFORE starting thread to avoid race condition
-        reset_progress()
+        capcode_import.reset_progress()
 
         # Start import in background thread
         def run_import():
-            import_all_capcodes(self.database)
-            # Refresh DB counts so the Advanced tab updates right away
+            capcode_import.import_all_capcodes(self.database)
+            # Refresh DB counts so the Info tab updates right away
             stats = self.database.get_stats()
             self.update_db_stats(
                 stats["places"], stats["streets"], stats["capcodes"], stats["texts"], stats["geocodes"]
@@ -849,10 +817,7 @@ class WebUI:
 
     async def _handle_capcode_progress(self, request: web.Request) -> web.Response:
         """Get current capcode import progress."""
-        from .capcode_import import get_import_progress
-
-        progress = get_import_progress()
-        return web.json_response(progress)
+        return web.json_response(capcode_import.get_import_progress())
 
     # =========================================================================
     # MESSAGE HISTORY HANDLERS
@@ -900,8 +865,6 @@ class WebUI:
     @staticmethod
     def _import_running() -> str | None:
         """Return an error message while a BAG or capcode import thread is running."""
-        from . import bag_import, capcode_import
-
         if bag_import.get_import_progress().get("running"):
             return "A BAG import is running; wait for it to finish"
         if capcode_import.get_import_progress().get("running"):
@@ -1007,9 +970,7 @@ class WebUI:
     async def _handle_import_abbreviations(self, request: web.Request) -> web.Response:
         """Import abbreviations from Bommel."""
         try:
-            from .abbreviation_import import import_abbreviations
-
-            count = import_abbreviations(self.database)
+            count = abbreviation_import.import_abbreviations(self.database)
             return web.json_response({"success": True, "count": count, "message": f"Imported {count} abbreviations"})
         except Exception as e:
             logger.error(f"Failed to import abbreviations: {e}")
@@ -1186,39 +1147,15 @@ class WebUI:
             self._ignore_changed()
         return web.json_response({"success": True, "deleted": count})
 
-    async def _fetch_tile(self, url: str, headers: dict) -> tuple[int, bytes]:
-        """Fetch one map tile, returning (status, body)."""
-        if self._tile_session is None or self._tile_session.closed:
-            self._tile_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
-        async with self._tile_session.get(url, headers=headers) as resp:
-            return resp.status, await resp.read() if resp.status == 200 else b""
-
     async def _handle_map_tile(self, request: web.Request) -> web.Response:
         """Serve an OpenStreetMap raster tile via Home Assistant's map tile proxy."""
         z, x, y = (int(request.match_info[k]) for k in ("z", "x", "y"))
         if z > MAP_MAX_ZOOM or x >= 2**z or y >= 2**z:
             return web.Response(status=404)
-
         try:
-            status = 0
-            if self._ha_map_tiles:
-                status, body = await self._fetch_tile(
-                    HA_MAP_TILES_URL.format(z=z, x=x, y=y),
-                    {"Authorization": f"Bearer {self._supervisor_token}"},
-                )
-                if status == 404:
-                    logger.info("Home Assistant has no map_tiles proxy (core < 2026.9), using OpenStreetMap directly")
-                    self._ha_map_tiles = False
-            if not self._ha_map_tiles:
-                status, body = await self._fetch_tile(
-                    OSM_TILES_URL.format(z=z, x=x, y=y), {"User-Agent": OSM_USER_AGENT}
-                )
-        except (aiohttp.ClientError, TimeoutError) as e:
+            body = await self.ha_client.get_map_tile(z, x, y)
+        except HAClientError as e:
             logger.debug(f"Map tile {z}/{x}/{y} failed: {e}")
-            return web.Response(status=502)
-
-        if status != 200:
-            logger.debug(f"Map tile {z}/{x}/{y} returned {status}")
             return web.Response(status=502)
         return web.Response(
             body=body,
@@ -1304,13 +1241,11 @@ class WebUI:
 
     async def _handle_list_vehicle_categories(self, request: web.Request) -> web.Response:
         """List known vehicle categories (for the standalone photo-upload dropdown)."""
-        from .vehicle_types import CATEGORY_ICONS
-
-        categories = [{"category": k, "icon": v} for k, v in CATEGORY_ICONS.items()]
+        categories = [{"category": k, "icon": v} for k, v in vehicle_types.CATEGORY_ICONS.items()]
         return web.json_response({"categories": categories})
 
     async def _handle_list_vehicle_photos(self, request: web.Request) -> web.Response:
-        """List vehicle photos with pagination and search, for the Database tab."""
+        """List vehicle photos with pagination and search, for the Settings tab."""
         page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
         search = request.query.get("search", "")
@@ -1421,8 +1356,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .topbar {
             flex-shrink: 0; min-height: 44px; display: flex; align-items: center; gap: 14px;
             padding: 6px 14px; background: var(--ha-card-background); border-bottom: var(--card-border);
-            flex-wrap: wrap;
+            white-space: nowrap;
         }
+        .topbar > * { flex-shrink: 0; }
         @media (max-width: 1600px) { .brand-sub { display: none; } }
         @media (max-width: 1360px) { .kpis .kpi-extra { display: none; } }
         .brand { display: flex; align-items: center; gap: 8px; }
@@ -1448,7 +1384,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .rx.stopped { color: var(--danger-color); }
         .spacer { flex: 1; }
 
-        .filter-pills { display: flex; gap: 4px; flex-wrap: wrap; }
+        .topbar > .filter-pills { flex-shrink: 1; min-width: 0; display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none; }
         .sensor-filter-pill {
             height: 28px; padding: 0 11px; border-radius: 4px; font-size: 12px; cursor: pointer;
             border: var(--card-border); background: var(--ha-card-background); color: var(--secondary-text-color);
@@ -1515,10 +1451,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .pill { padding: 5px 12px; border-radius: 999px; font-size: 12px; font-weight: 600; }
 
         /* Console: message table | map + docked detail */
-        .console { flex: 1; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) 560px; gap: 1px; background: var(--divider-color); }
+        .console { flex: 1; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) var(--console-side, minmax(520px, 44%)); gap: 1px; background: var(--divider-color); }
         .feed { display: flex; flex-direction: column; min-height: 0; background: var(--ha-card-background); }
         .feed-head, .feed-row {
-            display: grid; grid-template-columns: 66px 42px 104px minmax(0, 1fr) 170px 66px;
+            display: grid; grid-template-columns: 66px 42px minmax(0, 104px) minmax(140px, 1fr) minmax(0, 170px) minmax(0, 66px);
             gap: 10px; padding: 0 14px; align-items: center;
         }
         .feed-head {
@@ -1536,14 +1472,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .feed-row .time, .feed-row .unit { font-family: var(--mono); color: var(--secondary-text-color); }
         .feed-row .text { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .feed-row .text .badge { margin-left: 8px; font-family: inherit; }
-        .feed-row .place { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .side { display: flex; flex-direction: column; min-height: 0; background: var(--ha-card-background); }
-        .side .map-slot { height: 300px; flex-shrink: 0; }
+        .feed-row .place, .feed-row .unit { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .side { position: relative; display: flex; flex-direction: column; min-height: 0; background: var(--ha-card-background); }
+        .side .map-slot { flex: 0 0 var(--console-map, 38%); min-height: 120px; }
         .detail-dock { flex: 1; min-height: 0; overflow-y: auto; border-top: var(--card-border); }
 
         /* Wallboard: big map + incident list, ticker below */
         .wallboard { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-        .wall-main { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 400px; }
+        .wall-main { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) var(--wall-list, 400px); }
         .wall-map { position: relative; min-height: 0; }
         .wall-map .map-slot { position: absolute; inset: 0; }
         .wall-kpis {
@@ -1555,7 +1491,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .wall-kpi .l { font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--secondary-text-color); }
         .wall-kpi .v.p1 { color: var(--prio-1); }
         .wall-kpi .v.grip { color: var(--prio-2); }
-        .wall-list { display: flex; flex-direction: column; min-height: 0; background: var(--ha-card-background); border-left: var(--card-border); }
+        .wall-list { position: relative; display: flex; flex-direction: column; min-height: 0; background: var(--ha-card-background); border-left: var(--card-border); }
         .wall-items { flex: 1; min-height: 0; overflow-y: auto; }
         .incident-card {
             width: 100%; display: flex; flex-direction: column; gap: 5px; padding: 10px 14px; text-align: left;
@@ -1582,7 +1518,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         /* Lanes: one column per discipline + map */
-        .lanes { flex: 1; min-width: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)) 380px; gap: 1px; background: var(--divider-color); }
+        .lanes { flex: 1; min-width: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)) var(--lanes-side, max(440px, calc(100% - 1200px))); gap: 1px; background: var(--divider-color); }
         .lane { display: flex; flex-direction: column; min-height: 0; background: var(--ha-background); }
         .lane-head {
             height: 38px; flex-shrink: 0; display: flex; align-items: center; gap: 8px; padding: 0 12px;
@@ -1603,8 +1539,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .lane-card .meta .unit { margin-left: auto; }
         .lane-card .text { font-family: var(--mono); font-size: 12px; line-height: 1.4; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
         .lane-card .place { color: var(--secondary-text-color); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .lanes-side { display: flex; flex-direction: column; min-height: 0; background: var(--ha-card-background); }
+        .lanes-side { position: relative; display: flex; flex-direction: column; min-height: 0; background: var(--ha-card-background); }
         .lanes-side .map-slot { flex: 1; min-height: 0; }
+
+        /* ---------- Draggable dividers between panes ---------- */
+        .splitter { z-index: 1100; touch-action: none; transition: background 0.15s; }
+        .splitter.col { position: absolute; top: 0; bottom: 0; left: -3px; width: 7px; cursor: col-resize; }
+        .splitter.row { flex: 0 0 5px; cursor: row-resize; background: var(--divider-color); }
+        .splitter:hover, .splitter.dragging { background: var(--primary-color); }
 
         /* ---------- Map (one Leaflet map, moved into the active view's slot) ---------- */
         .map-slot { position: relative; background: var(--map-bg); }
@@ -1626,7 +1568,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         /* ---------- Message detail (docked in Console, popup elsewhere) ---------- */
         #detail { display: flex; flex-direction: column; }
         #detail-content { padding: 12px 16px; display: flex; flex-direction: column; gap: 10px; }
-        .detail-head { display: flex; align-items: center; gap: 10px; }
+        .detail-head { display: flex; align-items: center; gap: 4px 10px; flex-wrap: wrap; }
         .detail-head h2 { font-size: 15px; font-weight: 600; }
         .detail-head .when { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--secondary-text-color); white-space: nowrap; }
         .detail-body {
@@ -1635,11 +1577,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
         .abbrev-tags { display: flex; gap: 6px; flex-wrap: wrap; }
         .abbrev-tag { padding: 2px 8px; border-radius: 999px; font-size: 11.5px; background: var(--tag-bg); color: var(--tag-text); }
-        .detail-cols { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: start; }
+        #detail { container: detail / inline-size; }
+        .detail-main { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: start; }
+        .detail-left { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+        .detail-nav { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 10px 16px; border-top: var(--card-border); }
+        .history-section[hidden], .detail-nav[hidden] { display: none; }
+        .badge.escalated { margin-left: 8px; text-transform: none; letter-spacing: 0; }
+        @container detail (min-width: 640px) {
+            .detail-fields { grid-template-columns: 96px minmax(0, 1fr) 96px minmax(0, 1fr); }
+            .detail-fields dt.wide { grid-column: 1; }
+            .detail-fields dd.wide { grid-column: 2 / -1; }
+            .vehicle-side { width: 210px; }
+            .vehicle-visual { height: 150px; font-size: 56px; }
+        }
+        @container detail (max-width: 460px) {
+            .detail-head .when { margin-left: 0; flex-basis: 100%; }
+            .detail-main { grid-template-columns: 1fr; }
+            .vehicle-side { width: auto; }
+        }
         .detail-fields { display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 6px 10px; font-size: 12.5px; }
         .detail-fields dt { color: var(--secondary-text-color); }
         .detail-fields dd { word-break: break-word; }
-        .raw-block summary { cursor: pointer; color: var(--secondary-text-color); font-size: 11.5px; }
+        .raw-label { color: var(--secondary-text-color); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; }
         .raw-block pre {
             margin-top: 6px; padding: 8px 10px; background: var(--ha-background); border-radius: 4px;
             font-family: var(--mono); font-size: 11px; white-space: pre-wrap; word-break: break-all;
@@ -1656,8 +1615,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .vehicle-category-label { font-size: 12px; font-weight: 600; }
         .vehicle-number-label { font-size: 11px; color: var(--secondary-text-color); font-family: var(--mono); }
         .vehicle-side .btn { justify-content: center; padding: 4px 10px; font-size: 11.5px; }
-        .detail-modal .vehicle-side { width: 240px; }
-        .detail-modal .vehicle-visual { height: 180px; font-size: 64px; }
 
         .history-section { padding: 10px 16px 14px; border-top: var(--card-border); display: flex; flex-direction: column; gap: 6px; }
         .history-section h4 { color: var(--secondary-text-color); font-size: 11px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.06em; }
@@ -1670,10 +1627,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .history-item .time { font-family: var(--mono); color: var(--secondary-text-color); }
         .history-item .text { font-family: var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-        .detail-modal { width: min(920px, 100%); max-height: calc(100vh - 40px); display: flex; flex-direction: column; }
-        .detail-modal #detail { overflow-y: auto; }
+        /* Wallboard and Lanes: the detail floats in the map's left corner (top on the
+           Wallboard, below its counts; bottom on Lanes) */
+        .detail-float {
+            position: absolute; z-index: 950; top: 84px; left: 12px;
+            width: min(560px, calc(100% - 24px)); max-height: calc(100% - 96px);
+            display: none; flex-direction: column; overflow: hidden;
+            background: var(--ha-card-background); border: var(--card-border); border-radius: 8px; box-shadow: var(--shadow-lg);
+        }
+        .detail-float.open { display: flex; }
+        .detail-float.bottom { top: auto; bottom: 12px; }
+        .detail-float-head {
+            display: flex; align-items: center; justify-content: space-between; padding: 6px 8px 6px 16px;
+            border-bottom: var(--card-border); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
+            color: var(--secondary-text-color);
+        }
+        .detail-float-body { flex: 1; min-height: 0; overflow-y: auto; }
 
-        /* Advanced & Database pages */
+        /* Settings & Info pages */
         .panel {
             background: var(--ha-card-background); border: var(--card-border);
             border-radius: var(--card-radius); box-shadow: var(--shadow-sm);
@@ -1714,7 +1685,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .input:focus { border-color: var(--primary-color); }
         textarea.input { resize: vertical; line-height: 1.4; }
 
-        /* ---------- Advanced tab ---------- */
+        /* ---------- Info tab ---------- */
         .info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
         .info-card h3 {
             font-size: 11px; font-weight: 600; color: var(--secondary-text-color);
@@ -1726,6 +1697,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             padding: 8px 0; border-bottom: 1px solid var(--divider-color); font-size: 13px;
         }
         .info-row:last-child { border-bottom: none; }
+        .reception { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 12px 32px; }
         .info-label { color: var(--secondary-text-color); }
         .info-value { color: var(--primary-text-color); font-weight: 500; text-align: right; }
 
@@ -1749,7 +1721,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .chart-legend-item .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .chart-legend-item .count { color: var(--secondary-text-color); margin-left: auto; padding-left: 8px; flex-shrink: 0; }
 
-        /* ---------- Database tab ---------- */
+        /* ---------- Settings tab ---------- */
         .db-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
         .db-toolbar-left { display: flex; align-items: center; gap: 10px; }
         .db-toolbar-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -1782,7 +1754,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         /* ---------- Modal ---------- */
         .modal-overlay {
-            position: fixed; inset: 0; background: rgba(0,0,0,0.55);
+            position: fixed; inset: 0;
             display: none; align-items: center; justify-content: center;
             z-index: 3000; padding: 20px;
         }
@@ -1829,7 +1801,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .toast.error { border-left-color: var(--danger-color); }
         @keyframes toast-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
-        /* ---------- Database landing cards ---------- */
+        /* ---------- Settings landing cards ---------- */
         .db-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 12px; }
         .db-card {
             border: var(--card-border); border-radius: var(--card-radius);
@@ -1854,11 +1826,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .db-card-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: auto; }
 
         @media (max-width: 1200px) {
-            .console { grid-template-columns: minmax(0, 1fr) 420px; }
-            .lanes { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-            .lanes-side { display: none; }
-            .wall-main { grid-template-columns: minmax(0, 1fr) 320px; }
-            .feed-head, .feed-row { grid-template-columns: 62px 42px 96px minmax(0, 1fr) 130px; }
+            .console { grid-template-columns: minmax(0, 1fr) var(--console-side, 420px); }
+            .lanes { grid-template-columns: repeat(4, minmax(0, 1fr)) var(--lanes-side, 380px); }
+            .wall-main { grid-template-columns: minmax(0, 1fr) var(--wall-list, 320px); }
+            .feed-head, .feed-row { grid-template-columns: 62px 42px minmax(0, 96px) minmax(140px, 1fr) minmax(0, 130px); }
             .feed-head .unit, .feed-row .unit { display: none; }
         }
         @media (max-width: 800px) {
@@ -1869,7 +1840,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             .wall-map { height: 50vh; }
             .lanes { grid-template-columns: 1fr; }
             .ticker { grid-template-columns: repeat(2, minmax(0, 1fr)); height: auto; }
-            .detail-cols { grid-template-columns: 1fr; }
             .feed-head, .feed-row { grid-template-columns: 58px 42px minmax(0, 1fr); }
             .feed-head .disc-col, .feed-row .disc, .feed-head .place-col, .feed-row .place { display: none; }
         }
@@ -1887,8 +1857,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <button type="button" class="tab" data-tab="wallboard" onclick="switchTab('wallboard')">Wallboard</button>
             <button type="button" class="tab" data-tab="lanes" onclick="switchTab('lanes')">Lanes</button>
             <span class="tab-sep" aria-hidden="true"></span>
-            <button type="button" class="tab" data-tab="advanced" onclick="switchTab('advanced')">Advanced</button>
-            <button type="button" class="tab" data-tab="database" onclick="switchTab('database')">Database</button>
+            <button type="button" class="tab" data-tab="settings" onclick="switchTab('settings')">Settings</button>
+            <button type="button" class="tab" data-tab="info" onclick="switchTab('info')">Info</button>
         </nav>
         <div class="kpis">
             <span id="rx-status" class="rx stopped">DECODER STOPPED</span>
@@ -1920,8 +1890,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     <div class="feed-head"><span>Time</span><span>Prio</span><span class="disc-col">Discipline</span><span>Message</span><span class="place-col">Location</span><span class="unit">Unit</span></div>
                     <div id="console-rows" class="feed-rows"><div class="empty-state">No messages yet</div></div>
                 </div>
-                <div class="side">
+                <div id="console-side" class="side">
+                    <div class="splitter col" data-size="--console-side" data-pane="console-side" data-dir="-1" role="separator" aria-orientation="vertical" aria-label="Resize message list" title="Drag to resize, double-click to reset"></div>
                     <div id="slot-console" class="map-slot"></div>
+                    <div class="splitter row" data-size="--console-map" data-pane="slot-console" data-dir="1" role="separator" aria-orientation="horizontal" aria-label="Resize map" title="Drag to resize, double-click to reset"></div>
                     <div id="detail-dock" class="detail-dock"></div>
                 </div>
             </div>
@@ -1934,7 +1906,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         <div id="slot-wallboard" class="map-slot"></div>
                         <div id="wall-kpis" class="wall-kpis"></div>
                     </div>
-                    <div class="wall-list">
+                    <div id="wall-list" class="wall-list">
+                        <div class="splitter col" data-size="--wall-list" data-pane="wall-list" data-dir="-1" role="separator" aria-orientation="vertical" aria-label="Resize incident list" title="Drag to resize, double-click to reset"></div>
                         <div class="panel-label"><span>Incidents</span><span>by priority</span></div>
                         <div id="wall-items" class="wall-items"><div class="empty-state">No messages yet</div></div>
                     </div>
@@ -1949,43 +1922,46 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <div id="lane-ambulance" class="lane"></div>
                 <div id="lane-politie" class="lane"></div>
                 <div id="lane-other" class="lane"></div>
-                <div class="lanes-side"><div id="slot-lanes" class="map-slot"></div></div>
+                <div id="lanes-side" class="lanes-side">
+                    <div class="splitter col" data-size="--lanes-side" data-pane="lanes-side" data-dir="-1" role="separator" aria-orientation="vertical" aria-label="Resize lanes" title="Drag to resize, double-click to reset"></div>
+                    <div id="slot-lanes" class="map-slot"></div>
+                </div>
             </div>
         </section>
 
     <div class="pages">
     <div class="container">
-        <div id="tab-advanced" class="tab-content">
+        <div id="tab-info" class="tab-content">
             <div class="info-grid">
                 <div class="panel info-card">
                     <div class="panel-body">
                         <h3>📡 Receiver</h3>
-                        <div class="info-row"><span class="info-label">Network</span><span class="info-value" id="adv-network">-</span></div>
-                        <div class="info-row"><span class="info-label">Frequency</span><span class="info-value" id="adv-frequency">-</span></div>
-                        <div class="info-row"><span class="info-label">Sample rate</span><span class="info-value" id="adv-samplerate">-</span></div>
-                        <div class="info-row"><span class="info-label">Decoder</span><span class="info-value" id="adv-decoder">-</span></div>
+                        <div class="info-row"><span class="info-label">Network</span><span class="info-value" id="info-network">-</span></div>
+                        <div class="info-row"><span class="info-label">Frequency</span><span class="info-value" id="info-frequency">-</span></div>
+                        <div class="info-row"><span class="info-label">Sample rate</span><span class="info-value" id="info-samplerate">-</span></div>
+                        <div class="info-row"><span class="info-label">Decoder</span><span class="info-value" id="info-decoder">-</span></div>
                     </div>
                 </div>
 
                 <div class="panel info-card">
                     <div class="panel-body">
                         <h3>🔌 Device</h3>
-                        <div class="info-row"><span class="info-label">Type</span><span class="info-value" id="adv-device">-</span></div>
-                        <div class="info-row"><span class="info-label">Driver</span><span class="info-value" id="adv-driver">-</span></div>
-                        <div class="info-row"><span class="info-label">Status</span><span class="info-value" id="adv-status">-</span></div>
-                        <div class="info-row"><span class="info-label">Geocoding</span><span class="info-value" id="adv-geocoding">-</span></div>
-                        <div class="info-row"><span class="info-label">OpenCage quota</span><span class="info-value" id="adv-geocode-quota">-</span></div>
+                        <div class="info-row"><span class="info-label">Type</span><span class="info-value" id="info-device">-</span></div>
+                        <div class="info-row"><span class="info-label">Driver</span><span class="info-value" id="info-driver">-</span></div>
+                        <div class="info-row"><span class="info-label">Status</span><span class="info-value" id="info-status">-</span></div>
+                        <div class="info-row"><span class="info-label">Geocoding</span><span class="info-value" id="info-geocoding">-</span></div>
+                        <div class="info-row"><span class="info-label">OpenCage quota</span><span class="info-value" id="info-geocode-quota">-</span></div>
                     </div>
                 </div>
 
                 <div class="panel info-card">
                     <div class="panel-body">
                         <h3>🗄️ Database</h3>
-                        <div class="info-row"><span class="info-label">Places</span><span class="info-value" id="adv-places">0</span></div>
-                        <div class="info-row"><span class="info-label">Streets</span><span class="info-value" id="adv-streets">0</span></div>
-                        <div class="info-row"><span class="info-label">Capcodes</span><span class="info-value" id="adv-capcodes">0</span></div>
-                        <div class="info-row"><span class="info-label">Texts</span><span class="info-value" id="adv-texts">0</span></div>
-                        <div class="info-row"><span class="info-label">Geocodes</span><span class="info-value" id="adv-geocodes">0</span></div>
+                        <div class="info-row"><span class="info-label">Places</span><span class="info-value" id="info-places">0</span></div>
+                        <div class="info-row"><span class="info-label">Streets</span><span class="info-value" id="info-streets">0</span></div>
+                        <div class="info-row"><span class="info-label">Capcodes</span><span class="info-value" id="info-capcodes">0</span></div>
+                        <div class="info-row"><span class="info-label">Texts</span><span class="info-value" id="info-texts">0</span></div>
+                        <div class="info-row"><span class="info-label">Geocodes</span><span class="info-value" id="info-geocodes">0</span></div>
                     </div>
                 </div>
             </div>
@@ -1994,6 +1970,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <div class="panel info-card">
                     <div class="panel-body">
                         <h3>📶 Reception</h3>
+                        <div class="reception">
+                        <div>
                         <div class="info-row"><span class="info-label">Active receiver</span><span class="info-value" id="rx-source">-</span></div>
                         <div class="info-row"><span class="info-label">Last FLEX frame</span><span class="info-value" id="rx-last">-</span></div>
                         <div class="info-row"><span class="info-label">Frames last minute</span><span class="info-value" id="rx-frames-min">-</span></div>
@@ -2001,25 +1979,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         <div class="info-row"><span class="info-label">Corrected bit errors per frame</span><span class="info-value" id="rx-corrected">-</span></div>
                         <div class="info-row"><span class="info-label">Failed decodes last hour</span><span class="info-value" id="rx-failed">-</span></div>
                         <div class="info-row"><span class="info-label">Sync lost last hour</span><span class="info-value" id="rx-sync">-</span></div>
-                        <div class="chart-title" style="margin-top: 14px;">FLEX frames per minute, last hour</div>
+                        </div>
+                        <div>
+                        <div class="chart-title">FLEX frames per minute, last hour</div>
                         <div id="frames-chart"></div>
                         <div class="panel-sub" style="margin-top: 8px;">Fewer corrected bit errors and failed decodes mean a cleaner signal - use them when tuning gain and ppm. rtl_fm and rx_fm don't report an RF signal level.</div>
-                    </div>
-                </div>
-
-                <div class="panel info-card">
-                    <div class="panel-body">
-                        <h3>🎯 ppm calibration</h3>
-                        <div class="panel-sub" style="margin-bottom: 10px;">Tries ppm values around the current one on the active receiver and keeps the one that decodes the most FLEX frames. Decoding continues while it runs.</div>
-                        <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end;">
-                            <div class="form-field"><label>± range (ppm)</label><input id="cal-span" class="input" type="number" value="30" min="1" max="100" style="width: 90px;"></div>
-                            <div class="form-field"><label>Step</label><input id="cal-step" class="input" type="number" value="5" min="1" max="50" style="width: 70px;"></div>
-                            <div class="form-field"><label>Seconds each</label><input id="cal-dwell" class="input" type="number" value="30" min="10" max="600" style="width: 90px;"></div>
-                            <button id="cal-start" class="btn btn-primary" onclick="startCalibration()">Start</button>
-                            <button id="cal-cancel" class="btn btn-danger" onclick="cancelCalibration()" style="display: none;">Cancel</button>
                         </div>
-                        <div id="cal-status" class="panel-sub" style="margin-top: 12px;"></div>
-                        <div id="cal-results" style="margin-top: 8px;"></div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -2027,8 +1993,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div class="panel info-card stats-panel">
                 <div class="panel-body">
                     <h3>📊 Statistics</h3>
-                    <div class="info-row"><span class="info-label">Total messages</span><span class="info-value" id="adv-total">0</span></div>
-                    <div class="info-row"><span class="info-label">Session uptime</span><span class="info-value" id="adv-uptime">-</span></div>
+                    <div class="info-row"><span class="info-label">Total messages</span><span class="info-value" id="info-total">0</span></div>
+                    <div class="info-row"><span class="info-label">Session uptime</span><span class="info-value" id="info-uptime">-</span></div>
                     <div class="stats-charts-grid">
                         <div>
                             <div class="chart-title">By region
@@ -2047,7 +2013,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
         </div>
 
-        <div id="tab-database" class="tab-content">
+        <div id="tab-settings" class="tab-content">
             <div class="panel">
                 <div class="panel-body">
                     <!-- Landing: guided setup flow -->
@@ -2199,6 +2165,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                                 </div>
                             </div>
                         </div>
+
+                        <div class="db-toolbar" style="margin-top: 22px;">
+                            <span class="db-table-title">Receiver tuning</span>
+                        </div>
+                        <div class="db-card" style="max-width: 760px;">
+                            <div class="db-card-head">
+                                <span class="db-card-icon">🎯</span>
+                                <span class="db-card-title">ppm calibration</span>
+                            </div>
+                            <div class="db-card-desc">Tries ppm values around the current one on the active receiver and keeps the one that decodes the most FLEX frames. Decoding continues while it runs.</div>
+                            <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end;">
+                                <div class="form-field"><label for="cal-span">± range (ppm)</label><input id="cal-span" class="input" type="number" value="30" min="1" max="100" style="width: 90px;"></div>
+                                <div class="form-field"><label for="cal-step">Step</label><input id="cal-step" class="input" type="number" value="5" min="1" max="50" style="width: 70px;"></div>
+                                <div class="form-field"><label for="cal-dwell">Seconds each</label><input id="cal-dwell" class="input" type="number" value="30" min="10" max="600" style="width: 90px;"></div>
+                                <button id="cal-start" class="btn btn-primary" onclick="startCalibration()">Start</button>
+                                <button id="cal-cancel" class="btn btn-danger" onclick="cancelCalibration()" style="display: none;">Cancel</button>
+                            </div>
+                            <div id="cal-status" class="panel-sub"></div>
+                            <div id="cal-results"></div>
+                        </div>
                     </div>
                     <!-- Table view -->
                     <div id="db-table-view" style="display: none;">
@@ -2262,27 +2248,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <input id="map-history-until" type="range" style="display:none;" oninput="renderMapHistory()" title="Show incidents up to this moment">
                 <span id="map-history-label" class="until"></span>
             </div>
+            <div id="detail-float" class="detail-float" role="dialog" aria-label="Message details">
+                <div class="detail-float-head">
+                    <span>Message details</span>
+                    <button class="modal-close" onclick="closeDetailFloat()" aria-label="Close">✕</button>
+                </div>
+                <div id="detail-float-body" class="detail-float-body"></div>
+            </div>
         </div>
         <div id="detail">
             <div id="detail-content"><div class="empty-state">Click a message to view details</div></div>
-            <div id="incident-section" class="history-section" style="display:none;">
-                <h4>Incident</h4>
+            <div id="incident-section" class="history-section" hidden>
+                <h4 id="incident-title">Incident</h4>
                 <div id="incident-list"></div>
             </div>
-            <div id="history-section" class="history-section" style="display:none;">
-                <h4>Earlier at this location</h4>
+            <div id="history-section" class="history-section" hidden>
+                <h4>Earlier at this address</h4>
                 <div id="history-list"></div>
             </div>
-        </div>
-    </div>
-
-    <div id="detail-modal" class="modal-overlay" onclick="if (event.target === this) closeDetailModal()">
-        <div class="modal detail-modal" role="dialog" aria-modal="true" aria-label="Message details">
-            <div class="modal-head">
-                <span class="modal-title">Message details</span>
-                <button class="modal-close" onclick="closeDetailModal()" aria-label="Close">✕</button>
+            <div id="detail-nav" class="detail-nav" hidden>
+                <button type="button" class="btn" onclick="stepDetail(-1)">← Previous</button>
+                <span id="detail-pos" class="panel-sub"></span>
+                <button type="button" class="btn" onclick="stepDetail(1)">Next →</button>
             </div>
-            <div id="detail-modal-body"></div>
         </div>
     </div>
 
@@ -2659,7 +2647,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         function formatTime(ts) {
             return new Date(ts).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false});
         }
-        function formatDate(ts) { return new Date(ts).toLocaleString(); }
+        function formatDate(ts) {
+            return new Date(ts).toLocaleString([], {
+                day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+            });
+        }
 
         // Safe for element content AND quoted attribute values
         const HTML_ESCAPES = {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'};
@@ -2679,7 +2671,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         // =====================================================================
-        // Views: Console (detail docked) and Wallboard / Lanes (detail popup)
+        // Views: Console, Wallboard and Lanes
         // =====================================================================
         const VIEWS = ['console', 'wallboard', 'lanes'];
         let activeView = 'console';
@@ -2688,7 +2680,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tabName));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === 'tab-' + tabName));
             localStorage.setItem('p2000_tab', tabName);
-            if (tabName === 'advanced') loadReceiver();
+            if (tabName === 'info' || tabName === 'settings') loadReceiver();
             if (VIEWS.includes(tabName)) {
                 activeView = tabName;
                 document.getElementById('slot-' + tabName).appendChild(document.getElementById('map-root'));
@@ -2698,27 +2690,69 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             }
         }
 
+        // The detail panel is docked under the map in Console, and floats over
+        // the map's left corner on the Wallboard (top) and Lanes (bottom)
         function placeDetail() {
-            const detail = document.getElementById('detail');
-            if (activeView === 'console') {
-                closeDetailModal();
-                document.getElementById('detail-dock').appendChild(detail);
-            } else {
-                document.getElementById('detail-modal-body').appendChild(detail);
-            }
+            closeDetailFloat();
+            document.getElementById('detail-float').classList.toggle('bottom', activeView === 'lanes');
+            const home = activeView === 'console' ? 'detail-dock' : 'detail-float-body';
+            document.getElementById(home).appendChild(document.getElementById('detail'));
         }
 
-        function openDetailModal() {
-            document.getElementById('detail-modal').classList.add('open');
+        function openDetailFloat() {
+            document.getElementById('detail-float').classList.add('open');
         }
 
-        function closeDetailModal() {
-            document.getElementById('detail-modal').classList.remove('open');
+        function closeDetailFloat() {
+            document.getElementById('detail-float').classList.remove('open');
         }
 
         document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape') closeDetailModal();
+            if (e.key === 'Escape') closeDetailFloat();
         });
+
+        // Draggable dividers: each sets a CSS size variable, kept per browser;
+        // double-click restores the default
+        function initSplitters() {
+            const root = document.documentElement.style;
+            document.querySelectorAll('.splitter').forEach(handle => {
+                const name = handle.dataset.size;
+                const saved = localStorage.getItem('p2000_size' + name);
+                if (saved) root.setProperty(name, saved);
+
+                handle.addEventListener('pointerdown', (e) => {
+                    e.preventDefault();
+                    const pane = document.getElementById(handle.dataset.pane);
+                    const row = handle.classList.contains('row');
+                    const dir = Number(handle.dataset.dir);
+                    const start = row ? e.clientY : e.clientX;
+                    const startSize = row ? pane.offsetHeight : pane.offsetWidth;
+                    const room = row ? pane.parentElement.offsetHeight : pane.parentElement.offsetWidth;
+                    handle.setPointerCapture(e.pointerId);
+                    handle.classList.add('dragging');
+                    const move = (ev) => {
+                        const size = startSize + dir * ((row ? ev.clientY : ev.clientX) - start);
+                        root.setProperty(name, Math.round(Math.max(200, Math.min(room - 200, size))) + 'px');
+                        map.invalidateSize();
+                    };
+                    const up = () => {
+                        handle.classList.remove('dragging');
+                        handle.removeEventListener('pointermove', move);
+                        handle.removeEventListener('pointerup', up);
+                        localStorage.setItem('p2000_size' + name, root.getPropertyValue(name));
+                    };
+                    handle.addEventListener('pointermove', move);
+                    handle.addEventListener('pointerup', up);
+                });
+
+                handle.addEventListener('dblclick', () => {
+                    root.removeProperty(name);
+                    localStorage.removeItem('p2000_size' + name);
+                    map.invalidateSize();
+                });
+            });
+        }
+        initSplitters();
 
         function updateClock() {
             document.getElementById('clock').textContent = formatTime(Date.now());
@@ -2752,13 +2786,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const mins = totalMinutes % 60;
             const text = hours > 0 ? `${hours}h ${mins}m` : `${mins}m`;
             uptimeEl.textContent = text;
-            const advUp = document.getElementById('adv-uptime');
-            if (advUp) advUp.textContent = text;
+            document.getElementById('info-uptime').textContent = text;
         }
         setInterval(renderUptime, 30000);
 
         // =====================================================================
-        // Reception quality & ppm calibration (Advanced tab)
+        // Reception quality (Info tab) and ppm calibration (Settings tab)
         // =====================================================================
         function formatAgo(epochSeconds) {
             if (!epochSeconds) return 'never';
@@ -2828,7 +2861,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         let receiverTimer = null;
         function loadReceiver() {
             clearTimeout(receiverTimer);
-            if (!document.getElementById('tab-advanced').classList.contains('active')) return;
+            if (!document.querySelector('#tab-info.active, #tab-settings.active')) return;
             fetch(basePath + 'api/receiver').then(r => r.json()).then(rx => {
                 const active = rx.sources.find(src => src.active);
                 document.getElementById('rx-source').textContent = active
@@ -2883,33 +2916,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         // =====================================================================
         // Dashboard rendering
         // =====================================================================
-        function updateAdvanced(stats) {
-            const el = (id) => document.getElementById(id);
-            if (el('adv-network')) el('adv-network').textContent = stats.network_name || '-';
-            if (el('adv-frequency')) el('adv-frequency').textContent = stats.frequency || '-';
-            if (el('adv-samplerate')) el('adv-samplerate').textContent = stats.sample_rate ? stats.sample_rate + ' Hz' : '-';
-            if (el('adv-decoder')) el('adv-decoder').textContent = stats.decoder || '-';
-            if (el('adv-device')) el('adv-device').textContent = stats.device_type || '-';
-            if (el('adv-driver')) el('adv-driver').textContent = stats.device_driver || '-';
-            if (el('adv-total')) el('adv-total').textContent = stats.total_messages;
-            if (el('adv-status')) el('adv-status').textContent = stats.decoder_running ? 'Running' : (stats.decoder_error || 'Stopped');
-            if (el('adv-geocoding')) {
-                el('adv-geocoding').textContent = !stats.geocoding_configured
-                    ? 'Disabled'
-                    : (stats.geocoding_enabled ? 'Enabled' : 'Invalid API key (disabled)');
-            }
-            if (el('adv-geocode-quota')) {
-                el('adv-geocode-quota').textContent = (stats.geocoding_configured && stats.geocoding_enabled)
-                    ? (stats.geocode_rate_limited
-                        ? 'Exhausted - resets at midnight UTC'
-                        : (stats.geocode_rate_remaining !== undefined ? stats.geocode_rate_remaining + ' left today' : '-'))
-                    : '-';
-            }
-            if (el('adv-geocodes')) el('adv-geocodes').textContent = stats.db_geocodes || 0;
-            if (el('adv-places')) el('adv-places').textContent = stats.db_places || 0;
-            if (el('adv-streets')) el('adv-streets').textContent = stats.db_streets || 0;
-            if (el('adv-capcodes')) el('adv-capcodes').textContent = stats.db_capcodes || 0;
-            if (el('adv-texts')) el('adv-texts').textContent = stats.db_texts || 0;
+        function updateInfo(stats) {
+            const set = (id, value) => { document.getElementById('info-' + id).textContent = value; };
+            set('network', stats.network_name);
+            set('frequency', stats.frequency);
+            set('samplerate', stats.sample_rate + ' Hz');
+            set('decoder', stats.decoder);
+            set('device', stats.device_type);
+            set('driver', stats.device_driver);
+            set('total', stats.total_messages);
+            set('status', stats.decoder_running ? 'Running' : (stats.decoder_error || 'Stopped'));
+            set('geocoding', !stats.geocoding_configured
+                ? 'Disabled'
+                : (stats.geocoding_enabled ? 'Enabled' : 'Invalid API key (disabled)'));
+            set('geocode-quota', !(stats.geocoding_configured && stats.geocoding_enabled)
+                ? '-'
+                : (stats.geocode_rate_limited ? 'Exhausted - resets at midnight UTC' : stats.geocode_rate_remaining + ' left today'));
+            set('places', stats.db_places);
+            set('streets', stats.db_streets);
+            set('capcodes', stats.db_capcodes);
+            set('texts', stats.db_texts);
+            set('geocodes', stats.db_geocodes);
         }
 
         function showMessageDetails(msg, idx) {
@@ -2932,15 +2959,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 : '—';
             const hasDistance = msg.distance_km !== null && msg.distance_km !== undefined;
 
+            // [label, value, wide]: wide rows span the full width in the two-column layout
             const fields = [
                 ['Discipline', msg.discipline || '—'],
                 ['Region', msg.region || '—'],
-                ['Address', msg.address || msg.city || '—'],
-                ['Geocode level', geocodeLevel],
-                hasDistance ? ['Distance from home', `${msg.distance_km} km`] : null,
+                ['Geocode', geocodeLevel],
                 msg.repeats ? ['Repeats', `resent ${msg.repeats} times`] : null,
-                unmatchedCapcodes.length > 0 ? ['Capcodes', unmatchedCapcodes.join(', ')] : null,
-                ['Receivers', msg.receivers || '—'],
+                ['Address', msg.address || msg.city || '—', true],
+                unmatchedCapcodes.length > 0 ? ['Capcodes', unmatchedCapcodes.join(' '), true] : null,
+                ['Receivers', msg.receivers || '—', true],
             ].filter(Boolean);
 
             const abbrevTags = (msg.abbreviations || []).map(a =>
@@ -2948,40 +2975,48 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             ).join('');
 
             const rawBlock = msg.raw_message ? `
-                <details class="raw-block">
-                    <summary>Raw message</summary>
+                <div class="raw-block">
+                    <span class="raw-label">Raw message</span>
                     <pre>${escapeHtml(msg.raw_message)}</pre>
-                </details>` : '';
-
-            const vehicleBlock = msg.vehicle_category ? `
-                <div class="vehicle-side">
-                    <div class="vehicle-visual" id="vehicle-visual" onclick="openVehiclePhotoUpload()">
-                        <span id="vehicle-icon-fallback">${escapeHtml(msg.vehicle_icon || '📻')}</span>
-                    </div>
-                    <div class="vehicle-category-label">${escapeHtml(prettyVehicleCategory(msg.vehicle_category))}</div>
-                    ${msg.vehicle_number ? `<div class="vehicle-number-label">${escapeHtml(msg.vehicle_number)}</div>` : ''}
-                    <button class="btn" onclick="openVehiclePhotoUpload()">Change photo</button>
                 </div>` : '';
 
+            // The photo slot is always there: the recognised vehicle (photo
+            // uploadable), or an unknown unit
+            const category = msg.vehicle_category;
+            const vehicleBlock = `
+                <div class="vehicle-side">
+                    <div class="vehicle-visual" id="vehicle-visual"${category ? ' onclick="openVehiclePhotoUpload()"' : ''}>
+                        <span id="vehicle-icon-fallback">${escapeHtml(msg.vehicle_icon || '📻')}</span>
+                    </div>
+                    <div class="vehicle-category-label">${escapeHtml(category ? prettyVehicleCategory(category) : 'Unknown unit')}</div>
+                    ${msg.vehicle_number ? `<div class="vehicle-number-label">${escapeHtml(msg.vehicle_number)}</div>` : ''}
+                    ${category ? '<button class="btn" onclick="openVehiclePhotoUpload()">Change photo</button>' : ''}
+                </div>`;
+
             const title = [msg.discipline || 'P2000', placeOf(msg)].filter(Boolean).join(' · ');
+            const when = formatDate(msg.timestamp) + (hasDistance ? ` · ${msg.distance_km} km from home` : '');
             detailContent.innerHTML = `
                 <div class="detail-head">
                     ${prioChip(msg)}
                     <h2>${escapeHtml(title)}</h2>
-                    <span class="when">${formatDate(msg.timestamp)}</span>
+                    <span class="when">${escapeHtml(when)}</span>
                 </div>
-                <div class="detail-body">${escapeHtml(msg.body || 'No message')}</div>
-                ${abbrevTags ? `<div class="abbrev-tags">${abbrevTags}</div>` : ''}
-                <div class="detail-cols">
-                    <dl class="detail-fields">${fields.map(([label, value]) => `<dt>${label}</dt><dd>${escapeHtml(value)}</dd>`).join('')}</dl>
+                <div class="detail-main">
+                    <div class="detail-left">
+                        <div class="detail-body">${escapeHtml(msg.body || 'No message')}</div>
+                        ${abbrevTags ? `<div class="abbrev-tags">${abbrevTags}</div>` : ''}
+                        <dl class="detail-fields">${fields.map(([label, value, wide]) =>
+                            `<dt${wide ? ' class="wide"' : ''}>${label}</dt><dd${wide ? ' class="wide"' : ''}>${escapeHtml(value)}</dd>`).join('')}</dl>
+                        ${rawBlock}
+                    </div>
                     ${vehicleBlock}
                 </div>
-                ${rawBlock}
             `;
+            renderDetailNav();
 
             if (msg.vehicle_category) loadVehiclePhoto(msg);
 
-            document.getElementById('history-section').style.display = 'block';
+            document.getElementById('history-section').hidden = false;
 
             if (msg.latitude && msg.longitude) {
                 try {
@@ -2990,8 +3025,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     if (!isNaN(lat) && !isNaN(lng)) {
                         if (currentMarker) map.removeLayer(currentMarker);
                         currentMarker = L.marker([lat, lng]).addTo(map);
-                        currentMarker.bindPopup(`<b>${escapeHtml(msg.discipline || 'P2000')}</b><br><small>${escapeHtml(msg.address || '')}</small><br><div style="margin-top:6px;max-width:250px;word-wrap:break-word;">${escapeHtml(msg.body || 'No message')}</div>`).openPopup();
-                        map.setView([lat, lng], 13);
+                        currentMarker.bindPopup(`<b>${escapeHtml(msg.discipline || 'P2000')}</b><br><small>${escapeHtml(msg.address || '')}</small><br><div style="margin-top:6px;max-width:250px;word-wrap:break-word;">${escapeHtml(msg.body || 'No message')}</div>`);
+                        map.setView([lat, lng], 13, {animate: false});
+                        const panel = document.getElementById('detail-float');
+                        if (panel.classList.contains('open')) {
+                            // Keep the location visible to the right of the floating detail
+                            map.panBy([-(panel.offsetWidth + 24) / 2, 0], {animate: false});
+                        } else {
+                            currentMarker.openPopup();
+                        }
                     }
                 } catch (e) {}
             }
@@ -3025,22 +3067,42 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             }
         }
 
+        // Position of the shown message in the list, with previous/next buttons
+        function renderDetailNav() {
+            const idx = selectedMsg ? currentMessages.findIndex(m => msgKey(m) === msgKey(selectedMsg)) : -1;
+            document.getElementById('detail-nav').hidden = idx < 0;
+            document.getElementById('detail-pos').textContent = `Message ${idx + 1} of ${currentMessages.length}`;
+        }
+
+        function stepDetail(step) {
+            const idx = currentMessages.findIndex(m => msgKey(m) === msgKey(selectedMsg)) + step;
+            if (idx >= 0 && idx < currentMessages.length) handleMessageClick(idx);
+        }
+
         function renderIncident(msg) {
             const section = document.getElementById('incident-section');
             const list = document.getElementById('incident-list');
-            section.style.display = 'none';
+            section.hidden = true;
             if (!msg.incident_id) return;
             fetch(basePath + `api/incident/${encodeURIComponent(msg.incident_id)}`)
                 .then(r => r.json())
                 .then(items => {
                     if (selectedMsg !== msg || items.length < 2) return;
+                    // What later messages added to the incident's first one
+                    const disciplines = m => (m.discipline || '').split(',').map(d => d.trim()).filter(Boolean);
+                    const first = new Set(disciplines(items[0]));
+                    const added = [...new Set(items.slice(1).flatMap(disciplines))].filter(d => !first.has(d));
+                    const grip = Math.max(0, ...items.map(gripLevel));
+                    const escalation = added.map(d => '+ ' + d).concat(grip ? ['GRIP ' + grip] : []);
+                    document.getElementById('incident-title').innerHTML = `Incident · ${items.length} messages`
+                        + (escalation.length ? `<span class="badge incident escalated">escalated: ${escapeHtml(escalation.join(', '))}</span>` : '');
                     list.innerHTML = items.map(h => `
                         <div class="history-item">
                             <span class="time">${formatTime(h.timestamp)}</span>
                             <span class="text" title="${escapeHtml(h.body || '')}"><span class="disc ${discKind(h)}"></span> ${escapeHtml(h.body || '-')}</span>
                         </div>
                     `).join('');
-                    section.style.display = 'block';
+                    section.hidden = false;
                 })
                 .catch(() => {});
         }
@@ -3135,7 +3197,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             });
         }
 
-        // Standalone upload from the Database tab's Vehicle Photos table (no selected message).
+        // Standalone upload from the Settings tab's Vehicle Photos table (no selected message).
         function dbOpenVehiclePhotoUpload() {
             fetch(`${basePath}api/vehicle-categories`)
                 .then(r => r.json())
@@ -3258,9 +3320,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         const LANES = [['brandweer', 'Brandweer'], ['ambulance', 'Ambulance'], ['politie', 'Politie'], ['other', 'Other']];
 
-        // The lane (and colour) of a message: its first known discipline
+        // The lane (and colour) of a message: its first known discipline. A and
+        // B urgency codes are ambulance codes, so a message that also reaches
+        // fire brigade capcodes still belongs in the ambulance lane.
         function discKind(msg) {
             const disc = (msg.discipline || '').toLowerCase();
+            if (disc.includes('ambulance') && /^[AB]/.test(prioLabel(msg))) return 'ambulance';
             const lane = LANES.slice(0, 3).find(([kind]) => disc.includes(kind));
             return lane ? lane[0] : 'other';
         }
@@ -3362,8 +3427,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         function handleMessageClick(idx) {
             if (!currentMessages[idx]) return;
+            if (activeView !== 'console') openDetailFloat();
             showMessageDetails(currentMessages[idx], idx);
-            if (activeView !== 'console') openDetailModal();
         }
 
         function renderPieChart(data, el) {
@@ -3440,6 +3505,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             renderWallboard();
             renderLanes(latest);
             highlightSelectedMessage();
+            if (selectedMsg) renderDetailNav();
             updateMarkers(latest);
         }
 
@@ -3503,7 +3569,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             }
 
             renderMessagesList(data.latest || []);
-            updateAdvanced(stats);
+            updateInfo(stats);
         }
 
         // =====================================================================
@@ -3542,12 +3608,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             // by clicking a message, independent of the periodic message-list/
             // marker refresh - switching filters must clear them explicitly, or
             // a message that no longer matches the new filter keeps showing.
+            selectedMsg = null;
             selectedMsgKey = null;
-            closeDetailModal();
+            closeDetailFloat();
             if (currentMarker) { map.removeLayer(currentMarker); currentMarker = null; }
             detailContent.innerHTML = '<div class="empty-state">Click a message to view details</div>';
-            document.getElementById('history-section').style.display = 'none';
-            document.getElementById('incident-section').style.display = 'none';
+            document.getElementById('history-section').hidden = true;
+            document.getElementById('incident-section').hidden = true;
+            document.getElementById('detail-nav').hidden = true;
         }
 
         function selectSensorFilter(name) {
@@ -3589,13 +3657,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         const savedTab = localStorage.getItem('p2000_tab');
-        switchTab(VIEWS.concat(['advanced', 'database']).includes(savedTab) ? savedTab : 'console');
+        switchTab(VIEWS.concat(['settings', 'info']).includes(savedTab) ? savedTab : 'console');
         loadSensorFilterBar();
         fetch(basePath + 'api/stats').then(r => r.json()).then(stats => update({stats, latest: []}))
             .catch(() => toast('Failed to load stats', 'error'));
 
         // =====================================================================
-        // Database tab
+        // Settings tab: database tables and imports
         // =====================================================================
         let dbCurrentTable = null;
         let dbCurrentPage = 1;

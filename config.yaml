@@ -3,6 +3,8 @@ version: "1.2.0"
 slug: "meldkamer"
 description: "P2000 FLEX pager decoder dashboard for Home Assistant - decode Dutch emergency services messages using RTL-SDR or HackRF"
 url: https://github.com/cyberjunky/addon-meldkamer
+# The dashboard map needs core's map_tiles proxy (added in 2026.9)
+homeassistant: "2026.9.0"
 init: false
 arch:
   - aarch64

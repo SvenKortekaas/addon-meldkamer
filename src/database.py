@@ -14,6 +14,8 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from .abbreviation_import import DISCIPLINE_ABBREVIATION_OVERRIDES
+
 logger = logging.getLogger(__name__)
 
 
@@ -1537,8 +1539,6 @@ class Database:
         is used to override codes that mean different things per discipline
         - see DISCIPLINE_ABBREVIATION_OVERRIDES.
         """
-        from .abbreviation_import import DISCIPLINE_ABBREVIATION_OVERRIDES
-
         found = []
         words = text.upper().split()
         discipline_lower = (discipline or "").lower()
@@ -1569,9 +1569,7 @@ class Database:
                         found.append({"abbreviation": clean, "full_text": f"{base_text}, kanaal {channel}"})
                 else:
                     # Codes like DP4: letters + digits, no dash
-                    import re as _re
-
-                    m = _re.match(r"^([A-Z]+)(\d+)$", clean)
+                    m = re.match(r"^([A-Z]+)(\d+)$", clean)
                     if m and m.group(1) in all_abbrevs:
                         base_text = _resolve_text(m.group(1), all_abbrevs[m.group(1)])
                         found.append({"abbreviation": clean, "full_text": f"{base_text} {m.group(2)}"})

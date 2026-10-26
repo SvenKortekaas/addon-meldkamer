@@ -63,7 +63,7 @@ async def main() -> int:
     # TCP server for integration communication
     server = P2000Server(host="0.0.0.0", port=5000)
 
-    webui = WebUI(8099, database, speech, processor, decoder, sensor_manager)
+    webui = WebUI(8099, database, speech, processor, decoder, sensor_manager, ha_client)
     webui.update_db_stats(
         db_stats["places"], db_stats["streets"], db_stats["capcodes"], db_stats["texts"], db_stats["geocodes"]
     )
