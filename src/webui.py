@@ -33,7 +33,7 @@ MAX_PHOTO_SIZE = 5 * 1024 * 1024
 MAX_FORM_FIELD_SIZE = 4 * 1024
 PHOTO_MIME_TYPES = ("image/jpeg", "image/png", "image/webp", "image/gif")
 
-ADDON_VERSION = "1.1.1"
+ADDON_VERSION = "1.2.0"
 
 # Home Assistant core (2026.9+) proxies OpenStreetMap raster tiles itself via
 # its built-in map_tiles integration, identifying the requests the way OSM's
@@ -355,6 +355,11 @@ class WebUI:
             "decoder_running": decoder.is_running,
             "decoder_error": decoder.last_error,
             "receiver_online": decoder.stats.online(config.offline_after_minutes),
+            "frames_last_minute": decoder.stats.frames_last_minute(),
+            "messages_last_hour": decoder.stats.messages_last_hour(),
+            "open_incidents": self.processor.incidents.open_count(),
+            "incident_window_minutes": config.incident_window_minutes,
+            "ppm": decoder.ppm,
             "receiver_source": decoder.source.label,
             "device_type": decoder.device_type,
             "device_driver": decoder.device_driver,
@@ -1319,169 +1324,356 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Meldkamer</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
     <style>
+        /* Dark palette by default; light when Home Assistant (or, outside it,
+           the system) uses a light theme - see applyTheme() */
         :root {
-            --ha-card-background: #1a1d21;
-            --ha-background: #101214;
-            --primary-text-color: #e4e7ea;
-            --secondary-text-color: #98a0a8;
-            --primary-color: #03a9f4;
-            --accent-color: #ff9800;
-            --divider-color: rgba(255,255,255,0.09);
-            --card-radius: 12px;
+            --ha-card-background: #12161c;
+            --ha-background: #0b0e12;
+            --primary-text-color: #e7ebf0;
+            --secondary-text-color: #9ba5b3;
+            --primary-color: #4c8dff;
+            --accent-color: #f5a524;
+            --divider-color: #242b35;
+            --card-radius: 8px;
             --card-border: 1px solid var(--divider-color);
-            --prio-1: #e5484d;
-            --prio-2: #f57c00;
-            --prio-3: #fdd835;
-            --success-color: #43a047;
-            --danger-color: #e5484d;
+            --prio-1: #ff6159;
+            --prio-1-text: #1a0706;
+            --prio-2: #f5a524;
+            --prio-2-text: #1e1402;
+            --prio-3: #2a3340;
+            --prio-3-text: #c8cfd8;
+            --disc-ambulance: #f2c94c;
+            --disc-brandweer: #ff7a6b;
+            --disc-politie: #6ea8ff;
+            --disc-other: #a0aab8;
+            --success-color: #5fd68a;
+            --danger-color: #ff6159;
+            --row-alt: #0e1217;
+            --selected-bg: #1c2c4a;
+            --incident-bg: #3a1d1d;
+            --incident-text: #ffb4ae;
+            --tag-bg: rgba(76,141,255,0.14);
+            --tag-text: #b9d3ff;
+            --map-bg: #10151b;
             --shadow-sm: 0 1px 2px rgba(0,0,0,0.25);
-            --shadow-lg: 0 8px 30px rgba(0,0,0,0.35);
+            --shadow-lg: 0 8px 30px rgba(0,0,0,0.45);
             --hover-bg: rgba(140,150,160,0.10);
+            --mono: 'IBM Plex Mono', ui-monospace, monospace;
+            color-scheme: dark;
         }
-
-        @media (prefers-color-scheme: light) {
-            :root {
-                --ha-card-background: #ffffff;
-                --ha-background: #f3f5f7;
-                --primary-text-color: #1f2328;
-                --secondary-text-color: #6a737c;
-                --divider-color: rgba(16,24,40,0.10);
-                --shadow-sm: 0 1px 2px rgba(16,24,40,0.06);
-                --shadow-lg: 0 8px 30px rgba(16,24,40,0.16);
-                --hover-bg: rgba(16,24,40,0.045);
-            }
+        :root[data-theme="light"] {
+            --ha-card-background: #ffffff;
+            --ha-background: #eef1f4;
+            --primary-text-color: #1a1f26;
+            --secondary-text-color: #5b6573;
+            --primary-color: #2457c5;
+            --divider-color: #d5dbe2;
+            --prio-1: #d93a32;
+            --prio-1-text: #ffffff;
+            --prio-2-text: #2a1a00;
+            --prio-3: #e2e7ed;
+            --prio-3-text: #3d4652;
+            --disc-ambulance: #c99700;
+            --disc-brandweer: #e0483b;
+            --disc-politie: #2f6fe0;
+            --disc-other: #8a94a3;
+            --success-color: #1e7a44;
+            --danger-color: #d93a32;
+            --row-alt: #fafbfc;
+            --selected-bg: #e3edff;
+            --incident-bg: #fde7e5;
+            --incident-text: #a6241c;
+            --tag-bg: #e8effc;
+            --tag-text: #1f4aa8;
+            --map-bg: #e8ece6;
+            --shadow-sm: 0 1px 2px rgba(16,24,40,0.06);
+            --shadow-lg: 0 20px 60px rgba(16,24,40,0.25);
+            --hover-bg: rgba(16,24,40,0.045);
+            color-scheme: light;
         }
 
         * { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body { height: 100%; }
         body {
-            font-family: Roboto, -apple-system, 'Segoe UI', 'Noto Sans', sans-serif;
+            font-family: 'IBM Plex Sans', Roboto, -apple-system, 'Segoe UI', sans-serif;
             background: var(--ha-background);
             color: var(--primary-text-color);
-            min-height: 100vh;
             line-height: 1.45;
-            font-size: 14px;
+            font-size: 13px;
             -webkit-font-smoothing: antialiased;
+            display: flex; flex-direction: column; overflow: hidden;
         }
+        button, select, input { font-family: inherit; }
+        .mono { font-family: var(--mono); }
         .container { max-width: 1500px; margin: 0 auto; padding: 16px 20px 32px; }
 
         ::-webkit-scrollbar { width: 8px; height: 8px; }
         ::-webkit-scrollbar-thumb { background: rgba(140,150,160,0.35); border-radius: 4px; }
         ::-webkit-scrollbar-track { background: transparent; }
 
-        /* ---------- Header ---------- */
-        .app-header {
-            display: flex; justify-content: space-between; align-items: center;
-            gap: 16px; flex-wrap: wrap; padding: 4px 0 14px;
+        /* ---------- Top bar ---------- */
+        .topbar {
+            flex-shrink: 0; min-height: 44px; display: flex; align-items: center; gap: 14px;
+            padding: 6px 14px; background: var(--ha-card-background); border-bottom: var(--card-border);
+            flex-wrap: wrap;
         }
-        .brand { display: flex; align-items: center; gap: 12px; }
-        .brand-icon {
-            width: 38px; height: 38px; border-radius: 10px; flex-shrink: 0;
-            background: rgba(3,169,244,0.12); color: var(--primary-color);
-            display: flex; align-items: center; justify-content: center;
-        }
-        .brand-icon svg { width: 22px; height: 22px; }
-        .brand h1 { font-size: 17px; font-weight: 600; letter-spacing: 0.01em; }
-        .brand-sub { font-size: 12px; color: var(--secondary-text-color); }
-        .brand-sub span + span::before { content: ' · '; }
+        @media (max-width: 1600px) { .brand-sub { display: none; } }
+        @media (max-width: 1360px) { .kpis .kpi-extra { display: none; } }
+        .brand { display: flex; align-items: center; gap: 8px; }
+        .brand svg { width: 20px; height: 20px; color: var(--primary-color); }
+        .brand-name { font-weight: 600; letter-spacing: 0.04em; }
+        .brand-sub { font-family: var(--mono); font-size: 12px; color: var(--secondary-text-color); }
 
-        .header-actions { display: flex; align-items: center; gap: 8px; }
-        .conn {
-            display: inline-flex; align-items: center; gap: 7px;
-            font-size: 12px; color: var(--secondary-text-color); padding: 0 4px;
+        .tabs { display: flex; gap: 2px; padding: 2px; border-radius: 6px; background: var(--ha-background); border: var(--card-border); }
+        .tab {
+            height: 28px; padding: 0 12px; border: none; border-radius: 4px; cursor: pointer;
+            background: transparent; color: var(--secondary-text-color); font-size: 12.5px; font-weight: 500;
         }
-        .conn .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--secondary-text-color); }
-        .conn.live .dot { background: var(--success-color); box-shadow: 0 0 0 3px rgba(67,160,71,0.22); }
-        .conn.reconnecting .dot { background: var(--prio-2); }
-        .conn.live { color: var(--success-color); }
-        .conn.reconnecting { color: var(--prio-2); }
+        .tab:hover { color: var(--primary-text-color); }
+        .tab.active { background: var(--primary-color); color: #fff; }
+        .tab-sep { width: 1px; margin: 4px 4px; background: var(--divider-color); }
+
+        .kpis { display: flex; align-items: center; gap: 16px; font-family: var(--mono); font-size: 12px; color: var(--secondary-text-color); }
+        .kpis b { color: var(--primary-text-color); font-weight: 500; }
+        .rx { display: inline-flex; align-items: center; gap: 6px; font-weight: 500; }
+        .rx::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+        .rx.online { color: var(--success-color); }
+        .rx.offline { color: var(--prio-2); }
+        .rx.stopped { color: var(--danger-color); }
+        .spacer { flex: 1; }
+
+        .filter-pills { display: flex; gap: 4px; flex-wrap: wrap; }
+        .sensor-filter-pill {
+            height: 28px; padding: 0 11px; border-radius: 4px; font-size: 12px; cursor: pointer;
+            border: var(--card-border); background: var(--ha-card-background); color: var(--secondary-text-color);
+        }
+        .sensor-filter-pill:hover { color: var(--primary-text-color); border-color: var(--primary-color); }
+        .sensor-filter-pill.active { background: var(--selected-bg); border-color: var(--primary-color); color: var(--primary-text-color); }
 
         .icon-btn {
-            width: 32px; height: 32px; border-radius: 8px; border: var(--card-border);
+            width: 28px; height: 28px; border-radius: 4px; border: var(--card-border);
             background: var(--ha-card-background); color: var(--primary-text-color);
             display: inline-flex; align-items: center; justify-content: center;
-            cursor: pointer; font-size: 15px; transition: background 0.15s, opacity 0.15s;
+            cursor: pointer; font-size: 13px; transition: background 0.15s, opacity 0.15s;
         }
         .icon-btn:hover { background: var(--hover-bg); }
         .icon-btn.off { opacity: 0.4; }
         .icon-btn.paused { background: rgba(255,152,0,0.18); color: #ff9800; }
+        .clock { font-family: var(--mono); font-size: 15px; font-weight: 500; letter-spacing: 0.04em; }
 
-        .pill { padding: 5px 12px; border-radius: 999px; font-size: 12px; font-weight: 600; }
-        .pill-success { background: rgba(67,160,71,0.15); color: #4caf50; }
-        .pill-danger { background: rgba(229,72,77,0.14); color: #ef5350; }
+        /* ---------- Status bar ---------- */
+        .statusbar {
+            flex-shrink: 0; height: 26px; display: flex; align-items: center; gap: 18px; padding: 0 14px;
+            background: var(--ha-card-background); border-top: var(--card-border);
+            font-family: var(--mono); font-size: 11px; color: var(--secondary-text-color); white-space: nowrap; overflow: hidden;
+        }
+        .conn { display: inline-flex; align-items: center; gap: 6px; }
+        .conn .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--secondary-text-color); }
+        .conn.live { color: var(--success-color); }
+        .conn.live .dot { background: var(--success-color); }
+        .conn.reconnecting { color: var(--prio-2); }
+        .conn.reconnecting .dot { background: var(--prio-2); }
+        .decoder-ok { color: var(--success-color); }
+        .decoder-warn { color: var(--prio-2); }
+        .decoder-bad { color: var(--danger-color); }
 
-        /* ---------- Tabs ---------- */
-        .tabs {
-            display: flex; gap: 2px; margin-bottom: 18px;
-            border-bottom: 1px solid var(--divider-color);
-        }
-        .tab {
-            padding: 10px 16px; cursor: pointer; border: none; background: transparent;
-            color: var(--secondary-text-color); font-size: 13px; font-weight: 500;
-            border-bottom: 2px solid transparent; margin-bottom: -1px;
-            display: inline-flex; align-items: center; gap: 7px;
-            border-radius: 8px 8px 0 0; transition: color 0.15s, background 0.15s;
-        }
-        .tab svg { width: 17px; height: 17px; }
-        .tab:hover { color: var(--primary-text-color); background: var(--hover-bg); }
-        .tab.active { color: var(--primary-color); border-bottom-color: var(--primary-color); }
+        /* ---------- Views ---------- */
+        .views { flex: 1; min-height: 0; position: relative; }
         .tab-content { display: none; }
         .tab-content.active { display: block; }
+        .view.active { display: flex; height: 100%; }
+        .pages { height: 100%; overflow-y: auto; }
+        .pages:not(:has(.tab-content.active)) { display: none; }
 
-        /* ---------- Cards & stats ---------- */
-        .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 14px; }
-        .stat-card {
-            background: var(--ha-card-background); border: var(--card-border);
-            border-radius: var(--card-radius); box-shadow: var(--shadow-sm);
-            padding: 16px 18px; display: flex; align-items: center; gap: 14px;
+        .panel-label {
+            height: 34px; flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+            padding: 0 14px; border-bottom: var(--card-border); background: var(--ha-card-background);
+            color: var(--secondary-text-color); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
         }
-        .stat-icon {
-            width: 40px; height: 40px; border-radius: 10px; flex-shrink: 0;
-            background: rgba(3,169,244,0.10); color: var(--primary-color);
-            display: flex; align-items: center; justify-content: center;
+        .empty-state { color: var(--secondary-text-color); text-align: center; padding: 40px 20px; font-size: 12px; }
+
+        .prio {
+            display: inline-block; min-width: 30px; padding: 1px 4px; border-radius: 3px; text-align: center;
+            font-family: var(--mono); font-size: 11.5px; font-weight: 600;
+            background: var(--prio-3); color: var(--prio-3-text);
         }
-        .stat-icon svg { width: 20px; height: 20px; }
-        .stat-value { font-size: 24px; font-weight: 600; line-height: 1.15; color: var(--primary-text-color); }
-        .stat-label {
-            color: var(--secondary-text-color); font-size: 11px; margin-top: 2px;
-            text-transform: uppercase; letter-spacing: 0.06em; font-weight: 500;
+        .prio.p1 { background: var(--prio-1); color: var(--prio-1-text); }
+        .prio.p2 { background: var(--prio-2); color: var(--prio-2-text); }
+        .disc { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; overflow: hidden; }
+        .disc::before { content: ''; width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--disc-other); }
+        .disc.ambulance::before { background: var(--disc-ambulance); }
+        .disc.brandweer::before { background: var(--disc-brandweer); }
+        .disc.politie::before { background: var(--disc-politie); }
+        .badge { padding: 1px 6px; border-radius: 3px; font-size: 11px; font-weight: 600; white-space: nowrap; background: var(--tag-bg); color: var(--tag-text); }
+        .badge.incident { background: var(--incident-bg); color: var(--incident-text); }
+        .pill { padding: 5px 12px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+
+        /* Console: message table | map + docked detail */
+        .console { flex: 1; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) 560px; gap: 1px; background: var(--divider-color); }
+        .feed { display: flex; flex-direction: column; min-height: 0; background: var(--ha-card-background); }
+        .feed-head, .feed-row {
+            display: grid; grid-template-columns: 66px 42px 104px minmax(0, 1fr) 170px 66px;
+            gap: 10px; padding: 0 14px; align-items: center;
+        }
+        .feed-head {
+            height: 30px; flex-shrink: 0; background: var(--ha-background); border-bottom: var(--card-border);
+            color: var(--secondary-text-color); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
+        }
+        .feed-rows { flex: 1; min-height: 0; overflow-y: auto; }
+        .feed-row {
+            width: 100%; height: 30px; border: 0; border-bottom: 1px solid var(--divider-color); text-align: left;
+            background: transparent; color: inherit; font-size: 13px; cursor: pointer;
+        }
+        .feed-row:nth-child(even) { background: var(--row-alt); }
+        .feed-row:hover { background: var(--hover-bg); }
+        .feed-row.selected { background: var(--selected-bg); box-shadow: inset 3px 0 0 var(--primary-color); }
+        .feed-row .time, .feed-row .unit { font-family: var(--mono); color: var(--secondary-text-color); }
+        .feed-row .text { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .feed-row .text .badge { margin-left: 8px; font-family: inherit; }
+        .feed-row .place { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .side { display: flex; flex-direction: column; min-height: 0; background: var(--ha-card-background); }
+        .side .map-slot { height: 300px; flex-shrink: 0; }
+        .detail-dock { flex: 1; min-height: 0; overflow-y: auto; border-top: var(--card-border); }
+
+        /* Wallboard: big map + incident list, ticker below */
+        .wallboard { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+        .wall-main { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 400px; }
+        .wall-map { position: relative; min-height: 0; }
+        .wall-map .map-slot { position: absolute; inset: 0; }
+        .wall-kpis {
+            position: absolute; top: 12px; left: 56px; z-index: 900; display: flex; gap: 1px;
+            background: var(--divider-color); border: var(--card-border); border-radius: 4px; overflow: hidden;
+        }
+        .wall-kpi { padding: 7px 14px; background: var(--ha-card-background); }
+        .wall-kpi .v { font-family: var(--mono); font-size: 22px; font-weight: 600; line-height: 1.2; }
+        .wall-kpi .l { font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--secondary-text-color); }
+        .wall-kpi .v.p1 { color: var(--prio-1); }
+        .wall-kpi .v.grip { color: var(--prio-2); }
+        .wall-list { display: flex; flex-direction: column; min-height: 0; background: var(--ha-card-background); border-left: var(--card-border); }
+        .wall-items { flex: 1; min-height: 0; overflow-y: auto; }
+        .incident-card {
+            width: 100%; display: flex; flex-direction: column; gap: 5px; padding: 10px 14px; text-align: left;
+            border: 0; border-bottom: var(--card-border); background: transparent; color: inherit; cursor: pointer; font-size: 13px;
+        }
+        .incident-card:hover { background: var(--hover-bg); }
+        .incident-card.selected { background: var(--selected-bg); }
+        .incident-card.stale { opacity: 0.6; }
+        .incident-card .top { display: flex; align-items: center; gap: 8px; }
+        .incident-card .title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .incident-card .age { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--secondary-text-color); }
+        .incident-card .place { color: var(--secondary-text-color); font-size: 12.5px; }
+        .incident-card .tags { display: flex; gap: 6px; flex-wrap: wrap; }
+        .ticker { height: 88px; flex-shrink: 0; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 1px; background: var(--divider-color); border-top: var(--card-border); }
+        .tick {
+            min-width: 0; padding: 9px 12px; display: flex; flex-direction: column; gap: 4px; text-align: left;
+            border: 0; background: var(--ha-card-background); color: inherit; cursor: pointer;
+        }
+        .tick:hover { background: var(--hover-bg); }
+        .tick .meta { display: flex; gap: 8px; align-items: center; font-family: var(--mono); font-size: 12px; color: var(--secondary-text-color); }
+        .tick .text {
+            font-family: var(--mono); font-size: 12px; line-height: 1.4; overflow: hidden;
+            display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
         }
 
-        /* ---------- Map ---------- */
-        .map-wrapper {
-            position: relative; border-radius: var(--card-radius);
-            border: var(--card-border); overflow: hidden; box-shadow: var(--shadow-sm);
-            margin-bottom: 14px;
+        /* Lanes: one column per discipline + map */
+        .lanes { flex: 1; min-width: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)) 380px; gap: 1px; background: var(--divider-color); }
+        .lane { display: flex; flex-direction: column; min-height: 0; background: var(--ha-background); }
+        .lane-head {
+            height: 38px; flex-shrink: 0; display: flex; align-items: center; gap: 8px; padding: 0 12px;
+            background: var(--ha-card-background); border-bottom: 2px solid var(--disc-other); font-weight: 600;
         }
-        #map { height: 400px; min-height: 200px; max-height: 80vh; }
+        .lane-head.ambulance { border-bottom-color: var(--disc-ambulance); }
+        .lane-head.brandweer { border-bottom-color: var(--disc-brandweer); }
+        .lane-head.politie { border-bottom-color: var(--disc-politie); }
+        .lane-head .count { margin-left: auto; font-family: var(--mono); font-size: 12px; font-weight: 400; color: var(--secondary-text-color); }
+        .lane-items { flex: 1; min-height: 0; overflow-y: auto; padding: 6px; display: flex; flex-direction: column; gap: 6px; }
+        .lane-card {
+            width: 100%; display: flex; flex-direction: column; gap: 3px; padding: 8px 10px; text-align: left;
+            border: 1px solid transparent; border-radius: 4px; background: var(--ha-card-background); color: inherit; cursor: pointer; font-size: 13px;
+        }
+        .lane-card:hover { border-color: var(--divider-color); }
+        .lane-card.selected { background: var(--selected-bg); border-color: var(--primary-color); }
+        .lane-card .meta { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 12px; color: var(--secondary-text-color); }
+        .lane-card .meta .unit { margin-left: auto; }
+        .lane-card .text { font-family: var(--mono); font-size: 12px; line-height: 1.4; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+        .lane-card .place { color: var(--secondary-text-color); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .lanes-side { display: flex; flex-direction: column; min-height: 0; background: var(--ha-card-background); }
+        .lanes-side .map-slot { flex: 1; min-height: 0; }
+
+        /* ---------- Map (one Leaflet map, moved into the active view's slot) ---------- */
+        .map-slot { position: relative; background: var(--map-bg); }
+        #map-root { position: absolute; inset: 0; }
+        #map { position: absolute; inset: 0; background: var(--map-bg); }
+        :root:not([data-theme="light"]) .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(0.9) contrast(0.9); }
         .map-history {
-            position: absolute; top: 10px; right: 10px; z-index: 1000;
+            position: absolute; top: 8px; right: 8px; z-index: 1000;
             display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end;
-            padding: 6px 10px; border-radius: 8px; max-width: calc(100% - 70px);
+            padding: 4px 8px; border-radius: 4px; max-width: calc(100% - 70px);
             background: var(--ha-card-background); border: var(--card-border); box-shadow: var(--shadow-sm);
             font-size: 12px;
         }
-        .map-history select { padding: 3px 6px; font-size: 12px; }
-        .map-history input[type=range] { width: 180px; }
+        .map-history select { padding: 2px 6px; font-size: 12px; }
+        .map-history input[type=range] { width: 160px; }
         .map-history .until { color: var(--secondary-text-color); white-space: nowrap; }
-        .map-resize-handle {
-            position: absolute; bottom: 0; left: 0; right: 0; height: 10px;
-            cursor: ns-resize; z-index: 1000;
-            display: flex; align-items: center; justify-content: center;
-            background: rgba(0,0,0,0.08);
+        .leaflet-container { font-family: inherit; }
+
+        /* ---------- Message detail (docked in Console, popup elsewhere) ---------- */
+        #detail { display: flex; flex-direction: column; }
+        #detail-content { padding: 12px 16px; display: flex; flex-direction: column; gap: 10px; }
+        .detail-head { display: flex; align-items: center; gap: 10px; }
+        .detail-head h2 { font-size: 15px; font-weight: 600; }
+        .detail-head .when { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--secondary-text-color); white-space: nowrap; }
+        .detail-body {
+            padding: 9px 11px; border-radius: 4px; background: var(--ha-background); border: var(--card-border);
+            font-family: var(--mono); font-size: 12.5px; line-height: 1.5; word-break: break-word;
         }
-        .map-resize-handle:hover, .map-resize-handle.active { background: rgba(3,169,244,0.25); }
-        .map-resize-handle::after {
-            content: ''; width: 40px; height: 3px; border-radius: 2px;
-            background: rgba(128,128,128,0.6);
+        .abbrev-tags { display: flex; gap: 6px; flex-wrap: wrap; }
+        .abbrev-tag { padding: 2px 8px; border-radius: 999px; font-size: 11.5px; background: var(--tag-bg); color: var(--tag-text); }
+        .detail-cols { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: start; }
+        .detail-fields { display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 6px 10px; font-size: 12.5px; }
+        .detail-fields dt { color: var(--secondary-text-color); }
+        .detail-fields dd { word-break: break-word; }
+        .raw-block summary { cursor: pointer; color: var(--secondary-text-color); font-size: 11.5px; }
+        .raw-block pre {
+            margin-top: 6px; padding: 8px 10px; background: var(--ha-background); border-radius: 4px;
+            font-family: var(--mono); font-size: 11px; white-space: pre-wrap; word-break: break-all;
         }
 
-        /* ---------- Dashboard content ---------- */
-        .content-grid { display: grid; grid-template-columns: 340px 1fr; gap: 14px; align-items: start; }
+        .vehicle-side { width: 150px; display: flex; flex-direction: column; align-items: stretch; gap: 6px; text-align: center; }
+        .vehicle-visual {
+            height: 112px; border-radius: 6px; cursor: pointer; overflow: hidden;
+            background: var(--ha-background); border: 1px dashed var(--divider-color);
+            display: flex; align-items: center; justify-content: center; font-size: 44px;
+        }
+        .vehicle-visual:hover { opacity: 0.85; }
+        .vehicle-visual img { width: 100%; height: 100%; object-fit: cover; }
+        .vehicle-category-label { font-size: 12px; font-weight: 600; }
+        .vehicle-number-label { font-size: 11px; color: var(--secondary-text-color); font-family: var(--mono); }
+        .vehicle-side .btn { justify-content: center; padding: 4px 10px; font-size: 11.5px; }
+        .detail-modal .vehicle-side { width: 240px; }
+        .detail-modal .vehicle-visual { height: 180px; font-size: 64px; }
 
+        .history-section { padding: 10px 16px 14px; border-top: var(--card-border); display: flex; flex-direction: column; gap: 6px; }
+        .history-section h4 { color: var(--secondary-text-color); font-size: 11px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.06em; }
+        .history-item { display: grid; grid-template-columns: 104px minmax(0, 1fr); gap: 8px; font-size: 12px; }
+        .disc-tag { padding: 1px 7px; border-radius: 3px; font-size: 11.5px; border: 1px solid currentColor; color: var(--disc-other); }
+        .disc-tag.ambulance { color: var(--disc-ambulance); }
+        .disc-tag.brandweer { color: var(--disc-brandweer); }
+        .disc-tag.politie { color: var(--disc-politie); }
+        .disc-tag.grip { color: var(--prio-2); }
+        .history-item .time { font-family: var(--mono); color: var(--secondary-text-color); }
+        .history-item .text { font-family: var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+        .detail-modal { width: min(920px, 100%); max-height: calc(100vh - 40px); display: flex; flex-direction: column; }
+        .detail-modal #detail { overflow-y: auto; }
+
+        /* Advanced & Database pages */
         .panel {
             background: var(--ha-card-background); border: var(--card-border);
             border-radius: var(--card-radius); box-shadow: var(--shadow-sm);
@@ -1493,106 +1685,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .panel-title { font-size: 13px; font-weight: 600; }
         .panel-sub { color: var(--secondary-text-color); font-size: 11px; }
         .panel-body { padding: 16px; }
-
-        .sensor-filter-bar {
-            display: flex; flex-wrap: wrap; gap: 6px;
-            padding: 0 10px 10px;
-        }
-        .sensor-filter-pill {
-            padding: 4px 11px; border-radius: 999px; font-size: 12px; font-weight: 500;
-            border: 1px solid var(--divider-color); background: var(--ha-card-background);
-            color: var(--secondary-text-color); cursor: pointer; transition: all 0.12s;
-        }
-        .sensor-filter-pill:hover { border-color: var(--primary-color); color: var(--primary-text-color); }
-        .sensor-filter-pill.active {
-            background: var(--primary-color); border-color: var(--primary-color); color: white;
-        }
-        .msg-list {
-            display: flex; flex-direction: column; gap: 8px;
-            max-height: 460px; overflow-y: auto; padding: 10px;
-        }
-        .empty-state {
-            color: var(--secondary-text-color); text-align: center;
-            padding: 40px 20px; font-size: 12px;
-        }
-
-        .message {
-            background: var(--ha-card-background); border: var(--card-border);
-            border-left: 3px solid var(--secondary-text-color);
-            border-radius: 8px; padding: 9px 11px; cursor: pointer;
-            transition: background 0.12s, border-color 0.12s;
-        }
-        .message:hover { background: var(--hover-bg); }
-        .message.selected { border-color: var(--primary-color); background: rgba(3,169,244,0.08); }
-        .message.prio-1 { border-left-color: var(--prio-1); }
-        .message.prio-2 { border-left-color: var(--prio-2); }
-        .message.prio-3 { border-left-color: var(--prio-3); }
-        .message-header { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
-        .message-time { color: var(--secondary-text-color); font-size: 11px; white-space: nowrap; }
-        .message-badges { display: flex; gap: 4px; flex-wrap: wrap; }
-        .message-body { font-size: 12px; line-height: 1.4; color: var(--primary-text-color); }
-        .message-location { color: var(--secondary-text-color); font-size: 11px; margin-top: 4px; }
-
-        .badge {
-            padding: 2px 8px; border-radius: 999px; font-size: 10px; font-weight: 600;
-            background: rgba(3,169,244,0.12); color: var(--primary-color);
-        }
-        .badge.discipline { background: rgba(255,152,0,0.14); color: var(--accent-color); }
-        .badge.prio { background: rgba(229,72,77,0.14); color: #ef5350; }
-        .badge.incident { background: rgba(229,72,77,0.22); color: #ef5350; }
-        .pill-warning { background: rgba(245,124,0,0.16); color: var(--prio-2); }
-
-        /* ---------- Detail panel ---------- */
-        .detail-panel { position: sticky; top: 0; }
-        .detail-wrap { display: flex; gap: 16px; align-items: flex-start; }
-        .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 16px; flex: 1; min-width: 0; }
-        .detail-row {
-            display: flex; justify-content: space-between; gap: 12px;
-            padding: 7px 0; border-bottom: 1px solid var(--divider-color);
-        }
-        .detail-label { color: var(--secondary-text-color); font-size: 12px; white-space: nowrap; }
-        .detail-value { color: var(--primary-text-color); font-size: 12px; font-weight: 500; text-align: right; word-break: break-word; }
-        .detail-body {
-            grid-column: 1 / -1; padding: 9px 11px; margin-bottom: 6px;
-            background: var(--hover-bg); border-radius: 8px;
-            font-size: 12px; word-break: break-word;
-        }
-        .abbrev-tag {
-            display: inline-block; padding: 2px 7px; margin: 2px 2px 2px 0;
-            background: rgba(3,169,244,0.10); border-radius: 999px; font-size: 10px;
-        }
-        .raw-block { grid-column: 1 / -1; margin-top: 4px; }
-        .raw-block summary { cursor: pointer; color: var(--secondary-text-color); font-size: 11px; }
-        .raw-block pre {
-            margin-top: 6px; padding: 8px 10px; background: var(--hover-bg);
-            border-radius: 8px; font-size: 11px; white-space: pre-wrap; word-break: break-all;
-        }
-
-        .vehicle-side {
-            flex-shrink: 0;
-            display: flex; flex-direction: column; align-items: center; gap: 6px;
-            width: 140px; padding: 9px 11px;
-            background: var(--hover-bg); border-radius: 8px; text-align: center;
-        }
-        .vehicle-visual {
-            width: 120px; height: 120px; border-radius: 10px; flex-shrink: 0; cursor: pointer;
-            background: var(--ha-card-background); border: var(--card-border);
-            display: flex; align-items: center; justify-content: center; overflow: hidden;
-            font-size: 48px; transition: opacity 0.12s;
-        }
-        .vehicle-visual:hover { opacity: 0.8; }
-        .vehicle-visual img { width: 100%; height: 100%; object-fit: cover; }
-        .vehicle-category-label { font-size: 12.5px; font-weight: 500; color: var(--primary-text-color); }
-        .vehicle-number-label { font-size: 11px; color: var(--secondary-text-color); margin-top: 1px; }
-        .vehicle-side .btn { margin-top: 4px; padding: 4px 10px; font-size: 11.5px; width: 100%; }
-
-        .history-section { padding: 0 14px 12px; }
-        .history-section h4 { color: var(--accent-color); font-size: 11px; font-weight: 600; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
-        .history-item {
-            padding: 8px 10px; background: var(--hover-bg); border-radius: 8px;
-            margin-bottom: 6px; font-size: 12px;
-        }
-        .history-item .time { color: var(--secondary-text-color); font-size: 11px; }
 
         /* ---------- Buttons & inputs ---------- */
         .btn {
@@ -1761,126 +1853,108 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .db-card-count span { color: var(--primary-color); font-size: 14px; }
         .db-card-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: auto; }
 
-        @media (max-width: 1100px) {
-            .content-grid { grid-template-columns: 1fr; }
-            .stats-grid { grid-template-columns: repeat(2, 1fr); }
-            .detail-panel { position: static; }
+        @media (max-width: 1200px) {
+            .console { grid-template-columns: minmax(0, 1fr) 420px; }
+            .lanes { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+            .lanes-side { display: none; }
+            .wall-main { grid-template-columns: minmax(0, 1fr) 320px; }
+            .feed-head, .feed-row { grid-template-columns: 62px 42px 96px minmax(0, 1fr) 130px; }
+            .feed-head .unit, .feed-row .unit { display: none; }
         }
-        @media (max-width: 560px) {
-            .stats-grid { grid-template-columns: 1fr; }
-            .detail-grid { grid-template-columns: 1fr; }
+        @media (max-width: 800px) {
+            body { overflow: auto; }
+            .view.active { height: auto; }
+            .console, .wall-main { grid-template-columns: 1fr; }
+            .feed-rows { max-height: 60vh; }
+            .wall-map { height: 50vh; }
+            .lanes { grid-template-columns: 1fr; }
+            .ticker { grid-template-columns: repeat(2, minmax(0, 1fr)); height: auto; }
+            .detail-cols { grid-template-columns: 1fr; }
+            .feed-head, .feed-row { grid-template-columns: 58px 42px minmax(0, 1fr); }
+            .feed-head .disc-col, .feed-row .disc, .feed-head .place-col, .feed-row .place { display: none; }
         }
     </style>
 </head>
 <body>
+    <header class="topbar">
+        <div class="brand">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M5 5a10 10 0 0 0 0 14M19 5a10 10 0 0 1 0 14M8 8a6 6 0 0 0 0 8M16 8a6 6 0 0 1 0 8"/><circle cx="12" cy="12" r="1.6"/></svg>
+            <span class="brand-name">MELDKAMER</span>
+            <span class="brand-sub"><span id="network-name">P2000 FLEX</span> · <span id="receiver-type"></span></span>
+        </div>
+        <nav class="tabs" aria-label="Views">
+            <button type="button" class="tab" data-tab="console" onclick="switchTab('console')">Console</button>
+            <button type="button" class="tab" data-tab="wallboard" onclick="switchTab('wallboard')">Wallboard</button>
+            <button type="button" class="tab" data-tab="lanes" onclick="switchTab('lanes')">Lanes</button>
+            <span class="tab-sep" aria-hidden="true"></span>
+            <button type="button" class="tab" data-tab="advanced" onclick="switchTab('advanced')">Advanced</button>
+            <button type="button" class="tab" data-tab="database" onclick="switchTab('database')">Database</button>
+        </nav>
+        <div class="kpis">
+            <span id="rx-status" class="rx stopped">DECODER STOPPED</span>
+            <span>MSG <b id="kpi-msgs-hour">0</b>/h</span>
+            <span class="kpi-extra">FRAMES <b id="kpi-frames">0</b>/min</span>
+            <span class="kpi-extra">INCIDENTS <b id="kpi-incidents">0</b></span>
+        </div>
+        <span class="spacer"></span>
+        <div id="sensor-filter-bar" class="filter-pills" aria-label="Feed filter"></div>
+        <button id="sound-toggle" class="icon-btn" onclick="toggleSound()" title="Toggle notification sound">
+            <span id="sound-icon">🔔</span>
+        </button>
+        <button id="tts-toggle" class="icon-btn off" onclick="toggleTts()" title="Toggle speech output">
+            <span id="tts-icon">🔇</span>
+        </button>
+        <button id="automap-toggle" class="icon-btn" onclick="toggleAutoMap()" title="Auto-show new messages on map">
+            <span id="automap-icon">📍</span>
+        </button>
+        <button id="theme-toggle" class="icon-btn" onclick="cycleTheme()" title="Theme">
+            <span id="theme-icon">🌓</span>
+        </button>
+        <span id="clock" class="clock"></span>
+    </header>
+
+    <div class="views">
+        <section id="tab-console" class="tab-content view" aria-label="Console">
+            <div class="console">
+                <div class="feed">
+                    <div class="feed-head"><span>Time</span><span>Prio</span><span class="disc-col">Discipline</span><span>Message</span><span class="place-col">Location</span><span class="unit">Unit</span></div>
+                    <div id="console-rows" class="feed-rows"><div class="empty-state">No messages yet</div></div>
+                </div>
+                <div class="side">
+                    <div id="slot-console" class="map-slot"></div>
+                    <div id="detail-dock" class="detail-dock"></div>
+                </div>
+            </div>
+        </section>
+
+        <section id="tab-wallboard" class="tab-content view" aria-label="Wallboard">
+            <div class="wallboard">
+                <div class="wall-main">
+                    <div class="wall-map">
+                        <div id="slot-wallboard" class="map-slot"></div>
+                        <div id="wall-kpis" class="wall-kpis"></div>
+                    </div>
+                    <div class="wall-list">
+                        <div class="panel-label"><span>Incidents</span><span>by priority</span></div>
+                        <div id="wall-items" class="wall-items"><div class="empty-state">No messages yet</div></div>
+                    </div>
+                </div>
+                <div id="wall-ticker" class="ticker"></div>
+            </div>
+        </section>
+
+        <section id="tab-lanes" class="tab-content view" aria-label="Lanes">
+            <div class="lanes">
+                <div id="lane-brandweer" class="lane"></div>
+                <div id="lane-ambulance" class="lane"></div>
+                <div id="lane-politie" class="lane"></div>
+                <div id="lane-other" class="lane"></div>
+                <div class="lanes-side"><div id="slot-lanes" class="map-slot"></div></div>
+            </div>
+        </section>
+
+    <div class="pages">
     <div class="container">
-        <header class="app-header">
-            <div class="brand">
-                <span class="brand-icon">
-                    <svg viewBox="0 0 24 24"><path fill="currentColor" d="M4.93,4.93C3.12,6.74 2,9.24 2,12C2,14.76 3.12,17.26 4.93,19.07L6.34,17.66C4.89,16.22 4,14.22 4,12C4,9.79 4.89,7.78 6.34,6.34L4.93,4.93M19.07,4.93L17.66,6.34C19.11,7.78 20,9.79 20,12C20,14.22 19.11,16.22 17.66,17.66L19.07,19.07C20.88,17.26 22,14.76 22,12C22,9.24 20.88,6.74 19.07,4.93M7.76,7.76C6.67,8.85 6,10.35 6,12C6,13.65 6.67,15.15 7.76,16.24L9.17,14.83C8.45,14.11 8,13.11 8,12C8,10.89 8.45,9.89 9.17,9.17L7.76,7.76M16.24,7.76L14.83,9.17C15.55,9.89 16,10.89 16,12C16,13.11 15.55,14.11 14.83,14.83L16.24,16.24C17.33,15.15 18,13.65 18,12C18,10.35 17.33,8.85 16.24,7.76M12,10A2,2 0 0,0 10,12A2,2 0 0,0 12,14A2,2 0 0,0 14,12A2,2 0 0,0 12,10Z"/></svg>
-                </span>
-                <div>
-                    <h1>Meldkamer</h1>
-                    <div class="brand-sub"><span id="network-name">P2000 FLEX</span><span id="receiver-type"></span></div>
-                </div>
-            </div>
-            <div class="header-actions">
-                <span id="stream-status" class="conn" title="Live data connection"><span class="dot"></span><span id="stream-status-text">Connecting…</span></span>
-                <button id="sound-toggle" class="icon-btn" onclick="toggleSound()" title="Toggle notification sound">
-                    <span id="sound-icon">🔔</span>
-                </button>
-                <button id="tts-toggle" class="icon-btn off" onclick="toggleTts()" title="Toggle speech output">
-                    <span id="tts-icon">🔇</span>
-                </button>
-                <button id="automap-toggle" class="icon-btn" onclick="toggleAutoMap()" title="Auto-show new messages on map">
-                    <span id="automap-icon">📍</span>
-                </button>
-                <span id="decoder-status" class="pill pill-danger">Decoder stopped</span>
-            </div>
-        </header>
-
-        <div class="tabs">
-            <button class="tab active" data-tab="dashboard" onclick="switchTab('dashboard')">
-                <svg viewBox="0 0 24 24"><path fill="currentColor" d="M13,9H11V7H13M13,17H11V11H13M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2Z"/></svg>
-                Dashboard
-            </button>
-            <button class="tab" data-tab="advanced" onclick="switchTab('advanced')">
-                <svg viewBox="0 0 24 24"><path fill="currentColor" d="M12,15.5A3.5,3.5 0 0,1 8.5,12A3.5,3.5 0 0,1 12,8.5A3.5,3.5 0 0,1 15.5,12A3.5,3.5 0 0,1 12,15.5M19.43,12.97C19.47,12.65 19.5,12.33 19.5,12C19.5,11.67 19.47,11.34 19.43,11L21.54,9.37C21.73,9.22 21.78,8.95 21.66,8.73L19.66,5.27C19.54,5.05 19.27,4.96 19.05,5.05L16.56,6.05C16.04,5.66 15.5,5.32 14.87,5.07L14.5,2.42C14.46,2.18 14.25,2 14,2H10C9.75,2 9.54,2.18 9.5,2.42L9.13,5.07C8.5,5.32 7.96,5.66 7.44,6.05L4.95,5.05C4.73,4.96 4.46,5.05 4.34,5.27L2.34,8.73C2.21,8.95 2.27,9.22 2.46,9.37L4.57,11C4.53,11.34 4.5,11.67 4.5,12C4.5,12.33 4.53,12.65 4.57,12.97L2.46,14.63C2.27,14.78 2.21,15.05 2.34,15.27L4.34,18.73C4.46,18.95 4.73,19.03 4.95,18.95L7.44,17.94C7.96,18.34 8.5,18.68 9.13,18.93L9.5,21.58C9.54,21.82 9.75,22 10,22H14C14.25,22 14.46,21.82 14.5,21.58L14.87,18.93C15.5,18.67 16.04,18.34 16.56,17.94L19.05,18.95C19.27,19.03 19.54,18.95 19.66,18.73L21.66,15.27C21.78,15.05 21.73,14.78 21.54,14.63L19.43,12.97Z"/></svg>
-                Advanced
-            </button>
-            <button class="tab" data-tab="database" onclick="switchTab('database')">
-                <svg viewBox="0 0 24 24"><path fill="currentColor" d="M12,3C7.58,3 4,4.79 4,7C4,9.21 7.58,11 12,11C16.42,11 20,9.21 20,7C20,4.79 16.42,3 12,3M4,9V12C4,14.21 7.58,16 12,16C16.42,16 20,14.21 20,12V9C20,11.21 16.42,13 12,13C7.58,13 4,11.21 4,9M4,14V17C4,19.21 7.58,21 12,21C16.42,21 20,19.21 20,17V14C20,16.21 16.42,18 12,18C7.58,18 4,16.21 4,14Z"/></svg>
-                Database
-            </button>
-        </div>
-
-        <div id="tab-dashboard" class="tab-content active">
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <span class="stat-icon"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M20,2H4C2.9,2 2,2.9 2,4V22L6,18H20C21.1,18 22,17.1 22,16V4C22,2.9 21.1,2 20,2Z"/></svg></span>
-                    <div><div class="stat-value" id="total-messages">0</div><div class="stat-label">Total messages</div></div>
-                </div>
-                <div class="stat-card">
-                    <span class="stat-icon"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12,20A8,8 0 0,0 20,12A8,8 0 0,0 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20M12,2A10,10 0 0,1 22,12A10,10 0 0,1 12,22C6.47,22 2,17.5 2,12A10,10 0 0,1 12,2M12.5,7V12.25L17,14.92L16.25,16.15L11,13V7H12.5Z"/></svg></span>
-                    <div><div class="stat-value" id="uptime">0m</div><div class="stat-label">Uptime</div></div>
-                </div>
-                <div class="stat-card">
-                    <span class="stat-icon"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M17.9,17.39C17.64,16.59 16.89,16 16,16H15V13A1,1 0 0,0 14,12H8V10H10A1,1 0 0,0 11,9V7H13A2,2 0 0,0 15,5V4.59C17.93,5.77 20,8.65 20,12C20,14.08 19.2,15.97 17.9,17.39M11,19.93C7.05,19.44 4,16.08 4,12C4,11.38 4.08,10.78 4.21,10.21L9,15V16A2,2 0 0,0 11,18M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2Z"/></svg></span>
-                    <div><div class="stat-value" id="regions-count">0</div><div class="stat-label">Regions</div></div>
-                </div>
-                <div class="stat-card">
-                    <span class="stat-icon"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M11,13.5V21.5H3V13.5H11M12,2L17.5,11H6.5L12,2M17.5,13A4.5,4.5 0 0,1 22,17.5A4.5,4.5 0 0,1 17.5,22A4.5,4.5 0 0,1 13,17.5A4.5,4.5 0 0,1 17.5,13Z"/></svg></span>
-                    <div><div class="stat-value" id="disciplines-count">0</div><div class="stat-label">Disciplines</div></div>
-                </div>
-            </div>
-
-            <div class="map-wrapper">
-                <div id="map"></div>
-                <div class="map-history">
-                    <label for="map-history-hours">History</label>
-                    <select id="map-history-hours" class="input" onchange="loadMapHistory()">
-                        <option value="">Off</option>
-                        <option value="24">24 hours</option>
-                        <option value="168">7 days</option>
-                        <option value="720">30 days</option>
-                        <option value="8760">1 year</option>
-                    </select>
-                    <input id="map-history-until" type="range" style="display:none;" oninput="renderMapHistory()" title="Show incidents up to this moment">
-                    <span id="map-history-label" class="until"></span>
-                </div>
-                <div class="map-resize-handle" id="map-resize-handle" title="Drag to resize map"></div>
-            </div>
-
-            <div class="content-grid">
-                <div class="panel messages-section">
-                    <div id="sensor-filter-section" style="display:none;">
-                        <div class="panel-head"><span class="panel-title">Show</span></div>
-                        <div id="sensor-filter-bar" class="sensor-filter-bar"></div>
-                    </div>
-                    <div class="panel-head">
-                        <span class="panel-title">Recent messages</span>
-                        <span id="msg-count" class="panel-sub"></span>
-                    </div>
-                    <div id="messages" class="msg-list"><div class="empty-state">No messages yet</div></div>
-                </div>
-
-                <div id="detail-panel" class="panel detail-panel">
-                    <div class="panel-head"><span class="panel-title">Message details</span></div>
-                    <div class="panel-body">
-                        <div id="detail-content" class="detail-wrap"><div class="empty-state">Click a message to view details</div></div>
-                    </div>
-                    <div id="incident-section" class="history-section" style="display:none;">
-                        <h4>Incident</h4>
-                        <div id="incident-list"></div>
-                    </div>
-                    <div id="history-section" class="history-section" style="display:none;">
-                        <h4>Location history</h4>
-                        <div id="history-list"></div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
         <div id="tab-advanced" class="tab-content">
             <div class="info-grid">
                 <div class="panel info-card">
@@ -2159,23 +2233,115 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
         </div>
     </div>
+    </div>
+    </div>
+
+    <footer class="statusbar">
+        <span id="decoder-status" class="decoder-bad">● DECODER STOPPED</span>
+        <span id="device-info"></span>
+        <span id="stream-status" class="conn" title="Live data connection"><span class="dot"></span><span id="stream-status-text">Connecting…</span></span>
+        <span class="spacer"></span>
+        <span><span id="total-messages">0</span> messages</span>
+        <span>uptime <span id="uptime">0m</span></span>
+        <span>v__ADDON_VERSION__</span>
+    </footer>
+
+    <!-- The map and the message detail are single elements, moved into the active view -->
+    <div id="parking" hidden>
+        <div id="map-root">
+            <div id="map"></div>
+            <div class="map-history">
+                <label for="map-history-hours">History</label>
+                <select id="map-history-hours" class="input" onchange="loadMapHistory()">
+                    <option value="">Off</option>
+                    <option value="24">24 hours</option>
+                    <option value="168">7 days</option>
+                    <option value="720">30 days</option>
+                    <option value="8760">1 year</option>
+                </select>
+                <input id="map-history-until" type="range" style="display:none;" oninput="renderMapHistory()" title="Show incidents up to this moment">
+                <span id="map-history-label" class="until"></span>
+            </div>
+        </div>
+        <div id="detail">
+            <div id="detail-content"><div class="empty-state">Click a message to view details</div></div>
+            <div id="incident-section" class="history-section" style="display:none;">
+                <h4>Incident</h4>
+                <div id="incident-list"></div>
+            </div>
+            <div id="history-section" class="history-section" style="display:none;">
+                <h4>Earlier at this location</h4>
+                <div id="history-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <div id="detail-modal" class="modal-overlay" onclick="if (event.target === this) closeDetailModal()">
+        <div class="modal detail-modal" role="dialog" aria-modal="true" aria-label="Message details">
+            <div class="modal-head">
+                <span class="modal-title">Message details</span>
+                <button class="modal-close" onclick="closeDetailModal()" aria-label="Close">✕</button>
+            </div>
+            <div id="detail-modal-body"></div>
+        </div>
+    </div>
 
     <div id="modal-root"></div>
     <datalist id="capcode-suggestions"></datalist>
     <div id="toast-root"></div>
-    <div style="position: fixed; left: 12px; bottom: 8px; font-size: 10px; color: var(--secondary-text-color); opacity: 0.6; z-index: 100;">v__ADDON_VERSION__</div>
 
     <script>
         const basePath = window.location.pathname.endsWith('/') ? window.location.pathname : window.location.pathname + '/';
 
         // =====================================================================
-        // Map
+        // Theme: follows Home Assistant's dark mode (this page runs in its
+        // ingress iframe, same origin), the system outside Home Assistant,
+        // or a manual light/dark choice
         // =====================================================================
-        const savedMapHeight = localStorage.getItem('p2000_map_height');
-        if (savedMapHeight) {
-            document.getElementById('map').style.height = savedMapHeight + 'px';
+        const THEME_ICONS = {auto: '🌓', light: '☀️', dark: '🌙'};
+        let themeChoice = localStorage.getItem('p2000_theme');
+        if (!THEME_ICONS[themeChoice]) themeChoice = 'auto';
+
+        function haDarkMode() {
+            try {
+                const ha = window.parent !== window && window.parent.document.querySelector('home-assistant');
+                return ha && ha.hass && ha.hass.themes ? Boolean(ha.hass.themes.darkMode) : null;
+            } catch (e) {
+                return null;  // Not inside Home Assistant's frontend
+            }
         }
 
+        function applyTheme() {
+            let dark = themeChoice === 'dark';
+            if (themeChoice === 'auto') {
+                const ha = haDarkMode();
+                dark = ha === null ? window.matchMedia('(prefers-color-scheme: dark)').matches : ha;
+            }
+            document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+        }
+
+        function initThemeToggle() {
+            document.getElementById('theme-icon').textContent = THEME_ICONS[themeChoice];
+            document.getElementById('theme-toggle').title = themeChoice === 'auto'
+                ? 'Theme follows Home Assistant - click for light'
+                : `Theme: ${themeChoice} - click to change`;
+        }
+
+        function cycleTheme() {
+            themeChoice = {auto: 'light', light: 'dark', dark: 'auto'}[themeChoice];
+            localStorage.setItem('p2000_theme', themeChoice);
+            initThemeToggle();
+            applyTheme();
+        }
+
+        applyTheme();
+        // Home Assistant doesn't tell the iframe when its theme changes
+        setInterval(applyTheme, 2000);
+        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
+
+        // =====================================================================
+        // Map: one Leaflet map, moved into the active view's map slot
+        // =====================================================================
         const map = L.map('map').setView([52.2, 5.3], 8);
         // Tiles come through the add-on (and Home Assistant's built-in map tile
         // proxy); OSM blocks browsers requesting them directly from here.
@@ -2183,49 +2349,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             attribution: '© <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> contributors',
             maxZoom: 19
         }).addTo(map);
-        setTimeout(() => map.invalidateSize(), 100);
-
-        (function() {
-            const handle = document.getElementById('map-resize-handle');
-            const mapEl = document.getElementById('map');
-            let startY, startH;
-
-            handle.addEventListener('mousedown', function(e) {
-                e.preventDefault();
-                startY = e.clientY;
-                startH = mapEl.offsetHeight;
-                handle.classList.add('active');
-                document.addEventListener('mousemove', onDrag);
-                document.addEventListener('mouseup', onRelease);
-            });
-
-            handle.addEventListener('touchstart', function(e) {
-                startY = e.touches[0].clientY;
-                startH = mapEl.offsetHeight;
-                handle.classList.add('active');
-                document.addEventListener('touchmove', onDragTouch);
-                document.addEventListener('touchend', onRelease);
-            });
-
-            function onDrag(e) {
-                const newH = Math.max(200, Math.min(window.innerHeight * 0.8, startH + e.clientY - startY));
-                mapEl.style.height = newH + 'px';
-                map.invalidateSize();
-            }
-            function onDragTouch(e) {
-                const newH = Math.max(200, Math.min(window.innerHeight * 0.8, startH + e.touches[0].clientY - startY));
-                mapEl.style.height = newH + 'px';
-                map.invalidateSize();
-            }
-            function onRelease() {
-                handle.classList.remove('active');
-                document.removeEventListener('mousemove', onDrag);
-                document.removeEventListener('mouseup', onRelease);
-                document.removeEventListener('touchmove', onDragTouch);
-                document.removeEventListener('touchend', onRelease);
-                localStorage.setItem('p2000_map_height', mapEl.offsetHeight);
-            }
-        })();
 
         // Heatmap of past incidents from the message history; the slider
         // replays them up to the chosen moment
@@ -2285,12 +2408,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             return msg.id !== undefined && msg.id !== null ? 'id:' + msg.id : msg.timestamp + '|' + (msg.body || '');
         }
         function highlightSelectedMessage() {
-            document.querySelectorAll('.message').forEach(el => el.classList.remove('selected'));
-            if (selectedMsgKey === null) return;
-            const idx = currentMessages.findIndex(m => msgKey(m) === selectedMsgKey);
-            if (idx < 0) return;
-            const card = document.querySelector(`.message[data-msg-index="${idx}"]`);
-            if (card) card.classList.add('selected');
+            document.querySelectorAll('[data-msg-index]').forEach(el => {
+                const m = currentMessages[Number(el.dataset.msgIndex)];
+                el.classList.toggle('selected', selectedMsgKey !== null && Boolean(m) && msgKey(m) === selectedMsgKey);
+            });
         }
         const markers = [];
 
@@ -2311,11 +2432,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             });
         }
 
-        const messagesEl = document.getElementById('messages');
         const totalEl = document.getElementById('total-messages');
         const uptimeEl = document.getElementById('uptime');
-        const regionsEl = document.getElementById('regions-count');
-        const disciplinesEl = document.getElementById('disciplines-count');
         const decoderEl = document.getElementById('decoder-status');
         const regionChartEl = document.getElementById('region-chart');
         const disciplineChartEl = document.getElementById('discipline-chart');
@@ -2533,11 +2651,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         initSoundToggle();
         initAutoMapToggle();
         initTtsToggle();
+        initThemeToggle();
 
         // =====================================================================
         // Formatting helpers
         // =====================================================================
-        function formatTime(ts) { return new Date(ts).toLocaleTimeString(); }
+        function formatTime(ts) {
+            return new Date(ts).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false});
+        }
         function formatDate(ts) { return new Date(ts).toLocaleString(); }
 
         // Safe for element content AND quoted attribute values
@@ -2547,29 +2668,70 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             return String(text).replace(/[&<>"']/g, ch => HTML_ESCAPES[ch]);
         }
 
-        function countUnique(obj) {
-            const values = new Set();
-            Object.keys(obj || {}).forEach(k => k.split(',').forEach(p => { const t = p.trim(); if (t) values.add(t); }));
-            return values.size;
+        function formatShortDate(ts) {
+            return new Date(ts).toLocaleString([], {day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false});
         }
+
+        // Minutes or hours since a timestamp, for incident ages
+        function ago(ts) {
+            const mins = Math.max(0, Math.floor((Date.now() - new Date(ts)) / 60000));
+            return mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h`;
+        }
+
+        // =====================================================================
+        // Views: Console (detail docked) and Wallboard / Lanes (detail popup)
+        // =====================================================================
+        const VIEWS = ['console', 'wallboard', 'lanes'];
+        let activeView = 'console';
 
         function switchTab(tabName) {
             document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tabName));
-            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            document.getElementById('tab-' + tabName).classList.add('active');
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === 'tab-' + tabName));
+            localStorage.setItem('p2000_tab', tabName);
             if (tabName === 'advanced') loadReceiver();
-            if (tabName === 'dashboard') {
-                setTimeout(() => map.invalidateSize(), 100);
-                resyncIfStale();
+            if (VIEWS.includes(tabName)) {
+                activeView = tabName;
+                document.getElementById('slot-' + tabName).appendChild(document.getElementById('map-root'));
+                placeDetail();
+                setTimeout(() => map.invalidateSize(), 50);
+                if (evtSource) resyncIfStale();
             }
         }
+
+        function placeDetail() {
+            const detail = document.getElementById('detail');
+            if (activeView === 'console') {
+                closeDetailModal();
+                document.getElementById('detail-dock').appendChild(detail);
+            } else {
+                document.getElementById('detail-modal-body').appendChild(detail);
+            }
+        }
+
+        function openDetailModal() {
+            document.getElementById('detail-modal').classList.add('open');
+        }
+
+        function closeDetailModal() {
+            document.getElementById('detail-modal').classList.remove('open');
+        }
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeDetailModal();
+        });
+
+        function updateClock() {
+            document.getElementById('clock').textContent = formatTime(Date.now());
+        }
+        updateClock();
+        setInterval(updateClock, 1000);
 
         // The live stream can silently die (dropped by a proxy, or the browser
         // tab/this in-app tab being away for a while) with no visible error -
         // reconnect + refetch on return instead of leaving it frozen until a
         // manual page reload.
         function resyncIfStale() {
-            if (typeof evtSource === 'undefined' || !evtSource || evtSource.readyState === EventSource.CLOSED) {
+            if (!evtSource || evtSource.readyState === EventSource.CLOSED) {
                 connectStream();
             }
             loadMessagesList();
@@ -2770,16 +2932,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 : '—';
             const hasDistance = msg.distance_km !== null && msg.distance_km !== undefined;
 
-            const leftRows = [
-                ['Time', formatDate(msg.timestamp)],
-                ['Priority', msg.priority ? `P${msg.priority}` : '—'],
+            const fields = [
                 ['Discipline', msg.discipline || '—'],
                 ['Region', msg.region || '—'],
-            ];
-
-            const rightRows = [
-                ['Address', msg.address || '—'],
-                ['City', msg.city || '—'],
+                ['Address', msg.address || msg.city || '—'],
                 ['Geocode level', geocodeLevel],
                 hasDistance ? ['Distance from home', `${msg.distance_km} km`] : null,
                 msg.repeats ? ['Repeats', `resent ${msg.repeats} times`] : null,
@@ -2787,15 +2943,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 ['Receivers', msg.receivers || '—'],
             ].filter(Boolean);
 
-            const renderCol = (rows) => rows.map(([label, value]) => `
-                <div class="detail-row">
-                    <span class="detail-label">${label}</span>
-                    <span class="detail-value">${escapeHtml(value)}</span>
-                </div>
-            `).join('');
-
             const abbrevTags = (msg.abbreviations || []).map(a =>
-                `<span class="abbrev-tag"><strong>${escapeHtml(a.abbreviation)}</strong>: ${escapeHtml(a.full_text)}</span>`
+                `<span class="abbrev-tag"><strong>${escapeHtml(a.abbreviation)}</strong> ${escapeHtml(a.full_text)}</span>`
             ).join('');
 
             const rawBlock = msg.raw_message ? `
@@ -2810,19 +2959,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         <span id="vehicle-icon-fallback">${escapeHtml(msg.vehicle_icon || '📻')}</span>
                     </div>
                     <div class="vehicle-category-label">${escapeHtml(prettyVehicleCategory(msg.vehicle_category))}</div>
-                    ${msg.vehicle_number ? `<div class="vehicle-number-label">#${escapeHtml(msg.vehicle_number)}</div>` : ''}
-                    <button class="btn" onclick="openVehiclePhotoUpload()">📷 Add/change photo</button>
+                    ${msg.vehicle_number ? `<div class="vehicle-number-label">${escapeHtml(msg.vehicle_number)}</div>` : ''}
+                    <button class="btn" onclick="openVehiclePhotoUpload()">Change photo</button>
                 </div>` : '';
 
+            const title = [msg.discipline || 'P2000', placeOf(msg)].filter(Boolean).join(' · ');
             detailContent.innerHTML = `
-                <div class="detail-grid">
-                    <div class="detail-body">${escapeHtml(msg.body || 'No message')}</div>
-                    ${abbrevTags ? `<div style="grid-column: 1 / -1; margin-bottom: 4px;">${abbrevTags}</div>` : ''}
-                    <div style="grid-column: 1;">${renderCol(leftRows)}</div>
-                    <div style="grid-column: 2;">${renderCol(rightRows)}</div>
-                    ${rawBlock}
+                <div class="detail-head">
+                    ${prioChip(msg)}
+                    <h2>${escapeHtml(title)}</h2>
+                    <span class="when">${formatDate(msg.timestamp)}</span>
                 </div>
-                ${vehicleBlock}
+                <div class="detail-body">${escapeHtml(msg.body || 'No message')}</div>
+                ${abbrevTags ? `<div class="abbrev-tags">${abbrevTags}</div>` : ''}
+                <div class="detail-cols">
+                    <dl class="detail-fields">${fields.map(([label, value]) => `<dt>${label}</dt><dd>${escapeHtml(value)}</dd>`).join('')}</dl>
+                    ${vehicleBlock}
+                </div>
+                ${rawBlock}
             `;
 
             if (msg.vehicle_category) loadVehiclePhoto(msg);
@@ -2851,10 +3005,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     .slice(0, 10)
                     .map(h => `
                         <div class="history-item">
-                            <div class="time">${formatDate(h.timestamp)}</div>
-                            <div>${escapeHtml((h.body || '-').substring(0, 80))}…</div>
+                            <span class="time">${formatShortDate(h.timestamp)}</span>
+                            <span class="text" title="${escapeHtml(h.body || '')}">${escapeHtml(h.body || '-')}</span>
                         </div>
-                    `).join('') || '<div class="empty-state" style="padding: 12px;">No history for this location</div>';
+                    `).join('') || '<div class="panel-sub">Nothing earlier at this location</div>';
             };
             if (msg.address) {
                 fetch(basePath + `api/history/${encodeURIComponent(msg.address)}`)
@@ -2867,7 +3021,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     .then(history => renderHistory(history))
                     .catch(() => {});
             } else {
-                historyList.innerHTML = '<div class="empty-state" style="padding: 12px;">No location data</div>';
+                historyList.innerHTML = '<div class="panel-sub">No location in this message</div>';
             }
         }
 
@@ -2882,8 +3036,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     if (selectedMsg !== msg || items.length < 2) return;
                     list.innerHTML = items.map(h => `
                         <div class="history-item">
-                            <div class="time">${formatTime(h.timestamp)} · ${escapeHtml(h.discipline || 'Unknown')}${h.priority ? ' · P' + h.priority : ''}</div>
-                            <div>${escapeHtml(h.body || '-')}</div>
+                            <span class="time">${formatTime(h.timestamp)}</span>
+                            <span class="text" title="${escapeHtml(h.body || '')}"><span class="disc ${discKind(h)}"></span> ${escapeHtml(h.body || '-')}</span>
                         </div>
                     `).join('');
                     section.style.display = 'block';
@@ -3088,33 +3242,128 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             return groups;
         }
 
-        function renderMessage(group) {
-            const msg = group.msgs[0];
-            const idx = group.idx;
-            const prio = Math.min(...group.msgs.map(m => m.priority || 9));
-            const disciplines = [...new Set(group.msgs.flatMap(m => (m.discipline || '').split(',').map(d => d.trim()).filter(Boolean)))];
+        // Priority as the pager writes it (A1, B2, P1...), else P + level
+        function prioLabel(msg) {
+            const m = /^\\s*([ABP])\\s?([0-9])/i.exec(msg.body || '');
+            if (m) return (m[1] + m[2]).toUpperCase();
+            return msg.priority ? 'P' + msg.priority : '';
+        }
+
+        function prioChip(msg) {
+            const label = prioLabel(msg);
+            if (!label) return '';
+            const cls = msg.priority === 1 ? 'p1' : (msg.priority === 2 ? 'p2' : '');
+            return `<span class="prio ${cls}">${label}</span>`;
+        }
+
+        const LANES = [['brandweer', 'Brandweer'], ['ambulance', 'Ambulance'], ['politie', 'Politie'], ['other', 'Other']];
+
+        // The lane (and colour) of a message: its first known discipline
+        function discKind(msg) {
+            const disc = (msg.discipline || '').toLowerCase();
+            const lane = LANES.slice(0, 3).find(([kind]) => disc.includes(kind));
+            return lane ? lane[0] : 'other';
+        }
+
+        function placeOf(msg) {
+            return msg.street ? `${msg.street}, ${msg.city}` : (msg.city || '');
+        }
+
+        function consoleRow(msg, idx, incidentSize) {
             return `
-                <div class="message ${prio < 9 ? 'prio-' + prio : ''}" data-msg-index="${idx}" onclick="handleMessageClick(${idx})">
-                    <div class="message-header">
-                        <div class="message-badges">
-                            ${disciplines.map(d => `<span class="badge discipline">${escapeHtml(d)}</span>`).join('')}
-                            ${msg.region ? `<span class="badge">${escapeHtml(msg.region)}</span>` : ''}
-                            ${prio < 9 ? `<span class="badge prio">P${prio}</span>` : ''}
-                            ${group.msgs.length > 1 ? `<span class="badge incident" title="${group.msgs.length} messages for this incident">🚨 ${group.msgs.length}</span>` : ''}
-                            ${msg.repeats ? `<span class="badge" title="Resent ${msg.repeats} times by the pager network">🔁 ${msg.repeats}</span>` : ''}
-                        </div>
-                        <span class="message-time">${formatTime(msg.timestamp)}</span>
-                    </div>
-                    <div class="message-body">${escapeHtml((msg.body || 'No message').substring(0, 100))}${(msg.body || '').length > 100 ? '…' : ''}</div>
-                    ${msg.address ? `<div class="message-location">${escapeHtml(msg.address)}</div>` : ''}
-                </div>
-            `;
+                <button type="button" class="feed-row" data-msg-index="${idx}" onclick="handleMessageClick(${idx})">
+                    <span class="time">${formatTime(msg.timestamp)}</span>
+                    <span>${prioChip(msg)}</span>
+                    <span class="disc ${discKind(msg)}">${escapeHtml(msg.discipline || '—')}</span>
+                    <span class="text">${escapeHtml(msg.body || '')}${incidentSize > 1 ? `<span class="badge incident" title="${incidentSize} messages for this incident">🚨 ${incidentSize}</span>` : ''}${msg.repeats ? `<span class="badge" title="Resent ${msg.repeats} times by the pager network">🔁 ${msg.repeats}</span>` : ''}</span>
+                    <span class="place">${escapeHtml(placeOf(msg))}</span>
+                    <span class="unit">${escapeHtml(msg.vehicle_number || '')}</span>
+                </button>`;
+        }
+
+        function renderConsole(latest) {
+            const el = document.getElementById('console-rows');
+            const sizes = {};
+            latest.forEach(m => { if (m.incident_id) sizes[m.incident_id] = (sizes[m.incident_id] || 0) + 1; });
+            const shown = new Set();
+            el.innerHTML = latest.map((m, idx) => {
+                // The incident count goes on the incident's newest message only
+                const first = m.incident_id && !shown.has(m.incident_id);
+                if (first) shown.add(m.incident_id);
+                return consoleRow(m, idx, first ? sizes[m.incident_id] : 0);
+            }).join('') || '<div class="empty-state">No messages yet</div>';
+        }
+
+        function disciplineTags(msgs) {
+            const counts = {};
+            msgs.forEach(m => (m.discipline || '').split(',').map(d => d.trim()).filter(Boolean)
+                .forEach(d => { counts[d] = (counts[d] || 0) + 1; }));
+            return Object.entries(counts).map(([d, n]) =>
+                `<span class="disc-tag ${discKind({discipline: d})}">${escapeHtml(d)}${n > 1 ? ` (${n})` : ''}</span>`
+            ).join('');
+        }
+
+        function gripLevel(msg) {
+            const m = /GRIP\\s*:?\\s*([1-5])/i.exec(msg.body || '');
+            return m ? Number(m[1]) : 0;
+        }
+
+        // Incidents (or single messages) by priority, newest first; ones quiet
+        // for longer than the incident window drop below the active ones
+        function renderWallboard() {
+            const latest = currentMessages;
+            const windowMs = ((lastStats && lastStats.incident_window_minutes) || 15) * 60000;
+            const items = groupByIncident(latest).map(g => {
+                const top = g.msgs.reduce((a, b) => ((b.priority || 9) < (a.priority || 9) ? b : a));
+                return {g, top, active: Date.now() - new Date(g.msgs[0].timestamp) <= windowMs};
+            }).sort((a, b) => (b.active - a.active) || ((a.top.priority || 9) - (b.top.priority || 9))
+                || (new Date(b.g.msgs[0].timestamp) - new Date(a.g.msgs[0].timestamp)));
+
+            document.getElementById('wall-items').innerHTML = items.map(({g, top, active}) => {
+                const grip = Math.max(0, ...g.msgs.map(gripLevel));
+                return `
+                    <button type="button" class="incident-card${active ? '' : ' stale'}" data-msg-index="${g.idx}" onclick="handleMessageClick(${g.idx})">
+                        <span class="top">${prioChip(top)}<span class="title">${escapeHtml(top.body || '')}</span><span class="age">${ago(g.msgs[0].timestamp)}</span></span>
+                        <span class="place">${escapeHtml(placeOf(top) || top.region || '—')}${g.msgs.length > 1 ? ` · ${g.msgs.length} messages` : ''}</span>
+                        <span class="tags">${disciplineTags(g.msgs)}${grip ? `<span class="disc-tag grip">GRIP ${grip}</span>` : ''}</span>
+                    </button>`;
+            }).join('') || '<div class="empty-state">No messages yet</div>';
+
+            const active = items.filter(i => i.active);
+            const maxGrip = Math.max(0, ...active.flatMap(i => i.g.msgs).map(gripLevel));
+            document.getElementById('wall-kpis').innerHTML = `
+                <div class="wall-kpi"><div class="v p1">${active.filter(i => i.top.priority === 1).length}</div><div class="l">P1 active</div></div>
+                <div class="wall-kpi"><div class="v">${active.length}</div><div class="l">Active</div></div>
+                <div class="wall-kpi"><div class="v">${lastStats ? lastStats.messages_last_hour : 0}</div><div class="l">Msg / hour</div></div>
+                <div class="wall-kpi"><div class="v${maxGrip ? ' grip' : ''}">${maxGrip ? 'GRIP ' + maxGrip : '—'}</div><div class="l">GRIP</div></div>`;
+
+            document.getElementById('wall-ticker').innerHTML = latest.slice(0, 5).map((m, idx) => `
+                <button type="button" class="tick" data-msg-index="${idx}" onclick="handleMessageClick(${idx})">
+                    <span class="meta"><span>${formatTime(m.timestamp)}</span>${prioChip(m)}<span class="disc ${discKind(m)}">${escapeHtml(m.discipline || '')}</span></span>
+                    <span class="text">${escapeHtml(m.body || '')}</span>
+                </button>`).join('');
+        }
+
+        function renderLanes(latest) {
+            LANES.forEach(([kind, name]) => {
+                const items = latest.map((m, idx) => ({m, idx})).filter(({m}) => discKind(m) === kind);
+                const p1 = items.filter(({m}) => m.priority === 1).length;
+                document.getElementById('lane-' + kind).innerHTML = `
+                    <div class="lane-head ${kind}">${name}${p1 ? `<span class="prio p1">${p1} P1</span>` : ''}<span class="count">${items.length}</span></div>
+                    <div class="lane-items">${items.map(({m, idx}) => `
+                        <button type="button" class="lane-card" data-msg-index="${idx}" onclick="handleMessageClick(${idx})">
+                            <span class="meta">${prioChip(m)}<span>${formatTime(m.timestamp)}</span><span class="unit">${escapeHtml(m.vehicle_number || '')}</span></span>
+                            <span class="text">${escapeHtml(m.body || '')}</span>
+                            <span class="place">${escapeHtml(placeOf(m))}</span>
+                        </button>`).join('') || '<div class="empty-state">Nothing</div>'}
+                    </div>`;
+            });
         }
 
         function handleMessageClick(idx) {
-            if (currentMessages[idx]) {
-                showMessageDetails(currentMessages[idx], idx);
-            }
+            if (!currentMessages[idx]) return;
+            showMessageDetails(currentMessages[idx], idx);
+            if (activeView !== 'console') openDetailModal();
         }
 
         function renderPieChart(data, el) {
@@ -3186,30 +3435,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             lastMsgsSig = sig;
 
             currentMessages = latest;
-            if (latest.length > 0) {
-                messagesEl.innerHTML = groupByIncident(latest).map(renderMessage).join('');
-                highlightSelectedMessage();
-            } else {
-                selectedMsgKey = null;
-                messagesEl.innerHTML = '<div class="empty-state">No messages yet</div>';
-            }
+            if (!latest.length) selectedMsgKey = null;
+            renderConsole(latest);
+            renderWallboard();
+            renderLanes(latest);
+            highlightSelectedMessage();
             updateMarkers(latest);
         }
 
+        // Incident ages on the wallboard keep counting without new messages
+        setInterval(() => { renderWallboard(); highlightSelectedMessage(); }, 30000);
+
+        let lastStats = null;
+
         function update(data) {
             const stats = data.stats;
+            lastStats = stats;
 
             renderSensorZones(stats.sensor_zones);
             checkForNewMessages(data.latest || []);
 
             totalEl.textContent = stats.total_messages;
-            regionsEl.textContent = countUnique(stats.by_region);
-            disciplinesEl.textContent = countUnique(stats.by_discipline);
-
-            const msgCountEl = document.getElementById('msg-count');
-            if (msgCountEl && data.latest) {
-                msgCountEl.textContent = `${data.latest.length} shown`;
-            }
+            document.getElementById('kpi-msgs-hour').textContent = stats.messages_last_hour;
+            document.getElementById('kpi-frames').textContent = stats.frames_last_minute;
+            document.getElementById('kpi-incidents').textContent = stats.open_incidents;
+            document.getElementById('device-info').textContent =
+                `${stats.device_type || '-'} · ${stats.device_driver || '-'} · ppm ${stats.ppm}`;
 
             const networkEl = document.getElementById('network-name');
             if (networkEl && stats.network_name) {
@@ -3220,22 +3471,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 receiverEl.textContent = stats.device_type || '';
             }
 
-            if (stats.decoder_running && !stats.receiver_online) {
-                decoderEl.className = 'pill pill-warning';
-                decoderEl.textContent = 'No FLEX frames';
-                decoderEl.title = 'The decoder runs but has not decoded any FLEX frames recently - check the antenna, gain and ppm';
-            } else if (stats.decoder_running) {
-                decoderEl.className = 'pill pill-success';
-                decoderEl.textContent = 'Decoder running';
-                decoderEl.title = '';
-            } else if (stats.decoder_error) {
-                decoderEl.className = 'pill pill-danger';
-                decoderEl.textContent = 'No SDR device';
-                decoderEl.title = stats.decoder_error;
+            const rx = document.getElementById('rx-status');
+            if (!stats.decoder_running) {
+                rx.className = 'rx stopped';
+                rx.textContent = stats.decoder_error ? 'NO SDR DEVICE' : 'DECODER STOPPED';
+                rx.title = stats.decoder_error || '';
+                decoderEl.className = 'decoder-bad';
+                decoderEl.textContent = '● ' + (stats.decoder_error || 'Decoder stopped');
+            } else if (!stats.receiver_online) {
+                rx.className = 'rx offline';
+                rx.textContent = 'NO FLEX FRAMES';
+                rx.title = 'The decoder runs but has not decoded any FLEX frames recently - check the antenna, gain and ppm';
+                decoderEl.className = 'decoder-warn';
+                decoderEl.textContent = '● DECODER RUNNING · NO FRAMES';
             } else {
-                decoderEl.className = 'pill pill-danger';
-                decoderEl.textContent = 'Decoder stopped';
-                decoderEl.title = '';
+                rx.className = 'rx online';
+                rx.textContent = 'RX ONLINE';
+                rx.title = '';
+                decoderEl.className = 'decoder-ok';
+                decoderEl.textContent = '● DECODER RUNNING';
             }
 
             lastStartTime = stats.start_time;
@@ -3289,6 +3543,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             // marker refresh - switching filters must clear them explicitly, or
             // a message that no longer matches the new filter keeps showing.
             selectedMsgKey = null;
+            closeDetailModal();
             if (currentMarker) { map.removeLayer(currentMarker); currentMarker = null; }
             detailContent.innerHTML = '<div class="empty-state">Click a message to view details</div>';
             document.getElementById('history-section').style.display = 'none';
@@ -3311,15 +3566,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             fetch(basePath + 'api/sensors').then(r => r.json()).then(sensors => {
                 const bar = document.getElementById('sensor-filter-bar');
                 if (sensors && sensors.length > 0) {
-                    document.getElementById('sensor-filter-section').style.display = 'block';
                     // Default to "only messages matching one of your configured
                     // sensors" - the whole point of defining sensors is to narrow
                     // the feed, so showing everything by default defeats that.
                     currentSensorFilter = '__any__';
                     const pills = [
-                        `<button class="sensor-filter-pill active" data-sensor="__any__">Sensors</button>`,
-                        `<button class="sensor-filter-pill" data-sensor="">All</button>`,
-                    ].concat(sensors.map(s => `<button class="sensor-filter-pill" data-sensor="${escapeHtml(s.name)}">${escapeHtml(s.name)}</button>`));
+                        `<button type="button" class="sensor-filter-pill active" data-sensor="__any__">Sensors</button>`,
+                        `<button type="button" class="sensor-filter-pill" data-sensor="">All</button>`,
+                    ].concat(sensors.map(s => `<button type="button" class="sensor-filter-pill" data-sensor="${escapeHtml(s.name)}">${escapeHtml(s.name)}</button>`));
                     bar.innerHTML = pills.join('');
                     bar.addEventListener('click', (e) => {
                         const pill = e.target.closest('.sensor-filter-pill');
@@ -3334,6 +3588,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             });
         }
 
+        const savedTab = localStorage.getItem('p2000_tab');
+        switchTab(VIEWS.concat(['advanced', 'database']).includes(savedTab) ? savedTab : 'console');
         loadSensorFilterBar();
         fetch(basePath + 'api/stats').then(r => r.json()).then(stats => update({stats, latest: []}))
             .catch(() => toast('Failed to load stats', 'error'));

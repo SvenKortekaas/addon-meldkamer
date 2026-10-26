@@ -60,7 +60,12 @@ P2000 FLEX pager decoder dashboard for Home Assistant — decode Dutch emergency
 
 Access via Home Assistant sidebar → Meldkamer:
 
-- **Dashboard Tab** — Live messages, map, charts, statistics, sensor filter toggle
+- **Console / Wallboard / Lanes** — Three live views of the same feed, switched with tabs in the top bar:
+  - **Console** — dense message table, with the map and the selected message's full detail (vehicle photo, incident timeline, earlier messages at the address) docked on the right
+  - **Wallboard** — large map with live counts, incidents sorted by priority and a ticker of the newest messages; for an always-on screen
+  - **Lanes** — one column per discipline (Brandweer, Ambulance, Politie, other) next to the map
+
+  Wallboard and Lanes open the message detail in a popup. The sensor filter, sound, speech and auto-focus toggles sit in the top bar. The theme follows Home Assistant's light/dark mode; the 🌓 button switches between automatic, light and dark.
 - **Advanced Tab** — Receiver config, device info, reception quality, ppm calibration, database stats
 - **Database Tab** — Card-based data management for every table below
 

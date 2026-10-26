@@ -93,6 +93,11 @@ class IncidentTracker:
         for key in [k for k, inc in self._open.items() if now - inc.last_seen > self.window]:
             del self._open[key]
 
+    def open_count(self) -> int:
+        """Incidents with a message within the incident window."""
+        self._expire(datetime.now().astimezone())
+        return len(self._open)
+
     def restore(self, messages: list[dict]) -> None:
         """Rebuild open incidents from stored messages (oldest first) after a restart."""
         for data in messages:
