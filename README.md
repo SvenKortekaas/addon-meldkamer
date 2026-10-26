@@ -426,7 +426,7 @@ mqtt:
 | `mqtt.base_topic` | Availability topic prefix (`{base_topic}/status`) |
 | `mqtt.ha_autodiscovery` | Publish Home Assistant MQTT discovery config for each sensor |
 | `mqtt.retain` | Retain state/attribute messages on the broker |
-| `mqtt.tls_enabled` | Enable TLS to the broker (see `tls_ca`, `tls_cert`, `tls_keyfile`, `tls_insecure`) |
+| `mqtt.tls_enabled` | Enable TLS to the broker (see `tls_ca`, `tls_cert`, `tls_keyfile`, `tls_insecure`). Put your own certificate files in Home Assistant's `/ssl` folder and use those paths, e.g. `/ssl/ca.crt` |
 
 > [!NOTE]
 > State/attribute/discovery topics are published under `homeassistant/sensor/p2000_rtlsdr/...` (this prefix is fixed, independent of `base_topic`). The sensor's `mqtt_id` (or its auto-generated `entity_id` if not set) forms the last topic segment and the discovery `unique_id`.

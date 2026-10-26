@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Removed the unused `/config` and `/share` folder mappings (Supervisor warned about the deprecated `config` mapping); `/ssl` stays for MQTT TLS certificates.
+
 ## 1.2.1
 
 - Tabs: **Settings** (was Database; now also holds the ppm calibration) and **Info** (was Advanced), in that order after the views.
