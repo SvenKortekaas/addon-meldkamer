@@ -359,7 +359,7 @@ class Parser:
             msg.abbreviations = found
 
     def _classify_vehicle(self, msg: P2000Message) -> None:
-        """Best-effort vehicle/unit category and voertuignummer, from a known abbreviation set."""
+        """Best-effort vehicle/unit category and vehicle number, from a known abbreviation set."""
         if not msg.body:
             return
         msg.vehicle_category = vehicle_types.classify(msg.abbreviations)

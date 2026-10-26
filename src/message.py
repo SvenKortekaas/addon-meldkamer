@@ -51,7 +51,7 @@ class P2000Message:
     # Vehicle/unit identification (best-effort, from a small known abbreviation
     # vocabulary - see vehicle_types.py)
     vehicle_category: str = ""  # e.g. "ambulance", "helikopter", "" if unrecognized
-    vehicle_number: str = ""  # the "voertuignummer" token, e.g. "17106" - "" if none found
+    vehicle_number: str = ""  # the vehicle number token, e.g. "17106" - "" if none found
     vehicle_icon: str = ""  # fallback emoji for vehicle_category, shown until a photo is uploaded
 
     # Same text as `body`, but with any city abbreviation token (e.g. "SGRAVH")

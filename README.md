@@ -85,7 +85,7 @@ Each table gets its own card with row counts and Manage/Import actions:
 | 🗣️ TTS Replacements | Regex rules for speakable text-to-speech | CSV |
 | 🙈 Ignore Text | Wildcard patterns to drop matching messages | CSV |
 | 🚫 Ignore Capcodes | Capcodes to drop | CSV |
-| 📷 Vehicle Photos | Photos you've uploaded per voertuignummer/category | — (upload via message detail or +Add) |
+| 📷 Vehicle Photos | Photos you've uploaded per vehicle number or category | — (upload via message detail or +Add) |
 
 Click "Manage" on any card to view/edit/delete that table's rows.
 
