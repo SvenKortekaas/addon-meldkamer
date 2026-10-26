@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 MAX_MESSAGES = 500
 
-ADDON_VERSION = "0.0.99"
+ADDON_VERSION = "1.0.0"
 
 # Home Assistant core (2026.9+) proxies OpenStreetMap raster tiles itself via
 # its built-in map_tiles integration, identifying the requests the way OSM's
