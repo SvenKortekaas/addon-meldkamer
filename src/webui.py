@@ -1411,7 +1411,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .icon-btn:hover { background: var(--hover-bg); }
         .icon-btn.off { opacity: 0.4; }
         .icon-btn.paused { background: rgba(255,152,0,0.18); color: #ff9800; }
-        .clock { font-family: var(--mono); font-size: 15px; font-weight: 500; letter-spacing: 0.04em; }
+        .clock { font-family: var(--mono); font-size: 22px; font-weight: 600; letter-spacing: 0.04em; line-height: 1; }
 
         /* ---------- Status bar ---------- */
         .statusbar {
@@ -1515,16 +1515,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .incident-card .age { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--secondary-text-color); }
         .incident-card .place { color: var(--secondary-text-color); font-size: 12.5px; }
         .incident-card .tags { display: flex; gap: 6px; flex-wrap: wrap; }
-        .ticker { height: 88px; flex-shrink: 0; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 1px; background: var(--divider-color); border-top: var(--card-border); }
+        .ticker { height: 132px; flex-shrink: 0; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 1px; background: var(--divider-color); border-top: var(--card-border); }
         .tick {
-            min-width: 0; padding: 9px 12px; display: flex; flex-direction: column; gap: 4px; text-align: left;
+            min-width: 0; padding: 12px 16px; display: flex; flex-direction: column; gap: 7px; text-align: left;
             border: 0; background: var(--ha-card-background); color: inherit; cursor: pointer;
         }
         .tick:hover { background: var(--hover-bg); }
-        .tick .meta { display: flex; gap: 8px; align-items: center; font-family: var(--mono); font-size: 12px; color: var(--secondary-text-color); }
+        .tick .meta { display: flex; gap: 10px; align-items: center; font-family: var(--mono); font-size: 14px; color: var(--secondary-text-color); }
+        .tick .meta .prio { font-size: 13px; padding: 2px 6px; }
         .tick .text {
-            font-family: var(--mono); font-size: 12px; line-height: 1.4; overflow: hidden;
-            display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+            font-family: var(--mono); font-size: 15px; line-height: 1.4; overflow: hidden;
+            display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
         }
 
         /* Lanes: one column per discipline + map */
