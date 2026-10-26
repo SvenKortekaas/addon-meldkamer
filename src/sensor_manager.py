@@ -2,12 +2,54 @@
 
 import logging
 import math
+import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
 from .message import P2000Message
 
 logger = logging.getLogger(__name__)
+
+# Priority filter entries: optional P/A/B/PRIO prefix + digit ("P1", "a 1", "PRIO 2", "1")
+_PRIORITY_ENTRY_RE = re.compile(r"^(PRIO|P|A|B)?\s*([0-9])$", re.IGNORECASE)
+
+
+def slugify(value: str) -> str:
+    """Reduce a string to a valid HA object id: [a-z0-9_], no leading/trailing/double underscores.
+
+    Accents are transliterated ("Café" -> "cafe", "Ĳsselmonde" -> "ijsselmonde");
+    characters with no ASCII equivalent become underscores. May return "".
+    """
+    value = unicodedata.normalize("NFKD", value.casefold()).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", "_", value).strip("_")
+
+
+def sanitize_mqtt_id(value: str) -> str:
+    """Make a user-set mqtt_id safe as an MQTT topic level / discovery object id ([A-Za-z0-9_-]).
+
+    Already-valid ids are returned unchanged so existing unique_ids keep working.
+    """
+    value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", value).strip("_")
+
+
+def parse_priority(entry: str) -> int | None:
+    """Parse a priority filter entry to the int the parser stores in msg.priority.
+
+    Mirrors parser.PRIO_PATTERNS: P1/A1/PRIO 1 -> 1, P2/A2 -> 2, B1-B3/P3 -> 3, P4 -> 4.
+    Returns None when the entry can't be parsed.
+    """
+    match = _PRIORITY_ENTRY_RE.match(entry.strip())
+    if not match:
+        return None
+    prefix = (match.group(1) or "").upper()
+    level = int(match.group(2))
+    if prefix == "B":
+        return 3 if 1 <= level <= 3 else None
+    if prefix == "A":
+        return level if level in (1, 2) else None
+    return level if 1 <= level <= 4 else None
 
 
 @dataclass
@@ -44,6 +86,7 @@ class SensorManager:
     def __init__(self, sensors: list[SensorConfig]):
         self.sensors = sensors
         self._radius_warned: set = set()  # Sensors already warned about missing center coordinates
+        self._priority_warned: set = set()  # (sensor, entry) pairs already warned about as unparseable
         logger.info(f"Loaded {len(sensors)} sensor(s)")
 
     def get_matching_sensors(self, msg: P2000Message) -> list[SensorConfig]:
@@ -68,22 +111,31 @@ class SensorManager:
             if not any(d in filter_disciplines for d in msg_disciplines):
                 return False
 
-        # City filter
-        if filters.cities and (not msg.city or msg.city not in filters.cities):
+        # City filter (case-insensitive)
+        if filters.cities and (
+            not msg.city or msg.city.strip().casefold() not in {c.casefold() for c in filters.cities}
+        ):
             return False
 
-        # Capcode filter (match if ANY capcode in message matches)
-        if filters.capcodes and (not msg.capcodes or not any(code in filters.capcodes for code in msg.capcodes)):
-            return False
+        # Capcode filter (match if ANY capcode in message matches; compared as 9-digit zero-padded)
+        if filters.capcodes:
+            filter_capcodes = {c.strip().zfill(9) for c in filters.capcodes}
+            if not msg.capcodes or not any(str(code).strip().zfill(9) in filter_capcodes for code in msg.capcodes):
+                return False
 
-        # Priority filter (filter entries are strings, msg.priority is an int)
+        # Priority filter (filter entries are strings like "P1"/"A1"/"1", msg.priority is an int)
         if filters.priorities:
             allowed_priorities = set()
             for entry in filters.priorities:
-                try:
-                    allowed_priorities.add(int(entry))
-                except (TypeError, ValueError):
-                    continue  # Ignore unparseable entries
+                priority = parse_priority(entry)
+                if priority is not None:
+                    allowed_priorities.add(priority)
+                elif (sensor.name, entry) not in self._priority_warned:
+                    logger.warning(
+                        f"Sensor '{sensor.name}' has unrecognised priority '{entry}' (expected e.g. P1, A1, B1, 1) "
+                        "- ignoring it"
+                    )
+                    self._priority_warned.add((sensor.name, entry))
             if not msg.priority or msg.priority not in allowed_priorities:
                 return False
 
@@ -147,18 +199,17 @@ class SensorManager:
 def load_sensors_from_config(config_data: list[dict[str, Any]]) -> list[SensorConfig]:
     """Load sensor configurations from config dict."""
     sensors = []
+    seen_entity_ids: set = set()
+    seen_mqtt_keys: set = set()
 
     for sensor_data in config_data:
         try:
-            # Auto-generate entity_id from name if not provided
+            # Auto-generate entity_id from name if not provided; reduce either to a valid HA object id
             name = sensor_data["name"]
-            entity_id = sensor_data.get("entity_id")
+            entity_id = slugify(str(sensor_data.get("entity_id") or name))
             if not entity_id:
-                # Convert name to valid entity_id: lowercase, replace spaces/special chars with underscores
-                entity_id = name.lower()
-                entity_id = "".join(c if c.isalnum() else "_" for c in entity_id)
-                # Remove consecutive underscores and strip leading/trailing underscores
-                entity_id = "_".join(filter(None, entity_id.split("_")))
+                logger.error(f"Sensor '{name}' skipped: its name gives an empty entity_id (use letters or digits)")
+                continue
 
             # Parse comma-separated filter strings into lists
             def parse_csv(value):
@@ -190,12 +241,26 @@ def load_sensors_from_config(config_data: list[dict[str, Any]]) -> list[SensorCo
             )
 
             mqtt_id = sensor_data.get("mqtt_id")
+            mqtt_id = sanitize_mqtt_id(str(mqtt_id)) if mqtt_id not in (None, "") else None
+            if mqtt_id is not None and mqtt_id != str(sensor_data["mqtt_id"]).strip():
+                logger.warning(
+                    f"Sensor '{name}' mqtt_id '{sensor_data['mqtt_id']}' sanitised to '{mqtt_id or entity_id}'"
+                )
+
+            # Two sensors sharing an entity id or MQTT key would overwrite each other
+            mqtt_key = mqtt_id or entity_id
+            if entity_id in seen_entity_ids or mqtt_key in seen_mqtt_keys:
+                logger.error(f"Sensor '{name}' skipped: entity_id '{entity_id}' / mqtt_id '{mqtt_key}' already in use")
+                continue
+            seen_entity_ids.add(entity_id)
+            seen_mqtt_keys.add(mqtt_key)
+
             sensor = SensorConfig(
                 name=name,
                 entity_id=entity_id,
                 filters=filters,
                 icon=sensor_data.get("icon", "mdi:radio-tower"),
-                mqtt_id=str(mqtt_id).strip() if mqtt_id not in (None, "") else None,
+                mqtt_id=mqtt_id or None,
             )
 
             sensors.append(sensor)

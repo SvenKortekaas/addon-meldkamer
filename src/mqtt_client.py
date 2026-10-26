@@ -75,14 +75,21 @@ class MQTTClient:
 
         if self.config.mqtt_tls_enabled:
             cert_reqs = ssl.CERT_NONE if self.config.mqtt_tls_insecure else ssl.CERT_REQUIRED
-            self._client.tls_set(
-                ca_certs=self.config.mqtt_tls_ca or None,
-                certfile=self.config.mqtt_tls_cert or None,
-                keyfile=self.config.mqtt_tls_keyfile or None,
-                cert_reqs=cert_reqs,
-            )
-            if self.config.mqtt_tls_insecure:
-                self._client.tls_insecure_set(True)
+            try:
+                self._client.tls_set(
+                    ca_certs=self.config.mqtt_tls_ca or None,
+                    certfile=self.config.mqtt_tls_cert or None,
+                    keyfile=self.config.mqtt_tls_keyfile or None,
+                    cert_reqs=cert_reqs,
+                )
+                if self.config.mqtt_tls_insecure:
+                    self._client.tls_insecure_set(True)
+            except (OSError, ValueError, ssl.SSLError) as e:
+                # Missing/unreadable CA, cert or key file - don't take the whole add-on down
+                logger.error(f"MQTT TLS setup failed (check CA/cert/key paths): {e} - MQTT disabled")
+                self._client = None
+                self.enabled = False
+                return
 
         self._client.will_set(self.availability_topic, payload="offline", qos=1, retain=True)
         self._client.on_connect = self._on_connect
@@ -125,6 +132,10 @@ class MQTTClient:
 
     def _on_connect(self, client, userdata, flags, rc):
         if rc == 0:
+            # A (re)connect may follow a broker restart that lost retained discovery configs:
+            # forget what was sent so it's re-published with the next message per sensor.
+            # Rebinding to a fresh set is atomic w.r.t. the publishing thread.
+            self._discovered = set()
             self._connected = True
             logger.info("MQTT connected")
             client.publish(self.availability_topic, payload="online", qos=0, retain=True)
@@ -179,7 +190,8 @@ class MQTTClient:
         retain = self.config.mqtt_retain
         try:
             self._client.publish(attribute_topic, payload=json.dumps(attributes), retain=retain)
-            self._client.publish(state_topic, payload=msg.body, retain=retain)
+            # HA rejects sensor states over 255 chars (full text stays in the "raw message" attribute)
+            self._client.publish(state_topic, payload=(msg.body or "")[:255], retain=retain)
         except Exception as e:
             logger.error(f"Failed to publish MQTT message for sensor '{sensor.name}': {e}")
 

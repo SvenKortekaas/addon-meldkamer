@@ -193,7 +193,7 @@ sensors:
 ```
 
 > [!NOTE]
-> Entity IDs are auto-generated from sensor names: lowercase + underscores + `p2000_` prefix. Example: "Ambulance Nearby" → `sensor.p2000_ambulance_nearby`
+> Entity IDs are auto-generated from sensor names: lowercase ASCII letters, digits and underscores (accents are transliterated). Example: "Ambulance Nearby" → `sensor.ambulance_nearby`, "Café IJsselmonde" → `sensor.cafe_ijsselmonde`. A sensor whose name yields no letters/digits, or whose ID duplicates another sensor's, is skipped with an error in the log.
 
 > [!IMPORTANT]
 > All filter fields use **comma-separated strings** (e.g., `"Ambulance, Brandweer"`). Leave fields empty if not needed.
@@ -205,9 +205,9 @@ All filters within a sensor use **AND** logic — message must match ALL filters
 | Filter | Type | Description | Example |
 |--------|------|-------------|---------|
 | `disciplines` | string | Comma-separated disciplines | `"Ambulance, Brandweer"` |
-| `cities` | string | Comma-separated cities | `"Oegstgeest, Leiden"` |
-| `capcodes` | string | Comma-separated capcodes | `"002029583, 001520021"` |
-| `priorities` | string | Comma-separated priorities | `"P1, A1, GRIP"` |
+| `cities` | string | Comma-separated cities (case-insensitive) | `"Oegstgeest, Leiden"` |
+| `capcodes` | string | Comma-separated capcodes (leading zeros optional) | `"002029583, 001520021"` |
+| `priorities` | string | Comma-separated priorities: `P1`/`A1` = 1, `P2`/`A2` = 2, `P3`/`B1`–`B3` = 3, `P4` = 4 (a plain number works too). For GRIP use `text_contains: "GRIP"` | `"P1, A1"` |
 | `radius_km` | float | Distance from center (requires lat/lon) | `5.0` |
 | `center_lat` | float | Latitude for radius filter | `52.0974` |
 | `center_lon` | float | Longitude for radius filter | `4.2776` |
@@ -216,7 +216,7 @@ All filters within a sensor use **AND** logic — message must match ALL filters
 
 ### Sensor State & Attributes
 
-**State**: Full message text
+**State**: Message text, truncated to 255 characters (Home Assistant's state limit); the full text is in the attributes
 ```
 A2 HA Doude v Troostwijk/Goeskens Frankenslag SGRAVH : 15121...
 ```
@@ -289,7 +289,7 @@ automation:
   - alias: "P2000 Ambulance Alert"
     trigger:
       - platform: state
-        entity_id: sensor.p2000_ambulance_nearby
+        entity_id: sensor.ambulance_nearby
     condition:
       - condition: template
         value_template: "{{ trigger.to_state.state != trigger.from_state.state }}"
@@ -307,7 +307,7 @@ automation:
   - alias: "P2000 Station Alert"
     trigger:
       - platform: state
-        entity_id: sensor.p2000_my_fire_station
+        entity_id: sensor.my_fire_station
     action:
       - service: persistent_notification.create
         data:
