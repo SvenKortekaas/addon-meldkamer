@@ -1384,13 +1384,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .rx.stopped { color: var(--danger-color); }
         .spacer { flex: 1; }
 
-        .topbar > .filter-pills { flex-shrink: 1; min-width: 0; display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none; }
-        .sensor-filter-pill {
-            height: 28px; padding: 0 11px; border-radius: 4px; font-size: 12px; cursor: pointer;
-            border: var(--card-border); background: var(--ha-card-background); color: var(--secondary-text-color);
+        /* Sensor filter: a segmented control like the view tabs */
+        .topbar > .filter-pills {
+            flex-shrink: 1; min-width: 0; display: flex; align-items: center; gap: 2px; padding: 2px;
+            border-radius: 6px; background: var(--ha-background); border: 1px solid var(--primary-color);
+            overflow-x: auto; scrollbar-width: none;
         }
-        .sensor-filter-pill:hover { color: var(--primary-text-color); border-color: var(--primary-color); }
-        .sensor-filter-pill.active { background: var(--selected-bg); border-color: var(--primary-color); color: var(--primary-text-color); }
+        .topbar > .filter-pills:empty { display: none; }
+        .filter-label {
+            padding: 0 8px 0 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.07em;
+            text-transform: uppercase; color: var(--primary-color);
+        }
+        .sensor-filter-pill {
+            height: 28px; padding: 0 12px; border: none; border-radius: 4px; cursor: pointer;
+            background: transparent; color: var(--primary-text-color); font-size: 12.5px; font-weight: 500;
+        }
+        .sensor-filter-pill:hover { background: var(--hover-bg); }
+        .sensor-filter-pill.active { background: var(--primary-color); color: #fff; }
 
         .icon-btn {
             width: 28px; height: 28px; border-radius: 4px; border: var(--card-border);
@@ -3625,7 +3635,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         `<button type="button" class="sensor-filter-pill active" data-sensor="__any__">Sensors</button>`,
                         `<button type="button" class="sensor-filter-pill" data-sensor="">All</button>`,
                     ].concat(sensors.map(s => `<button type="button" class="sensor-filter-pill" data-sensor="${escapeHtml(s.name)}">${escapeHtml(s.name)}</button>`));
-                    bar.innerHTML = pills.join('');
+                    bar.innerHTML = '<span class="filter-label">Filter</span>' + pills.join('');
                     bar.addEventListener('click', (e) => {
                         const pill = e.target.closest('.sensor-filter-pill');
                         if (pill) selectSensorFilter(pill.dataset.sensor);
