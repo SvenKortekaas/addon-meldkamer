@@ -31,10 +31,10 @@ jobs:
       build_matrix: ${{ steps.matrix.outputs.matrix }}
       image_name: ${{ steps.normalize.outputs.image_name }}
       registry_prefix: ${{ steps.normalize.outputs.registry_prefix }}
-      name: ${{ steps.info.outputs.name }}
-      description: ${{ steps.info.outputs.description }}
-      url: ${{ steps.info.outputs.url }}
-      version: ${{ steps.info.outputs.version }}
+      name: ${{ steps.normalize.outputs.name }}
+      description: ${{ steps.normalize.outputs.description }}
+      url: ${{ steps.normalize.outputs.url }}
+      version: ${{ steps.normalize.outputs.version }}
     steps:
       - name: Check out the repository
         uses: actions/checkout@v7.0.1
@@ -45,13 +45,25 @@ jobs:
         with:
           path: "."
 
-      - name: Split image name
+      # The info helper outputs JSON-encoded values ("1.1.1" with the quotes)
+      - name: Decode app information
         id: normalize
         env:
           IMAGE: ${{ steps.info.outputs.image }}
+          VERSION: ${{ steps.info.outputs.version }}
+          NAME: ${{ steps.info.outputs.name }}
+          DESCRIPTION: ${{ steps.info.outputs.description }}
+          URL: ${{ steps.info.outputs.url }}
         run: |
-          echo "image_name=${IMAGE##*/}" >> "$GITHUB_OUTPUT"
-          echo "registry_prefix=${IMAGE%/*}" >> "$GITHUB_OUTPUT"
+          image=$(jq -r . <<< "$IMAGE")
+          {
+            echo "image_name=${image##*/}"
+            echo "registry_prefix=${image%/*}"
+            echo "version=$(jq -r . <<< "$VERSION")"
+            echo "name=$(jq -r . <<< "$NAME")"
+            echo "description=$(jq -r . <<< "$DESCRIPTION")"
+            echo "url=$(jq -r . <<< "$URL")"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Prepare build matrix
         id: matrix
