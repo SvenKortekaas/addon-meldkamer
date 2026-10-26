@@ -6,14 +6,16 @@ import fnmatch
 import logging
 import os
 import re
+import shlex
 import signal
+import subprocess
 from collections.abc import Callable
 
 from . import abbreviation_import
 from .config import Config
 from .database import Database
 from .geocoding import Geocoder
-from .ha_client import HAClient
+from .ha_client import HAClient, HAClientError
 from .message import P2000Message
 from .mqtt_client import MQTTClient
 from .parser import Parser
@@ -51,6 +53,13 @@ class Decoder:
         self._process: asyncio.subprocess.Process | None = None
         self._running = False
         self.on_message: Callable[[P2000Message], None] | None = None
+
+        # Decoded lines are handed from the stdout reader to a worker task, so
+        # slow geocoding/HA requests can't stall the reader and let the SDR
+        # pipe overflow (dropping messages)
+        self._line_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1000)
+        self._worker_task: asyncio.Task | None = None
+        self._register_task: asyncio.Task | None = None
 
         # Seed the built-in P2000 abbreviation dictionary (only new codes, won't
         # overwrite a user's own edits to an existing abbreviation's text)
@@ -137,21 +146,19 @@ class Decoder:
 
     async def _check_and_reset_hackrf(self) -> bool:
         """Check HackRF status and reset if stuck. Returns True if OK."""
-        import subprocess
-
         logger.info("Checking HackRF status...")
 
         # First, kill any existing rx_fm or hackrf processes that might be holding the device
         try:
-            subprocess.run(["pkill", "-9", "rx_fm"], capture_output=True, timeout=2)
-            subprocess.run(["pkill", "-9", "hackrf"], capture_output=True, timeout=2)
+            await asyncio.to_thread(subprocess.run, ["pkill", "-9", "rx_fm"], capture_output=True, timeout=2)
+            await asyncio.to_thread(subprocess.run, ["pkill", "-9", "hackrf"], capture_output=True, timeout=2)
             await asyncio.sleep(1)  # Let USB settle
         except Exception:
             pass  # pkill may not exist or may fail, that's OK
 
         try:
             # Try hackrf_info to see if device responds
-            result = subprocess.run(["hackrf_info"], capture_output=True, timeout=5)
+            result = await asyncio.to_thread(subprocess.run, ["hackrf_info"], capture_output=True, timeout=5)
 
             if result.returncode == 0 and b"Serial number" in result.stdout:
                 # Check if external clock is being used (causes no reception!)
@@ -159,14 +166,16 @@ class Decoder:
                     logger.warning("HackRF is using EXTERNAL clock - forcing back to INTERNAL clock!")
                     try:
                         # Reset to internal clock
-                        subprocess.run(["hackrf_clock", "-i"], capture_output=True, timeout=5)
+                        await asyncio.to_thread(subprocess.run, ["hackrf_clock", "-i"], capture_output=True, timeout=5)
                         await asyncio.sleep(2)  # Let device reconfigure
                         logger.info("HackRF clock reset to internal")
                     except FileNotFoundError:
                         # hackrf_clock might not exist, try spiflash reset instead
                         logger.warning("hackrf_clock not available, attempting full reset...")
                         try:
-                            subprocess.run(["hackrf_spiflash", "-R"], capture_output=True, timeout=10)
+                            await asyncio.to_thread(
+                                subprocess.run, ["hackrf_spiflash", "-R"], capture_output=True, timeout=10
+                            )
                             await asyncio.sleep(5)
                             logger.info("HackRF reset via spiflash")
                         except Exception as e:
@@ -191,11 +200,11 @@ class Decoder:
         try:
             # Method 1: hackrf_spiflash to reset the device
             logger.info("Attempting HackRF reset via hackrf_spiflash...")
-            subprocess.run(["hackrf_spiflash", "-R"], capture_output=True, timeout=10)
+            await asyncio.to_thread(subprocess.run, ["hackrf_spiflash", "-R"], capture_output=True, timeout=10)
             await asyncio.sleep(5)  # Wait longer for USB re-enumeration
 
             # Check if it worked
-            result = subprocess.run(["hackrf_info"], capture_output=True, timeout=5)
+            result = await asyncio.to_thread(subprocess.run, ["hackrf_info"], capture_output=True, timeout=5)
             if result.returncode == 0:
                 logger.info("HackRF reset successful!")
                 return True
@@ -226,7 +235,12 @@ class Decoder:
 
         multimon = f"multimon-ng -a {decoder} -t raw -"
 
-        # Network receiver - connect to rtl_tcp server via netcat
+        # Gain 0 means automatic gain control: rtl_fm/rx_fm only use AGC when
+        # -g is left out ("-g 0" would be a manual gain of ~0 dB)
+        gain_arg = f" -g {gain}" if gain else ""
+
+        # Network receiver - connect to an rtl_tcp server via SoapyRTLTCP
+        # (osmocom rtl_fm has no rtl_tcp client)
         if receiver_type == "network":
             host = self.config.network_host
             port = self.config.network_port
@@ -234,16 +248,18 @@ class Decoder:
                 raise RuntimeError("Network receiver requires network_host to be set")
             logger.info(f"Using network receiver: rtl_tcp at {host}:{port}")
             self.device_type = f"Network ({host}:{port})"
-            self.device_driver = "rtl_fm (rtl_tcp)"
-            # rtl_fm can connect directly to rtl_tcp server
-            self._cached_command = f"rtl_fm -d rtl_tcp={host}:{port} -f {freq} -g {gain} -M fm -s {rate} | {multimon}"
+            self.device_driver = "rx_fm (rtl_tcp)"
+            # SoapyRTLTCP needs IPv6 addresses in brackets to split off the port
+            address = f"[{host}]:{port}" if ":" in host and not host.startswith("[") else f"{host}:{port}"
+            device = shlex.quote(f"driver=rtltcp,rtltcp={address}")
+            self._cached_command = f"rx_fm -d {device} -f {freq}{gain_arg} -M fm -s {rate} -p {ppm} | {multimon}"
 
         # Explicit RTL-SDR
         elif receiver_type == "rtl-sdr":
             logger.info("Using rtl_fm (RTL-SDR selected)")
             self.device_type = "RTL-SDR"
             self.device_driver = "rtl_fm"
-            self._cached_command = f"rtl_fm -f {freq} -g {gain} -M fm -s {rate} -p {ppm} | {multimon}"
+            self._cached_command = f"rtl_fm -f {freq}{gain_arg} -M fm -s {rate} -p {ppm} | {multimon}"
 
         # Explicit HackRF
         elif receiver_type == "hackrf":
@@ -257,7 +273,9 @@ class Decoder:
             logger.info(f"HackRF gains: LNA={lna}dB, VGA={vga}dB, AMP={amp} (RF amplifier {'on' if amp else 'off'})")
             # Use SoapySDR gain string format for rx_fm
             gain_str = f"LNA={lna},VGA={vga},AMP={amp}"
-            self._cached_command = f'rx_fm -d driver=hackrf -f {freq} -g "{gain_str}" -M fm -s {rate} | {multimon}'
+            self._cached_command = (
+                f'rx_fm -d driver=hackrf -f {freq} -g "{gain_str}" -M fm -s {rate} -p {ppm} | {multimon}'
+            )
 
         # Explicit SoapySDR (auto-detect device)
         elif receiver_type == "soapysdr":
@@ -268,7 +286,7 @@ class Decoder:
             soapy_gain = gain if gain > 0 else 40
             if gain == 0:
                 logger.info("SoapySDR may not support auto gain, using gain=40")
-            self._cached_command = f"rx_fm -f {freq} -g {soapy_gain} -M fm -s {rate} | {multimon}"
+            self._cached_command = f"rx_fm -f {freq} -g {soapy_gain} -M fm -s {rate} -p {ppm} | {multimon}"
 
         # RTL-SDR (default) - "auto" is treated as rtl-sdr, no device probing.
         # Probing proved unreliable: a failed probe cached the wrong driver
@@ -277,7 +295,7 @@ class Decoder:
             logger.info("Using rtl_fm (RTL-SDR, default)")
             self.device_type = "RTL-SDR"
             self.device_driver = "rtl_fm"
-            self._cached_command = f"rtl_fm -f {freq} -g {gain} -M fm -s {rate} -p {ppm} | {multimon}"
+            self._cached_command = f"rtl_fm -f {freq}{gain_arg} -M fm -s {rate} -p {ppm} | {multimon}"
 
         return self._cached_command
 
@@ -298,26 +316,14 @@ class Decoder:
         if self.mqtt_client:
             await self.mqtt_client.start()
 
-        # Pre-create sensors in Home Assistant so they appear immediately,
-        # but don't wipe the state/attributes of sensors that already exist
-        if self.sensor_manager and self.ha_client.available:
-            logger.info(f"Registering {len(self.sensor_manager.sensors)} sensor(s) in Home Assistant...")
-            for sensor in self.sensor_manager.sensors:
-                existing = await self.ha_client.get_state(sensor.entity_id)
-                if existing is not None:
-                    logger.debug(f"sensor.{sensor.entity_id} already exists, keeping current state")
-                    continue
-                await self.ha_client.update_sensor(
-                    sensor.entity_id,
-                    state="Waiting for data...",
-                    attributes={
-                        "friendly_name": sensor.name,
-                        "icon": sensor.icon,
-                    },
-                )
-            logger.info("Sensors registered in Home Assistant")
-
         self._running = True
+
+        # Pre-create sensors in the background (Core may still be starting)
+        if self.sensor_manager and self.ha_client.available:
+            self._register_task = asyncio.create_task(self._register_sensors())
+
+        self._worker_task = asyncio.create_task(self._process_queue())
+
         backoff = 5  # Seconds between restarts, doubles up to 60 on repeated failures
 
         while self._running:
@@ -351,6 +357,57 @@ class Decoder:
             backoff = min(backoff * 2, 60)
 
         logger.info("Decoder stopped")
+
+    async def _register_sensors(self) -> None:
+        """Pre-create sensors in Home Assistant so they appear immediately.
+
+        Doesn't wipe the state/attributes of sensors that already exist, and
+        retries with backoff while Home Assistant is unreachable (e.g. Core
+        still starting, Supervisor answering 502).
+        """
+        pending = list(self.sensor_manager.sensors)
+        logger.info(f"Registering {len(pending)} sensor(s) in Home Assistant...")
+        backoff = 5
+        while self._running:
+            failed = []
+            for sensor in pending:
+                try:
+                    existing = await self.ha_client.get_state(sensor.entity_id)
+                except HAClientError:
+                    # Unknown whether it exists - don't overwrite a possibly existing state
+                    failed.append(sensor)
+                    continue
+                if existing is not None:
+                    logger.debug(f"sensor.{sensor.entity_id} already exists, keeping current state")
+                    continue
+                created = await self.ha_client.update_sensor(
+                    sensor.entity_id,
+                    state="Waiting for data...",
+                    attributes={
+                        "friendly_name": sensor.name,
+                        "icon": sensor.icon,
+                    },
+                )
+                if not created:
+                    failed.append(sensor)
+            if not failed:
+                logger.info("Sensors registered in Home Assistant")
+                return
+            pending = failed
+            logger.warning(f"Could not register {len(pending)} sensor(s) in Home Assistant, retrying in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 300)
+
+    async def _process_queue(self) -> None:
+        """Process decoded lines queued by the stdout reader."""
+        while True:
+            line = await self._line_queue.get()
+            try:
+                await self._process_line(line)
+            except Exception:
+                logger.exception("Error processing line")
+            finally:
+                self._line_queue.task_done()
 
     async def _run_process(self) -> bool:
         """Run the SDR | multimon-ng pipeline once until it exits.
@@ -392,7 +449,10 @@ class Decoder:
                             got_output = True
                             self.last_error = ""  # Receiving data again
                         logger.debug(f"Raw line: {decoded[:100]}")
-                        await self._process_line(decoded)
+                        try:
+                            self._line_queue.put_nowait(decoded)
+                        except asyncio.QueueFull:
+                            logger.warning("Message processing is falling behind, dropping line")
                 except asyncio.CancelledError:
                     logger.debug("Decoder stdout reading cancelled")
                     raise
@@ -612,11 +672,8 @@ class Decoder:
         """Stop the decoder subprocess."""
         self._running = False
 
-        # Close HA client
-        await self.ha_client.close()
-
-        if self.mqtt_client:
-            await self.mqtt_client.stop()
+        if self._register_task:
+            self._register_task.cancel()
 
         if self._process:
             try:
@@ -631,3 +688,17 @@ class Decoder:
                 if "HackRF" in self.device_type:
                     logger.info("Waiting for HackRF USB reset...")
                     await asyncio.sleep(3.0)
+
+        # Give already queued messages a moment to be published, then stop the worker
+        if self._worker_task:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._line_queue.join(), timeout=2.0)
+            self._worker_task.cancel()
+            await asyncio.gather(self._worker_task, return_exceptions=True)
+            self._worker_task = None
+
+        # Close HA client
+        await self.ha_client.close()
+
+        if self.mqtt_client:
+            await self.mqtt_client.stop()

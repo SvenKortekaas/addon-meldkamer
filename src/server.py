@@ -39,39 +39,51 @@ class P2000Server:
         addr = writer.get_extra_info("peername")
         logger.info(f"Client connected: {addr}")
         self._clients.add(writer)
+        alive = True
 
         try:
             # Send welcome message
             welcome = {"type": "connected", "version": "2.0.0"}
-            await self._send(writer, welcome)
+            alive = await self._send(writer, welcome)
 
             # Keep connection alive
-            while self._running:
+            while self._running and alive:
                 try:
                     data = await asyncio.wait_for(reader.read(1024), timeout=30.0)
                     if not data:
                         break
                     # Handle any client commands here if needed
                 except TimeoutError:
+                    # A socket-level ETIMEDOUT is also a TimeoutError, and the
+                    # reader re-raises it on every read - stop on a dead socket
+                    if writer.is_closing() or reader.exception() is not None:
+                        alive = False
+                        break
                     # Send ping to keep alive
-                    await self._send(writer, {"type": "ping"})
-        except ConnectionError:
-            pass
+                    alive = await self._send(writer, {"type": "ping"})
+        except OSError:
+            alive = False
         finally:
             self._clients.discard(writer)
-            writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
+            if alive:
+                writer.close()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(writer.wait_closed(), timeout=5.0)
+            else:
+                # Dead or stuck client: drop it without waiting for a flush
+                writer.transport.abort()
             logger.info(f"Client disconnected: {addr}")
 
-    async def _send(self, writer: asyncio.StreamWriter, data: dict) -> None:
-        """Send JSON data to a client."""
+    async def _send(self, writer: asyncio.StreamWriter, data: dict) -> bool:
+        """Send JSON data to a client. Returns False if the client is dead or too slow."""
         try:
             message = json.dumps(data) + "\n"
             writer.write(message.encode())
-            await writer.drain()
+            await asyncio.wait_for(writer.drain(), timeout=5.0)
+            return True
         except Exception as e:
             logger.debug(f"Send error: {e}")
+            return False
 
     def broadcast_message(self, msg: P2000Message) -> None:
         """Broadcast a P2000 message to all connected clients."""
@@ -105,7 +117,7 @@ class P2000Server:
         # Clean up disconnected (or too slow) clients
         for writer in disconnected:
             self._clients.discard(writer)
-            writer.close()
+            writer.transport.abort()
 
     async def stop(self) -> None:
         """Stop the TCP server."""
