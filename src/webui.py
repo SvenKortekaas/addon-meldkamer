@@ -1645,93 +1645,88 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .detail-float-body { flex: 1; min-height: 0; overflow-y: auto; }
 
         /* Settings & Info pages */
-        .panel {
-            background: var(--ha-card-background); border: var(--card-border);
-            border-radius: var(--card-radius); box-shadow: var(--shadow-sm);
-        }
+        .panel { background: var(--ha-card-background); border: var(--card-border); border-radius: 6px; }
         .panel-head {
             display: flex; justify-content: space-between; align-items: center;
             padding: 12px 14px; border-bottom: 1px solid var(--divider-color);
         }
         .panel-title { font-size: 13px; font-weight: 600; }
-        .panel-sub { color: var(--secondary-text-color); font-size: 11px; }
-        .panel-body { padding: 16px; }
+        .panel-sub { color: var(--secondary-text-color); font-size: 12px; }
+        .panel-body { padding: 16px 18px; }
 
         /* ---------- Buttons & inputs ---------- */
         .btn {
-            display: inline-flex; align-items: center; gap: 6px;
-            padding: 7px 14px; border-radius: 8px; border: var(--card-border);
+            display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 12px;
+            border-radius: 4px; border: var(--card-border); white-space: nowrap;
             background: var(--ha-card-background); color: var(--primary-text-color);
-            font-size: 12.5px; font-weight: 500; cursor: pointer;
-            transition: background 0.12s, opacity 0.12s;
+            font-size: 13px; font-weight: 500; cursor: pointer;
+            transition: background 0.12s, opacity 0.12s, filter 0.12s;
         }
         .btn:hover { background: var(--hover-bg); }
         .btn:disabled { opacity: 0.45; cursor: default; }
         .btn-primary { background: var(--primary-color); border-color: var(--primary-color); color: #fff; }
-        .btn-primary:hover { background: #039be5; }
-        .btn-success { background: var(--success-color); border-color: var(--success-color); color: #fff; }
-        .btn-success:hover { background: #3d9142; }
-        .btn-danger { background: transparent; color: #ef5350; border-color: rgba(229,72,77,0.45); }
-        .btn-danger:hover { background: rgba(229,72,77,0.12); }
+        .btn-primary:hover { background: var(--primary-color); filter: brightness(1.1); }
+        .btn-danger { background: transparent; color: var(--danger-color); border-color: var(--danger-color); }
+        .btn-danger:hover { background: var(--incident-bg); }
         .btn-danger-solid { background: var(--danger-color); border-color: var(--danger-color); color: #fff; }
-        .btn-danger-solid:hover { background: #d32f2f; }
+        .btn-danger-solid:hover { background: var(--danger-color); filter: brightness(1.1); }
 
         .input {
-            padding: 7px 12px; border-radius: 8px; border: var(--card-border);
+            height: 30px; padding: 0 10px; border-radius: 4px; border: var(--card-border);
             background: var(--ha-background); color: var(--primary-text-color);
             font-size: 13px; outline: none; font-family: inherit;
             transition: border-color 0.12s;
         }
         .input:focus { border-color: var(--primary-color); }
-        textarea.input { resize: vertical; line-height: 1.4; }
+        textarea.input { height: auto; padding: 8px 10px; resize: vertical; line-height: 1.4; font-family: var(--mono); }
 
         /* ---------- Info tab ---------- */
-        .info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
-        .info-card h3 {
-            font-size: 11px; font-weight: 600; color: var(--secondary-text-color);
-            text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px;
+        .info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+        .info-card h3, .section-title {
+            font-size: 11.5px; font-weight: 600; color: var(--secondary-text-color);
+            text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 4px;
             display: flex; align-items: center; gap: 8px;
         }
         .info-row {
             display: flex; justify-content: space-between; gap: 12px;
-            padding: 8px 0; border-bottom: 1px solid var(--divider-color); font-size: 13px;
+            padding: 9px 0; border-bottom: 1px solid var(--divider-color); font-size: 14px;
         }
         .info-row:last-child { border-bottom: none; }
         .reception { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 12px 32px; }
         .info-label { color: var(--secondary-text-color); }
-        .info-value { color: var(--primary-text-color); font-weight: 500; text-align: right; }
+        .info-value { color: var(--primary-text-color); font-family: var(--mono); font-size: 13.5px; text-align: right; }
 
-        .stats-panel { margin-top: 16px; }
+        .stats-panel { margin-top: 14px; }
         .stats-charts-grid {
             display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
             gap: 28px; margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--divider-color);
         }
         .chart-title {
             display: flex; align-items: center; gap: 8px; margin-bottom: 12px;
-            font-size: 11px; font-weight: 600; color: var(--secondary-text-color);
-            text-transform: uppercase; letter-spacing: 0.06em;
+            font-size: 11.5px; font-weight: 600; color: var(--secondary-text-color);
+            text-transform: uppercase; letter-spacing: 0.07em;
         }
         .chart-row { display: flex; align-items: center; gap: 20px; }
-        .chart-legend { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+        .chart-legend { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 7px; }
         .chart-legend-item {
-            display: flex; align-items: center; gap: 8px; font-size: 12.5px;
+            display: flex; align-items: center; gap: 8px; font-size: 13.5px;
             color: var(--primary-text-color); overflow: hidden;
         }
-        .chart-legend-item .swatch { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; }
+        .chart-legend-item .swatch { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
         .chart-legend-item .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .chart-legend-item .count { color: var(--secondary-text-color); margin-left: auto; padding-left: 8px; flex-shrink: 0; }
+        .chart-legend-item .count { font-family: var(--mono); color: var(--secondary-text-color); margin-left: auto; padding-left: 8px; flex-shrink: 0; }
 
         /* ---------- Settings tab ---------- */
         .db-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
         .db-toolbar-left { display: flex; align-items: center; gap: 10px; }
         .db-toolbar-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-        .db-table-title { font-size: 15px; font-weight: 600; }
+        .db-table-title { font-size: 12px; font-weight: 600; color: var(--secondary-text-color); text-transform: uppercase; letter-spacing: 0.07em; }
 
         .db-table-wrap { max-height: 480px; overflow-y: auto; }
-        .db-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        .db-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
         .db-table th {
-            text-align: left; padding: 10px 12px; font-size: 11px; font-weight: 600;
-            text-transform: uppercase; letter-spacing: 0.05em;
+            text-align: left; padding: 9px 12px; font-size: 11px; font-weight: 600;
+            text-transform: uppercase; letter-spacing: 0.06em;
             color: var(--secondary-text-color); border-bottom: 1px solid var(--divider-color);
             position: sticky; top: 0; background: var(--ha-card-background); z-index: 1;
         }
@@ -1739,14 +1734,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .db-table tbody tr:hover { background: var(--hover-bg); }
         .row-del {
             border: none; background: transparent; color: var(--secondary-text-color);
-            cursor: pointer; padding: 4px 7px; border-radius: 6px; font-size: 13px; line-height: 1;
+            cursor: pointer; padding: 4px 7px; border-radius: 4px; font-size: 13px; line-height: 1;
         }
-        .row-del:hover { color: #ef5350; background: rgba(229,72,77,0.12); }
+        .row-del:hover { color: var(--danger-color); background: var(--incident-bg); }
 
         .db-pagination {
             display: flex; justify-content: space-between; align-items: center;
             padding: 12px 14px; border-top: 1px solid var(--divider-color);
-            font-size: 12px; color: var(--secondary-text-color);
+            font-family: var(--mono); font-size: 12.5px; color: var(--secondary-text-color);
         }
 
         .progress { height: 8px; border-radius: 999px; background: var(--divider-color); overflow: hidden; }
@@ -1761,17 +1756,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .modal-overlay.open { display: flex; }
         .modal {
             background: var(--ha-card-background); border: var(--card-border);
-            border-radius: 12px; width: min(520px, 100%); max-height: 85vh;
+            border-radius: 6px; width: min(520px, 100%); max-height: 85vh;
             overflow-y: auto; box-shadow: var(--shadow-lg);
         }
         .modal-head {
             display: flex; justify-content: space-between; align-items: center;
             padding: 14px 18px; border-bottom: 1px solid var(--divider-color);
         }
-        .modal-title { font-size: 15px; font-weight: 600; }
+        .modal-title { font-size: 14px; font-weight: 600; }
         .modal-close {
             border: none; background: transparent; color: var(--secondary-text-color);
-            font-size: 18px; cursor: pointer; line-height: 1; padding: 2px 6px; border-radius: 6px;
+            font-size: 18px; cursor: pointer; line-height: 1; padding: 2px 6px; border-radius: 4px;
         }
         .modal-close:hover { background: var(--hover-bg); color: var(--primary-text-color); }
         .modal-body { padding: 16px 18px; display: flex; flex-direction: column; gap: 12px; font-size: 13px; }
@@ -1802,27 +1797,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         @keyframes toast-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
         /* ---------- Settings landing cards ---------- */
-        .db-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 12px; }
+        .db-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 12px; }
         .db-card {
-            border: var(--card-border); border-radius: var(--card-radius);
+            border: var(--card-border); border-radius: 4px;
             background: var(--ha-background); padding: 14px 16px;
-            display: flex; flex-direction: column; gap: 8px;
+            display: flex; flex-direction: column; gap: 9px;
         }
         .db-card-head { display: flex; align-items: center; gap: 8px; }
         .db-step {
-            width: 20px; height: 20px; border-radius: 50%; flex-shrink: 0;
-            background: rgba(3,169,244,0.12); color: var(--primary-color);
-            font-size: 11px; font-weight: 700;
+            width: 22px; height: 22px; border-radius: 3px; flex-shrink: 0;
+            background: var(--tag-bg); color: var(--tag-text);
+            font-family: var(--mono); font-size: 12px; font-weight: 600;
             display: inline-flex; align-items: center; justify-content: center;
         }
-        .db-card-icon { font-size: 16px; }
-        .db-card-title { font-size: 13px; font-weight: 600; flex: 1; }
-        .db-card-status { font-size: 10px; font-weight: 600; padding: 2px 8px; border-radius: 999px; }
-        .db-card-status.ready { background: rgba(67,160,71,0.15); color: #4caf50; }
-        .db-card-status.empty { background: rgba(245,124,0,0.15); color: var(--prio-2); }
-        .db-card-desc { font-size: 12px; color: var(--secondary-text-color); line-height: 1.45; }
-        .db-card-count { font-size: 12px; font-weight: 600; color: var(--secondary-text-color); }
-        .db-card-count span { color: var(--primary-color); font-size: 14px; }
+        .db-card-title { font-size: 14px; font-weight: 600; flex: 1; }
+        .db-card-status { font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 3px; }
+        .db-card-status.ready { color: var(--success-color); border: 1px solid currentColor; }
+        .db-card-status.empty { color: var(--prio-2); border: 1px solid currentColor; }
+        .db-card-desc { font-size: 13px; color: var(--secondary-text-color); line-height: 1.5; }
+        .db-card-count { font-size: 12.5px; color: var(--secondary-text-color); }
+        .db-card-count span { font-family: var(--mono); color: var(--primary-text-color); font-size: 15px; font-weight: 500; }
         .db-card-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: auto; }
 
         @media (max-width: 1200px) {
@@ -1935,7 +1929,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div class="info-grid">
                 <div class="panel info-card">
                     <div class="panel-body">
-                        <h3>📡 Receiver</h3>
+                        <h3>Receiver</h3>
                         <div class="info-row"><span class="info-label">Network</span><span class="info-value" id="info-network">-</span></div>
                         <div class="info-row"><span class="info-label">Frequency</span><span class="info-value" id="info-frequency">-</span></div>
                         <div class="info-row"><span class="info-label">Sample rate</span><span class="info-value" id="info-samplerate">-</span></div>
@@ -1945,7 +1939,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
                 <div class="panel info-card">
                     <div class="panel-body">
-                        <h3>🔌 Device</h3>
+                        <h3>Device</h3>
                         <div class="info-row"><span class="info-label">Type</span><span class="info-value" id="info-device">-</span></div>
                         <div class="info-row"><span class="info-label">Driver</span><span class="info-value" id="info-driver">-</span></div>
                         <div class="info-row"><span class="info-label">Status</span><span class="info-value" id="info-status">-</span></div>
@@ -1956,7 +1950,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
                 <div class="panel info-card">
                     <div class="panel-body">
-                        <h3>🗄️ Database</h3>
+                        <h3>Database</h3>
                         <div class="info-row"><span class="info-label">Places</span><span class="info-value" id="info-places">0</span></div>
                         <div class="info-row"><span class="info-label">Streets</span><span class="info-value" id="info-streets">0</span></div>
                         <div class="info-row"><span class="info-label">Capcodes</span><span class="info-value" id="info-capcodes">0</span></div>
@@ -1969,7 +1963,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div class="info-grid" style="margin-top: 14px;">
                 <div class="panel info-card">
                     <div class="panel-body">
-                        <h3>📶 Reception</h3>
+                        <h3>Reception</h3>
                         <div class="reception">
                         <div>
                         <div class="info-row"><span class="info-label">Active receiver</span><span class="info-value" id="rx-source">-</span></div>
@@ -1992,7 +1986,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
             <div class="panel info-card stats-panel">
                 <div class="panel-body">
-                    <h3>📊 Statistics</h3>
+                    <h3>Statistics</h3>
                     <div class="info-row"><span class="info-label">Total messages</span><span class="info-value" id="info-total">0</span></div>
                     <div class="info-row"><span class="info-label">Session uptime</span><span class="info-value" id="info-uptime">-</span></div>
                     <div class="stats-charts-grid">
@@ -2020,7 +2014,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     <div id="db-landing">
                         <div class="db-toolbar">
                             <span class="db-table-title">Database setup</span>
-                            <button class="btn btn-danger" onclick="dbResetDatabase()">🗑️ Reset database</button>
+                            <button class="btn btn-danger" onclick="dbResetDatabase()">Reset database</button>
                         </div>
                         <div class="panel-sub" style="margin-bottom: 14px;">Load the reference data in order - each step improves message parsing, badges and map pins.</div>
 
@@ -2028,14 +2022,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                             <div class="db-card">
                                 <div class="db-card-head">
                                     <span class="db-step">1</span>
-                                    <span class="db-card-icon">📟</span>
                                     <span class="db-card-title">Capcodes</span>
                                     <span class="db-card-status empty" id="db-status-capcodes">-</span>
                                 </div>
                                 <div class="db-card-desc">Pager addresses with discipline, region and receiver info. Powers the badges and receiver details on every message.</div>
                                 <div class="db-card-count"><span id="db-count-capcodes">0</span> rows</div>
                                 <div class="db-card-actions">
-                                    <button class="btn btn-success" onclick="dbImportBommel(this)">Import Bommel</button>
+                                    <button class="btn btn-primary" onclick="dbImportBommel(this)">Import Bommel</button>
                                     <button class="btn" onclick="dbOpenTable('capcodes')">Manage</button>
                                 </div>
                             </div>
@@ -2043,14 +2036,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                             <div class="db-card">
                                 <div class="db-card-head">
                                     <span class="db-step">2</span>
-                                    <span class="db-card-icon">🏙️</span>
                                     <span class="db-card-title">Places</span>
                                     <span class="db-card-status empty" id="db-status-places">-</span>
                                 </div>
                                 <div class="db-card-desc">All ~2600 Dutch places with coordinates. Enables city detection in messages and city-level map pins.</div>
                                 <div class="db-card-count"><span id="db-count-places">0</span> rows</div>
                                 <div class="db-card-actions">
-                                    <button class="btn btn-success" onclick="importAllPlaces(this)">Import All Places</button>
+                                    <button class="btn btn-primary" onclick="importAllPlaces(this)">Import All Places</button>
                                     <button class="btn" onclick="dbOpenTable('places')">Manage</button>
                                 </div>
                             </div>
@@ -2058,14 +2050,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                             <div class="db-card">
                                 <div class="db-card-head">
                                     <span class="db-step">3</span>
-                                    <span class="db-card-icon">🛤️</span>
                                     <span class="db-card-title">Streets</span>
                                     <span class="db-card-status empty" id="db-status-streets">-</span>
                                 </div>
                                 <div class="db-card-desc">Official BAG street names per province. Enables full street-address extraction for precise geocoding.</div>
                                 <div class="db-card-count"><span id="db-count-streets">0</span> rows</div>
                                 <div class="db-card-actions">
-                                    <button class="btn btn-success" onclick="dbImportBAG(this)">Import BAG</button>
+                                    <button class="btn btn-primary" onclick="dbImportBAG(this)">Import BAG</button>
                                     <button class="btn" onclick="dbOpenTable('streets')">Manage</button>
                                 </div>
                             </div>
@@ -2076,7 +2067,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         <div class="db-cards">
                             <div class="db-card">
                                 <div class="db-card-head">
-                                    <span class="db-card-icon">📖</span>
                                     <span class="db-card-title">Texts</span>
                                     <span class="db-card-status ready" id="db-status-texts">-</span>
                                 </div>
@@ -2089,7 +2079,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
                             <div class="db-card">
                                 <div class="db-card-head">
-                                    <span class="db-card-icon">📨</span>
                                     <span class="db-card-title">Messages</span>
                                     <span class="db-card-status ready" id="db-status-messages">-</span>
                                 </div>
@@ -2102,7 +2091,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
                             <div class="db-card">
                                 <div class="db-card-head">
-                                    <span class="db-card-icon">📍</span>
                                     <span class="db-card-title">Geocodes</span>
                                     <span class="db-card-status ready" id="db-status-geocodes">-</span>
                                 </div>
@@ -2115,7 +2103,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
                             <div class="db-card">
                                 <div class="db-card-head">
-                                    <span class="db-card-icon">🗣️</span>
                                     <span class="db-card-title">TTS Replacements</span>
                                     <span class="db-card-status ready" id="db-status-tts">-</span>
                                 </div>
@@ -2128,7 +2115,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
                             <div class="db-card">
                                 <div class="db-card-head">
-                                    <span class="db-card-icon">🙈</span>
                                     <span class="db-card-title">Ignore Text</span>
                                     <span class="db-card-status ready" id="db-status-ignore_text">-</span>
                                 </div>
@@ -2141,7 +2127,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
                             <div class="db-card">
                                 <div class="db-card-head">
-                                    <span class="db-card-icon">🚫</span>
                                     <span class="db-card-title">Ignore Capcodes</span>
                                     <span class="db-card-status ready" id="db-status-ignore_capcodes">-</span>
                                 </div>
@@ -2154,7 +2139,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
                             <div class="db-card">
                                 <div class="db-card-head">
-                                    <span class="db-card-icon">📷</span>
                                     <span class="db-card-title">Vehicle Photos</span>
                                     <span class="db-card-status empty" id="db-status-vehicle_photos">-</span>
                                 </div>
@@ -2171,7 +2155,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         </div>
                         <div class="db-card" style="max-width: 760px;">
                             <div class="db-card-head">
-                                <span class="db-card-icon">🎯</span>
                                 <span class="db-card-title">ppm calibration</span>
                             </div>
                             <div class="db-card-desc">Tries ppm values around the current one on the active receiver and keeps the one that decodes the most FLEX frames. Decoding continues while it runs.</div>
@@ -3165,7 +3148,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         <input type="text" class="input" data-vp-label placeholder="e.g. 17106 - Rotterdam-Rijnmond">
                     </div>
                 `,
-                footHTML: `<button class="btn" data-close>Cancel</button><button class="btn btn-success" data-save>Upload</button>`
+                footHTML: `<button class="btn" data-close>Cancel</button><button class="btn btn-primary" data-save>Upload</button>`
             });
 
             overlay.querySelector('[data-save]').addEventListener('click', () => {
@@ -3235,7 +3218,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         <input type="text" class="input" data-db-vp-label placeholder="e.g. 17106 - Rotterdam-Rijnmond">
                     </div>
                 `,
-                footHTML: `<button class="btn" data-close>Cancel</button><button class="btn btn-success" data-save>Upload</button>`
+                footHTML: `<button class="btn" data-close>Cancel</button><button class="btn btn-primary" data-save>Upload</button>`
             });
 
             const categoryField = overlay.querySelector('[data-db-vp-category-field]');
@@ -3436,7 +3419,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const total = sorted.reduce((sum, [, v]) => sum + v, 0);
             if (total === 0) { el.innerHTML = '<div class="empty-state" style="padding: 20px;">No data</div>'; return; }
 
-            const colors = ['#03a9f4', '#ff9800', '#4caf50', '#e91e63', '#9c27b0', '#00bcd4'];
+            const colors = ['#4c8dff', '#f5a524', '#5fd68a', '#ff6159', '#b18cff', '#4fc3c8'];
             let cumulativePercent = 0;
             let paths = '';
             let legend = '';
@@ -3685,72 +3668,72 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         };
 
         const dbTitles = {
-            capcodes: '📟 Capcodes',
-            places: '🏙️ Places',
-            streets: '🛤️ Streets',
-            messages: '📨 Messages',
-            texts: '📖 Texts',
-            geocodes: '📍 Geocodes',
-            tts: '🗣️ TTS Replacements',
-            ignore_text: '🙈 Ignore Text',
-            ignore_capcodes: '🚫 Ignore Capcodes',
-            vehicle_photos: '📷 Vehicle Photos'
+            capcodes: 'Capcodes',
+            places: 'Places',
+            streets: 'Streets',
+            messages: 'Messages',
+            texts: 'Texts',
+            geocodes: 'Geocodes',
+            tts: 'TTS Replacements',
+            ignore_text: 'Ignore Text',
+            ignore_capcodes: 'Ignore Capcodes',
+            vehicle_photos: 'Vehicle Photos'
         };
 
         const dbTableButtons = {
             capcodes: [
-                {label: '+ Add', cls: 'btn-success', fn: 'dbAdd'},
-                {label: '📥 Export', cls: 'btn-primary', fn: 'dbExport'},
-                {label: '📤 Import CSV', cls: '', fn: 'dbImportDialog'},
-                {label: '📟 Import Bommel', cls: '', fn: 'dbImportBommel'},
-                {label: '🗑️ Clear table', cls: 'btn-danger', fn: 'dbClearTable'}
+                {label: '+ Add', cls: 'btn-primary', fn: 'dbAdd'},
+                {label: 'Export', cls: 'btn-primary', fn: 'dbExport'},
+                {label: 'Import CSV', cls: '', fn: 'dbImportDialog'},
+                {label: 'Import Bommel', cls: '', fn: 'dbImportBommel'},
+                {label: 'Clear table', cls: 'btn-danger', fn: 'dbClearTable'}
             ],
             places: [
-                {label: '+ Add', cls: 'btn-success', fn: 'dbAdd'},
-                {label: '📥 Export', cls: 'btn-primary', fn: 'dbExport'},
-                {label: '📤 Import CSV', cls: '', fn: 'dbImportDialog'},
-                {label: '🌍 Import All Places', cls: '', fn: 'importAllPlaces'},
-                {label: '🇳🇱 Import BAG', cls: '', fn: 'dbImportBAG'},
-                {label: '🗑️ Clear table', cls: 'btn-danger', fn: 'dbClearTable'}
+                {label: '+ Add', cls: 'btn-primary', fn: 'dbAdd'},
+                {label: 'Export', cls: 'btn-primary', fn: 'dbExport'},
+                {label: 'Import CSV', cls: '', fn: 'dbImportDialog'},
+                {label: 'Import All Places', cls: '', fn: 'importAllPlaces'},
+                {label: 'Import BAG', cls: '', fn: 'dbImportBAG'},
+                {label: 'Clear table', cls: 'btn-danger', fn: 'dbClearTable'}
             ],
             streets: [
-                {label: '+ Add', cls: 'btn-success', fn: 'dbAdd'},
-                {label: '📥 Export', cls: 'btn-primary', fn: 'dbExport'},
-                {label: '📤 Import CSV', cls: '', fn: 'dbImportDialog'},
-                {label: '🇳🇱 Import BAG', cls: '', fn: 'dbImportBAG'},
-                {label: '🗑️ Clear table', cls: 'btn-danger', fn: 'dbClearTable'}
+                {label: '+ Add', cls: 'btn-primary', fn: 'dbAdd'},
+                {label: 'Export', cls: 'btn-primary', fn: 'dbExport'},
+                {label: 'Import CSV', cls: '', fn: 'dbImportDialog'},
+                {label: 'Import BAG', cls: '', fn: 'dbImportBAG'},
+                {label: 'Clear table', cls: 'btn-danger', fn: 'dbClearTable'}
             ],
             messages: [
-                {label: '📥 Export', cls: 'btn-primary', fn: 'dbExport'},
-                {label: '🗑️ Delete all', cls: 'btn-danger', fn: 'dbDeleteAllMessages'}
+                {label: 'Export', cls: 'btn-primary', fn: 'dbExport'},
+                {label: 'Delete all', cls: 'btn-danger', fn: 'dbDeleteAllMessages'}
             ],
             texts: [
-                {label: '+ Add', cls: 'btn-success', fn: 'dbAdd'},
-                {label: '📥 Export', cls: 'btn-primary', fn: 'dbExport'},
-                {label: '📖 Import Texts', cls: '', fn: 'dbImportAbbreviations'},
-                {label: '🗑️ Clear table', cls: 'btn-danger', fn: 'dbClearTable'}
+                {label: '+ Add', cls: 'btn-primary', fn: 'dbAdd'},
+                {label: 'Export', cls: 'btn-primary', fn: 'dbExport'},
+                {label: 'Import Texts', cls: '', fn: 'dbImportAbbreviations'},
+                {label: 'Clear table', cls: 'btn-danger', fn: 'dbClearTable'}
             ],
             geocodes: [
-                {label: '🗑️ Clear all', cls: 'btn-danger', fn: 'dbClearGeocodes'}
+                {label: 'Clear all', cls: 'btn-danger', fn: 'dbClearGeocodes'}
             ],
             tts: [
-                {label: '+ Add', cls: 'btn-success', fn: 'dbAdd'},
-                {label: '📥 Export', cls: 'btn-primary', fn: 'dbExport'},
-                {label: '🗑️ Delete all', cls: 'btn-danger', fn: 'dbDeleteAllTts'}
+                {label: '+ Add', cls: 'btn-primary', fn: 'dbAdd'},
+                {label: 'Export', cls: 'btn-primary', fn: 'dbExport'},
+                {label: 'Delete all', cls: 'btn-danger', fn: 'dbDeleteAllTts'}
             ],
             ignore_text: [
-                {label: '+ Add', cls: 'btn-success', fn: 'dbAdd'},
-                {label: '📥 Export', cls: 'btn-primary', fn: 'dbExport'},
-                {label: '🗑️ Delete all', cls: 'btn-danger', fn: 'dbDeleteAllIgnoreText'}
+                {label: '+ Add', cls: 'btn-primary', fn: 'dbAdd'},
+                {label: 'Export', cls: 'btn-primary', fn: 'dbExport'},
+                {label: 'Delete all', cls: 'btn-danger', fn: 'dbDeleteAllIgnoreText'}
             ],
             ignore_capcodes: [
-                {label: '+ Add', cls: 'btn-success', fn: 'dbAdd'},
-                {label: '📥 Export', cls: 'btn-primary', fn: 'dbExport'},
-                {label: '🗑️ Delete all', cls: 'btn-danger', fn: 'dbDeleteAllIgnoreCapcodes'}
+                {label: '+ Add', cls: 'btn-primary', fn: 'dbAdd'},
+                {label: 'Export', cls: 'btn-primary', fn: 'dbExport'},
+                {label: 'Delete all', cls: 'btn-danger', fn: 'dbDeleteAllIgnoreCapcodes'}
             ],
             vehicle_photos: [
-                {label: '+ Add', cls: 'btn-success', fn: 'dbOpenVehiclePhotoUpload'},
-                {label: '🗑️ Clear table', cls: 'btn-danger', fn: 'dbClearTable'}
+                {label: '+ Add', cls: 'btn-primary', fn: 'dbOpenVehiclePhotoUpload'},
+                {label: 'Clear table', cls: 'btn-danger', fn: 'dbClearTable'}
             ]
         };
 
@@ -3951,7 +3934,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const overlay = openModal({
                 title: `Add to ${dbTitles[dbCurrentTable]}`,
                 bodyHTML,
-                footHTML: `<button class="btn" data-close>Cancel</button><button class="btn btn-success" data-save>Add</button>`
+                footHTML: `<button class="btn" data-close>Cancel</button><button class="btn btn-primary" data-save>Add</button>`
             });
             overlay.querySelector('[data-save]').addEventListener('click', () => {
                 const values = {};

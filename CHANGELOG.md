@@ -10,6 +10,7 @@
 - Messages with an A/B urgency code that also reach fire brigade capcodes go in the Ambulance lane.
 - Requires Home Assistant 2026.9 or newer (map tiles always come through its map tile proxy).
 - Fix: the built-in abbreviation dictionary is seeded on startup again.
+- Settings and Info pages use the dashboard's look: flat panels, compact buttons, mono values, no emoji headings, and larger, more readable text.
 - New screenshots.
 
 ## 1.2.0
