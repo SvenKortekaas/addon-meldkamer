@@ -1,4 +1,4 @@
-"""Best-effort vehicle/unit classification and voertuignummer extraction.
+"""Best-effort vehicle/unit classification and vehicle number extraction.
 
 Maps the small set of vehicle-type abbreviations already in
 abbreviation_import.py to a broad category, used to pick a fallback icon and
@@ -7,7 +7,7 @@ vehicle_photos table). This is deliberately a coarse classification, not a
 decode of the official "Nationaal Nummerplan Brandweer Nederland" numbering
 scheme - real per-vehicle photos aren't available from any open/licensed
 source, so the practical path is category-level defaults plus optional
-user-uploaded photos keyed by the exact voertuignummer token.
+user-uploaded photos keyed by the exact vehicle number token.
 """
 
 import re
@@ -60,7 +60,7 @@ VEHICLE_CATEGORIES: dict[str, str] = {
 }
 
 # Category -> fallback emoji shown when no user-uploaded photo exists for
-# either the exact voertuignummer or the category itself.
+# either the exact vehicle number or the category itself.
 CATEGORY_ICONS: dict[str, str] = {
     "ambulance": "🚑",
     "helikopter": "🚁",
@@ -81,7 +81,7 @@ CATEGORY_ICONS: dict[str, str] = {
 
 DEFAULT_ICON = "📻"
 
-# Matches a known vehicle-type token directly followed by a voertuignummer,
+# Matches a known vehicle-type token directly followed by a vehicle number,
 # either the official "RR-XXXX" fire brigade format (e.g. "TS 07-1782") or a
 # bare run of digits as commonly seen for ambulance units (e.g. "AMBU 17106").
 # Longer codes (AL-42, ...) are tried first so e.g. "AL-42" isn't matched as
@@ -92,7 +92,7 @@ _VEHICLE_NUMBER_RE = re.compile(
     + r")\s+(\d{2,4}-\d{3,4}|\d{3,6})\b"
 )
 
-# Fallback for ambulance "ritmelding" messages that carry the voertuignummer
+# Fallback for ambulance "ritmelding" messages that carry the vehicle number
 # without any AMBU/MUG-style prefix right next to it, as a bare 5-digit
 # RRNNN token - 2-digit RAV region + 3-digit unit sequence, dash omitted to
 # save space in the pager text, e.g. "07205 - Arnhem Rit 264112" is unit
@@ -115,7 +115,7 @@ def classify(abbreviations: list[dict[str, str]]) -> str:
 
 
 def extract_vehicle_number(text: str) -> str:
-    """Extract a voertuignummer following a known vehicle-type token, if present."""
+    """Extract a vehicle number following a known vehicle-type token, if present."""
     match = _VEHICLE_NUMBER_RE.search(text)
     if match:
         number = match.group(1)

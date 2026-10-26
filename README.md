@@ -5,6 +5,8 @@
 
 P2000 FLEX pager decoder dashboard for Home Assistant — decode Dutch emergency services messages using RTL-SDR, HackRF, or network streaming.
 
+[![Add repository to my Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fcyberjunky%2Faddon-meldkamer)
+
 ![Message details with map, vehicle classification, and abbreviation tags](https://raw.githubusercontent.com/cyberjunky/addon-meldkamer/main/screenshots/message-details.png)
 
 <details>
@@ -36,6 +38,17 @@ P2000 FLEX pager decoder dashboard for Home Assistant — decode Dutch emergency
 - 🚑 **Vehicle Classification** — Best-effort vehicle/unit recognition (ambulance, fire, helicopter, police, water rescue) with user-uploadable photos per vehicle or category
 - 🔔 **Sound Notifications** — Configurable audio alerts for new messages
 - 🔍 **Message Filtering** — Filter by text patterns and capcodes, managed live from the dashboard
+
+## Installation
+
+1. Click the button to add this repository to your Home Assistant:
+
+   [![Add repository to my Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fcyberjunky%2Faddon-meldkamer)
+
+   Or add it by hand: **Settings → Add-ons → Add-on Store → ⋮ → Repositories**, and enter `https://github.com/cyberjunky/addon-meldkamer`.
+2. Find **Meldkamer** in the Add-on Store and click **Install**.
+3. Plug in your SDR receiver, review the **Configuration** tab, and click **Start**.
+4. Open **Meldkamer** from the sidebar.
 
 ## Network
 
@@ -72,7 +85,7 @@ Each table gets its own card with row counts and Manage/Import actions:
 | 🗣️ TTS Replacements | Regex rules for speakable text-to-speech | CSV |
 | 🙈 Ignore Text | Wildcard patterns to drop matching messages | CSV |
 | 🚫 Ignore Capcodes | Capcodes to drop | CSV |
-| 📷 Vehicle Photos | Photos you've uploaded per voertuignummer/category | — (upload via message detail or +Add) |
+| 📷 Vehicle Photos | Photos you've uploaded per vehicle number or category | — (upload via message detail or +Add) |
 
 Click "Manage" on any card to view/edit/delete that table's rows.
 

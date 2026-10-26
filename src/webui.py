@@ -2118,7 +2118,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                                     <span class="db-card-title">Vehicle Photos</span>
                                     <span class="db-card-status empty" id="db-status-vehicle_photos">-</span>
                                 </div>
-                                <div class="db-card-desc">Photos you've uploaded per voertuignummer (e.g. "07-1782", "18-187") or vehicle category (e.g. "ambulance", "politie"), shown on matching messages.</div>
+                                <div class="db-card-desc">Photos you've uploaded per vehicle number (e.g. "07-1782", "18-187") or vehicle category (e.g. "ambulance", "politie"), shown on matching messages.</div>
                                 <div class="db-card-count"><span id="db-count-vehicle_photos">0</span> rows</div>
                                 <div class="db-card-actions">
                                     <button class="btn" onclick="dbOpenTable('vehicle_photos')">Manage</button>
@@ -2891,7 +2891,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 .catch(() => {});
         }
 
-        // ----- Vehicle photos (user-uploaded, keyed by voertuignummer or category) -----
+        // ----- Vehicle photos (user-uploaded, keyed by vehicle number or category) -----
         function prettyVehicleCategory(category) {
             return (category || '').split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
         }
@@ -2900,7 +2900,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             return `${basePath}api/vehicle-photo/${keyType}/${encodeURIComponent(keyValue)}`;
         }
 
-        // Tries the exact voertuignummer photo first, falls back to the category
+        // Tries the exact vehicle number photo first, falls back to the category
         // photo, and finally leaves the emoji fallback showing.
         function loadVehiclePhoto(msg) {
             const visual = document.getElementById('vehicle-visual');
@@ -3003,14 +3003,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     </div>
                     <div class="form-field">
                         <label class="form-check"><input type="radio" name="db-vp-key" value="category" checked> Vehicle category (fallback photo)</label>
-                        <label class="form-check"><input type="radio" name="db-vp-key" value="number"> Specific vehicle number (voertuignummer)</label>
+                        <label class="form-check"><input type="radio" name="db-vp-key" value="number"> Specific vehicle number</label>
                     </div>
                     <div class="form-field" data-db-vp-category-field>
                         <label>Category</label>
                         <select class="input" data-db-vp-category>${categoryOptions}</select>
                     </div>
                     <div class="form-field" data-db-vp-number-field style="display:none;">
-                        <label>Voertuignummer</label>
+                        <label>Vehicle number</label>
                         <input type="text" class="input" data-db-vp-number placeholder="e.g. 07-1782 or 18-187">
                         <div style="font-size: 12px; color: var(--secondary-text-color); margin-top: 4px;">The RR-NNN number only, without the vehicle-type prefix - e.g. "07-1782" (fire brigade) or "18-187" (ambulance region-unit). Check the vehicle's own #tag on a matching message's detail panel for the exact value to use.</div>
                     </div>
@@ -3042,7 +3042,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 const keyValue = keyType === 'category'
                     ? overlay.querySelector('[data-db-vp-category]').value
                     : overlay.querySelector('[data-db-vp-number]').value.trim();
-                if (!keyValue) { toast(keyType === 'category' ? 'Choose a category' : 'Enter a voertuignummer', 'error'); return; }
+                if (!keyValue) { toast(keyType === 'category' ? 'Choose a category' : 'Enter a vehicle number', 'error'); return; }
                 const label = overlay.querySelector('[data-db-vp-label]').value.trim();
 
                 const form = new FormData();

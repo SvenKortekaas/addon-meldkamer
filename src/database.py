@@ -186,7 +186,7 @@ class Database:
         enabled INTEGER NOT NULL DEFAULT 1
     );
 
-    -- User-uploaded vehicle photos, keyed by exact voertuignummer ('number')
+    -- User-uploaded vehicle photos, keyed by exact vehicle number ('number')
     -- or by broad category ('category', e.g. "ambulance") as a fallback.
     CREATE TABLE IF NOT EXISTS vehicle_photos (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1982,7 +1982,7 @@ class Database:
         return output.getvalue()
 
     # =========================================================================
-    # VEHICLE PHOTOS (user-uploaded, keyed by voertuignummer or category)
+    # VEHICLE PHOTOS (user-uploaded, keyed by vehicle number or category)
     # =========================================================================
 
     def get_vehicle_photo(self, key_type: str, key_value: str) -> dict | None:
@@ -2001,7 +2001,7 @@ class Database:
             return None
 
     def set_vehicle_photo(self, key_type: str, key_value: str, mime_type: str, image: bytes, label: str = "") -> bool:
-        """Add or replace a vehicle photo for a voertuignummer or category."""
+        """Add or replace a vehicle photo for a vehicle number or category."""
         try:
             self.cursor.execute(
                 "INSERT OR REPLACE INTO vehicle_photos (key_type, key_value, label, mime_type, image) "
