@@ -33,7 +33,7 @@ MAX_PHOTO_SIZE = 5 * 1024 * 1024
 MAX_FORM_FIELD_SIZE = 4 * 1024
 PHOTO_MIME_TYPES = ("image/jpeg", "image/png", "image/webp", "image/gif")
 
-ADDON_VERSION = "1.1.0"
+ADDON_VERSION = "1.1.1"
 
 # Home Assistant core (2026.9+) proxies OpenStreetMap raster tiles itself via
 # its built-in map_tiles integration, identifying the requests the way OSM's

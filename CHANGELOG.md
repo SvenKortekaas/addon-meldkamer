@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1
+
+- Prebuilt images: the add-on is now pulled from `ghcr.io/cyberjunky/addon-meldkamer` instead of being compiled on your system, so installing and updating take a minute instead of a long build.
+- Based on Alpine 3.23 (Home Assistant's multi-arch base image).
+- Only 64-bit systems (`amd64`, `aarch64`) are supported, the architectures Home Assistant's image builder supports.
+
 ## 1.1.0
 
 ### Breaking changes
