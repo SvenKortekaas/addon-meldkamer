@@ -2253,7 +2253,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         let currentMarker = null;
         let selectedMsg = null;
-        let selectedMsgIndex = -1;
+        let selectedMsgKey = null;
+        // Stable identity for a message: list positions shift as new ones arrive
+        function msgKey(msg) {
+            return msg.id !== undefined && msg.id !== null ? 'id:' + msg.id : msg.timestamp + '|' + (msg.body || '');
+        }
+        function highlightSelectedMessage() {
+            document.querySelectorAll('.message').forEach(el => el.classList.remove('selected'));
+            if (selectedMsgKey === null) return;
+            const idx = currentMessages.findIndex(m => msgKey(m) === selectedMsgKey);
+            if (idx < 0) return;
+            const card = document.querySelector(`.message[data-msg-index="${idx}"]`);
+            if (card) card.classList.add('selected');
+        }
         const markers = [];
 
         // Configured sensor radii (e.g. "within 3km of Schiphol") - static
@@ -2541,11 +2553,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         function formatTime(ts) { return new Date(ts).toLocaleTimeString(); }
         function formatDate(ts) { return new Date(ts).toLocaleString(); }
 
+        // Safe for element content AND quoted attribute values
+        const HTML_ESCAPES = {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'};
         function escapeHtml(text) {
             if (text === null || text === undefined) return '';
-            const div = document.createElement('div');
-            div.textContent = String(text);
-            return div.innerHTML;
+            return String(text).replace(/[&<>"']/g, ch => HTML_ESCAPES[ch]);
         }
 
         function countUnique(obj) {
@@ -2629,12 +2641,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         function showMessageDetails(msg, idx) {
             selectedMsg = msg;
-            selectedMsgIndex = (typeof idx === 'number') ? idx : -1;
-            document.querySelectorAll('.message').forEach(el => el.classList.remove('selected'));
-            if (selectedMsgIndex >= 0) {
-                const card = document.querySelector(`.message[data-msg-index="${selectedMsgIndex}"]`);
-                if (card) card.classList.add('selected');
-            }
+            selectedMsgKey = (typeof idx === 'number') ? msgKey(msg) : null;
+            highlightSelectedMessage();
 
             // Filter capcodes to only show unmatched ones
             const matchedCapcodes = new Set();
@@ -3022,12 +3030,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             currentMessages = latest;
             if (latest.length > 0) {
                 messagesEl.innerHTML = latest.map(renderMessage).join('');
-                if (selectedMsgIndex >= 0 && selectedMsgIndex < latest.length) {
-                    const card = document.querySelector(`.message[data-msg-index="${selectedMsgIndex}"]`);
-                    if (card) card.classList.add('selected');
-                }
+                highlightSelectedMessage();
             } else {
-                selectedMsgIndex = -1;
+                selectedMsgKey = null;
                 messagesEl.innerHTML = '<div class="empty-state">No messages yet</div>';
             }
             updateMarkers(latest);
@@ -3113,7 +3118,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const url = basePath + 'api/messages' + (currentSensorFilter ? `?sensor=${encodeURIComponent(currentSensorFilter)}` : '');
             fetch(url).then(r => r.json()).then(msgs => {
                 renderMessagesList((msgs || []).slice(0, 50));
-            });
+            }).catch(() => toast('Failed to load messages', 'error'));
         }
 
         function clearSelectedMessage() {
@@ -3121,7 +3126,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             // by clicking a message, independent of the periodic message-list/
             // marker refresh - switching filters must clear them explicitly, or
             // a message that no longer matches the new filter keeps showing.
-            selectedMsgIndex = -1;
+            selectedMsgKey = null;
             if (currentMarker) { map.removeLayer(currentMarker); currentMarker = null; }
             detailContent.innerHTML = '<div class="empty-state">Click a message to view details</div>';
             document.getElementById('history-section').style.display = 'none';
@@ -3149,10 +3154,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     // the feed, so showing everything by default defeats that.
                     currentSensorFilter = '__any__';
                     const pills = [
-                        `<button class="sensor-filter-pill active" data-sensor="__any__" onclick="selectSensorFilter('__any__')">Sensors</button>`,
-                        `<button class="sensor-filter-pill" data-sensor="" onclick="selectSensorFilter('')">All</button>`,
-                    ].concat(sensors.map(s => `<button class="sensor-filter-pill" data-sensor="${escapeHtml(s.name)}" onclick="selectSensorFilter('${escapeHtml(s.name)}')">${escapeHtml(s.name)}</button>`));
+                        `<button class="sensor-filter-pill active" data-sensor="__any__">Sensors</button>`,
+                        `<button class="sensor-filter-pill" data-sensor="">All</button>`,
+                    ].concat(sensors.map(s => `<button class="sensor-filter-pill" data-sensor="${escapeHtml(s.name)}">${escapeHtml(s.name)}</button>`));
                     bar.innerHTML = pills.join('');
+                    bar.addEventListener('click', (e) => {
+                        const pill = e.target.closest('.sensor-filter-pill');
+                        if (pill) selectSensorFilter(pill.dataset.sensor);
+                    });
                 }
                 connectStream();
                 loadMessagesList();
@@ -3163,13 +3172,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         loadSensorFilterBar();
-        fetch(basePath + 'api/stats').then(r => r.json()).then(stats => update({stats, latest: []}));
+        fetch(basePath + 'api/stats').then(r => r.json()).then(stats => update({stats, latest: []}))
+            .catch(() => toast('Failed to load stats', 'error'));
 
         // =====================================================================
         // Database tab
         // =====================================================================
         let dbCurrentTable = null;
         let dbCurrentPage = 1;
+        let dbTotalPages = 1;
         let dbSearchTimeout = null;
         let dbCurrentItems = [];
 
@@ -3363,10 +3374,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             }
 
             document.getElementById('db-count').textContent = `${(data.total || 0).toLocaleString()} items`;
-            const dbTotalPages = Math.max(1, Math.ceil((data.total || 0) / 50));
-            document.getElementById('db-page').textContent = `Page ${data.page || 1} / ${dbTotalPages}`;
-            document.getElementById('db-prev').disabled = (data.page || 1) <= 1;
-            document.getElementById('db-next').disabled = (data.page || 1) * 50 >= (data.total || 0);
+            dbCurrentPage = data.page || 1;
+            dbTotalPages = Math.max(1, Math.ceil((data.total || 0) / (data.per_page || 50)));
+            document.getElementById('db-page').textContent = `Page ${dbCurrentPage} / ${dbTotalPages}`;
+            document.getElementById('db-prev').disabled = dbCurrentPage <= 1;
+            document.getElementById('db-next').disabled = dbCurrentPage >= dbTotalPages;
         }
 
         function dbSearch() {
@@ -3378,7 +3390,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         function dbPrev() { if (dbCurrentPage > 1) { dbCurrentPage--; dbLoadData(); } }
-        function dbNext() { dbCurrentPage++; dbLoadData(); }
+        function dbNext() { if (dbCurrentPage < dbTotalPages) { dbCurrentPage++; dbLoadData(); } }
 
         function dbRowId(item) {
             if (dbCurrentTable === 'capcodes') return item.capcode;
@@ -3435,7 +3447,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             if (dbCurrentTable === 'ignore_capcodes' && f === 'capcode') {
                 return `<input type="text" class="input" data-field="${f}" list="capcode-suggestions" oninput="updateCapcodeSuggestions(this.value)"${valueAttr}>`;
             }
-            return `<input type="text" class="input" data-field="${f}"${valueAttr}>`;
+            // Editing a capcode row: the capcode is the key in the URL and can't change
+            const readonly = value !== undefined && dbCurrentTable === 'capcodes' && f === 'capcode' ? ' readonly' : '';
+            return `<input type="text" class="input" data-field="${f}"${valueAttr}${readonly}>`;
         }
 
         // ----- Add item (modal form) -----
@@ -3554,14 +3568,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({csv, replace})
-                }).then(r => r.json()).then(result => {
+                }).then(r => r.text().then(text => {
+                    let result = null;
+                    try { result = JSON.parse(text); } catch (e) { /* plain-text error page */ }
+                    if (!r.ok) {
+                        const msg = (result && result.error) || (r.status === 413 ? 'CSV file too large (max 50 MB)' : text);
+                        throw new Error(msg || `HTTP ${r.status}`);
+                    }
+                    return result || {};
+                })).then(result => {
                     if (result.error) toast(result.error, 'error');
                     else {
                         toast(`Imported ${result.imported} items, skipped ${result.skipped}`, 'success');
                         closeModal();
                         dbLoadData();
                     }
-                }).catch(() => toast('Import failed', 'error'));
+                }).catch(e => toast('Import failed: ' + e.message, 'error'));
             });
         }
 
@@ -3594,42 +3616,53 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         if (btn) { btn.disabled = true; btn.textContent = '⏳ Starting…'; }
                         const resetBtn = () => { if (btn) { btn.disabled = false; btn.textContent = origLabel; } };
 
-                        bagProgressInterval = setInterval(() => {
-                            fetch(`${basePath}api/db/bag/progress`)
-                                .then(r => r.json())
-                                .then(p => {
-                                    if (btn) btn.textContent = `⏳ ${p.percent}%`;
-                                    if (!p.running) {
-                                        clearInterval(bagProgressInterval);
-                                        bagProgressInterval = null;
-                                        if (p.percent >= 100) {
-                                            toast(`BAG import complete: ${p.cities} cities, ${p.streets} streets`, 'success');
-                                        } else {
-                                            toast('BAG import failed: ' + (p.status || 'unknown error'), 'error');
-                                        }
-                                        resetBtn();
-                                        dbLoadStats();
-                                        if (dbCurrentTable) dbLoadData();
-                                    }
-                                });
-                        }, 500);
+                        const stopPolling = () => {
+                            if (bagProgressInterval) { clearInterval(bagProgressInterval); bagProgressInterval = null; }
+                        };
 
+                        // Poll only once the server has reset progress for this run,
+                        // or the first poll can read the previous run's result
                         fetch(`${basePath}api/db/bag/import/${encodeURIComponent(province)}`, {method: 'POST'})
                             .then(r => r.json())
                             .then(result => {
                                 if (result.error) {
-                                    if (bagProgressInterval) { clearInterval(bagProgressInterval); bagProgressInterval = null; }
                                     toast(result.error, 'error');
                                     resetBtn();
+                                    return;
                                 }
+                                stopPolling();
+                                bagProgressInterval = setInterval(() => {
+                                    fetch(`${basePath}api/db/bag/progress`)
+                                        .then(r => r.json())
+                                        .then(p => {
+                                            if (btn) btn.textContent = `⏳ ${p.percent}%`;
+                                            if (!p.running) {
+                                                stopPolling();
+                                                if (p.percent >= 100) {
+                                                    toast(`BAG import complete: ${p.cities} cities, ${p.streets} streets`, 'success');
+                                                } else {
+                                                    toast('BAG import failed: ' + (p.status || 'unknown error'), 'error');
+                                                }
+                                                resetBtn();
+                                                dbLoadStats();
+                                                if (dbCurrentTable) dbLoadData();
+                                            }
+                                        })
+                                        .catch(() => {
+                                            stopPolling();
+                                            toast('Lost track of BAG import progress', 'error');
+                                            resetBtn();
+                                        });
+                                }, 500);
                             })
                             .catch(() => {
-                                if (bagProgressInterval) { clearInterval(bagProgressInterval); bagProgressInterval = null; }
+                                stopPolling();
                                 toast('BAG import failed', 'error');
                                 resetBtn();
                             });
                     });
-                });
+                })
+                .catch(() => toast('Failed to load provinces', 'error'));
         }
 
         function importAllPlaces(btn) {
@@ -3657,10 +3690,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                                     if (btn) btn.textContent = `⏳ ${p.percent}%`;
                                     if (!p.running) {
                                         clearInterval(pollInterval);
-                                        toast(`Import complete: ${p.cities} places`, 'success');
+                                        if (p.percent >= 100) {
+                                            toast(`Import complete: ${p.cities} places`, 'success');
+                                        } else {
+                                            toast('Import failed: ' + (p.status || 'unknown error'), 'error');
+                                        }
                                         resetBtn();
                                         dbLoadStats();
                                     }
+                                })
+                                .catch(() => {
+                                    clearInterval(pollInterval);
+                                    toast('Lost track of import progress', 'error');
+                                    resetBtn();
                                 });
                         }, 500);
                     })
@@ -3685,37 +3727,46 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 if (btn) { btn.disabled = true; btn.textContent = '⏳ Starting…'; }
                 const resetBtn = () => { if (btn) { btn.disabled = false; btn.textContent = origLabel; } };
 
-                capcodeProgressInterval = setInterval(() => {
-                    fetch(`${basePath}api/db/capcodes/import-progress`)
-                        .then(r => r.json())
-                        .then(p => {
-                            if (btn) btn.textContent = `⏳ ${p.percent}%`;
-                            if (!p.running) {
-                                clearInterval(capcodeProgressInterval);
-                                capcodeProgressInterval = null;
-                                if (p.percent >= 100) {
-                                    toast(`Capcode import complete: ${(p.imported || 0).toLocaleString()} capcodes`, 'success');
-                                } else {
-                                    toast('Capcode import failed: ' + (p.status || 'unknown error'), 'error');
-                                }
-                                resetBtn();
-                                dbLoadStats();
-                                if (dbCurrentTable) dbLoadData();
-                            }
-                        });
-                }, 300);
+                const stopPolling = () => {
+                    if (capcodeProgressInterval) { clearInterval(capcodeProgressInterval); capcodeProgressInterval = null; }
+                };
 
+                // Poll only once the server has reset progress for this run
                 fetch(`${basePath}api/db/capcodes/import-bommel`, {method: 'POST'})
                     .then(r => r.json())
                     .then(result => {
                         if (result.error) {
-                            if (capcodeProgressInterval) { clearInterval(capcodeProgressInterval); capcodeProgressInterval = null; }
                             toast(result.error, 'error');
                             resetBtn();
+                            return;
                         }
+                        stopPolling();
+                        capcodeProgressInterval = setInterval(() => {
+                            fetch(`${basePath}api/db/capcodes/import-progress`)
+                                .then(r => r.json())
+                                .then(p => {
+                                    if (btn) btn.textContent = `⏳ ${p.percent}%`;
+                                    if (!p.running) {
+                                        stopPolling();
+                                        if (p.percent >= 100) {
+                                            toast(`Capcode import complete: ${(p.imported || 0).toLocaleString()} capcodes`, 'success');
+                                        } else {
+                                            toast('Capcode import failed: ' + (p.status || 'unknown error'), 'error');
+                                        }
+                                        resetBtn();
+                                        dbLoadStats();
+                                        if (dbCurrentTable) dbLoadData();
+                                    }
+                                })
+                                .catch(() => {
+                                    stopPolling();
+                                    toast('Lost track of capcode import progress', 'error');
+                                    resetBtn();
+                                });
+                        }, 300);
                     })
                     .catch(() => {
-                        if (capcodeProgressInterval) { clearInterval(capcodeProgressInterval); capcodeProgressInterval = null; }
+                        stopPolling();
                         toast('Capcode import failed', 'error');
                         resetBtn();
                     });
