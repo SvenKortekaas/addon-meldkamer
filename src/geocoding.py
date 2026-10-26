@@ -1,6 +1,7 @@
 """OpenCage geocoding client with rate limiting and caching."""
 
 import logging
+import time
 from datetime import UTC, datetime
 
 import requests
@@ -14,6 +15,8 @@ class Geocoder:
     """OpenCage geocoding with database cache."""
 
     API_URL = "https://api.opencagedata.com/geocode/v1/json"
+    BACKOFF_SECONDS = 5  # Pause after HTTP 429 (per-second rate limit)
+    MAX_BACKOFF_SECONDS = 60
 
     def __init__(self, token: str, database: Database):
         self.token = token
@@ -24,6 +27,7 @@ class Geocoder:
         self.rate_reset: int | None = None  # Reset epoch reported by OpenCage
         self.geocoded = False  # Whether the last geocode() call produced coordinates
         self._rate_limited_on = None  # UTC date when the rate limit was hit
+        self._backoff_until = 0.0  # monotonic time until which requests are paused (HTTP 429)
 
     def geocode(self, address: str) -> dict | None:
         """
@@ -53,8 +57,8 @@ class Geocoder:
         # Clear the rate limit flag if the daily quota has reset (midnight UTC)
         self._check_rate_limit_reset()
 
-        # Skip if rate limited
-        if self.rate_limited:
+        # Skip if rate limited (daily quota) or backing off after HTTP 429
+        if self.rate_limited or time.monotonic() < self._backoff_until:
             return None
 
         # Call OpenCage API
@@ -69,7 +73,18 @@ class Geocoder:
                 timeout=5,
             )
 
-            if response.status_code == 402 or response.status_code == 429:
+            if response.status_code == 429:
+                # Too many requests per second - back off briefly, the daily quota is not exhausted
+                try:
+                    delay = float(response.headers.get("Retry-After", self.BACKOFF_SECONDS))
+                except ValueError:
+                    delay = self.BACKOFF_SECONDS
+                delay = min(max(delay, 1), self.MAX_BACKOFF_SECONDS)
+                logger.warning(f"OpenCage request rate limit hit (HTTP 429) - pausing geocoding for {delay:.0f}s")
+                self._backoff_until = time.monotonic() + delay
+                return None
+
+            if response.status_code == 402:
                 logger.warning("OpenCage rate limit exceeded (daily quota) - geocoding paused until quota resets")
                 self.rate_limited = True
                 self._rate_limited_on = datetime.now(UTC).date()
@@ -83,9 +98,10 @@ class Geocoder:
                     pass
                 return None
 
-            if response.status_code == 401:
+            if response.status_code in (401, 403):
+                reason = "unauthorized" if response.status_code == 401 else "disabled or suspended"
                 logger.error(
-                    "OpenCage API key unauthorized (HTTP 401) - check opencage_token; "
+                    f"OpenCage API key {reason} (HTTP {response.status_code}) - check opencage_token; "
                     "geocoding permanently disabled until addon restart"
                 )
                 self.enabled = False
