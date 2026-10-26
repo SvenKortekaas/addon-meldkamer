@@ -101,8 +101,13 @@ class Config:
     def from_options_file(cls, path: str = "/data/options.json") -> "Config":
         options_path = Path(path)
         if options_path.exists():
-            with open(options_path) as f:
-                data = json.load(f)
+            try:
+                with open(options_path) as f:
+                    data = json.load(f)
+            except (OSError, ValueError) as e:
+                raise ValueError(f"Cannot read add-on options from {path}: {e}") from e
+            if not isinstance(data, dict):
+                raise ValueError(f"Invalid add-on options in {path}: expected a JSON object")
 
             receiver = data.get("receiver", {})
             geocoding = data.get("geocoding", {})

@@ -2,6 +2,8 @@ ARG BUILD_FROM
 FROM $BUILD_FROM
 
 ENV LANG=C.UTF-8
+# Time for the app to stop the SDR pipeline cleanly on shutdown (see __main__.py)
+ENV S6_SERVICES_GRACETIME=8000
 
 # Install build dependencies
 RUN apk update && \
@@ -54,6 +56,16 @@ RUN cd /tmp && \
     make && \
     make install && \
     cd / && rm -rf /tmp/rtl-sdr /tmp/SoapyRTLSDR
+
+# Build SoapyRTLTCP driver (network receiver: rtl_tcp server via rx_fm)
+RUN cd /tmp && \
+    git clone https://github.com/pothosware/SoapyRTLTCP.git && \
+    cd SoapyRTLTCP && \
+    mkdir build && cd build && \
+    cmake .. && \
+    make && \
+    make install && \
+    cd / && rm -rf /tmp/SoapyRTLTCP
 
 # Install multimon-ng for FLEX pager decoding
 RUN cd /tmp && \

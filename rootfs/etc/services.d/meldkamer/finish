@@ -1,6 +1,21 @@
-#!/bin/sh
+#!/usr/bin/with-contenv bashio
 # ==============================================================================
 # Meldkamer - S6 Service Finish Script
+# Arguments: ${1} = exit code (256 when killed by a signal), ${2} = signal
 # ==============================================================================
+
+# The SDR pipeline runs in its own session, so it survives a killed Python
+# process and would keep the SDR device busy for the next start
+pkill -9 -x rtl_fm 2>/dev/null || true
+pkill -9 -x rx_fm 2>/dev/null || true
+pkill -9 -x multimon-ng 2>/dev/null || true
+
+# Fatal error (e.g. invalid configuration): take down the add-on instead of
+# restarting it in an endless loop
+if [[ "${1:-0}" -ne 0 ]] && [[ "${1:-0}" -ne 256 ]]; then
+    echo "[ERROR] Meldkamer failed with exit code ${1}, stopping add-on"
+    echo "${1:-0}" > /run/s6-linux-init-container-results/exitcode
+    exec /run/s6/basedir/bin/halt
+fi
 
 echo "[INFO] Meldkamer stopped"

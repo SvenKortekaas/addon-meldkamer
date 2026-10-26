@@ -9,6 +9,10 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 
+class HAClientError(Exception):
+    """Home Assistant API request failed (unreachable, auth or server error)."""
+
+
 class HAClient:
     """Publishes sensor state to Home Assistant via Supervisor REST API."""
 
@@ -41,6 +45,8 @@ class HAClient:
             entity_id: Sensor entity ID (without 'sensor.' prefix).
 
         Returns the state dict, or None if the entity does not exist yet (404).
+        Raises HAClientError on any other failure, so callers can tell "not
+        found" apart from "Home Assistant unreachable".
         """
         try:
             session = await self._get_session()
@@ -52,11 +58,11 @@ class HAClient:
                 if resp.status == 200:
                     return await resp.json()
                 text = await resp.text()
-                logger.error(f"HA API error {resp.status} for sensor.{entity_id}: {text}")
-                return None
+                error = f"HA API error {resp.status}: {text}"
         except Exception as e:
-            logger.error(f"Failed to get state for sensor.{entity_id}: {e}")
-            return None
+            error = f"{type(e).__name__}: {e}"
+        logger.warning(f"Failed to get state for sensor.{entity_id}: {error}")
+        raise HAClientError(error)
 
     async def update_sensor(
         self,
