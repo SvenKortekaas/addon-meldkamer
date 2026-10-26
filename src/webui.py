@@ -4,12 +4,14 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import time
 from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
+import aiohttp
 from aiohttp import web
 
 from .database import Database
@@ -21,6 +23,20 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGES = 500
 
 ADDON_VERSION = "0.0.99"
+
+# Home Assistant core (2026.9+) proxies OpenStreetMap raster tiles itself via
+# its built-in map_tiles integration, identifying the requests the way OSM's
+# tile usage policy requires. Browsers loading tiles straight from OSM inside
+# the ingress iframe get 403 "Access blocked", so the dashboard asks us for
+# tiles and we fetch them from core through the Supervisor API proxy.
+HA_MAP_TILES_URL = "http://supervisor/core/api/map_tiles/raster/{z}/{x}/{y}.png"
+# Fallback for cores older than 2026.9, which have no map_tiles proxy: fetch
+# from OSM directly with an identifying User-Agent, as the policy asks.
+OSM_TILES_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+OSM_USER_AGENT = f"Meldkamer/{ADDON_VERSION} (+https://github.com/cyberjunky/addon-meldkamer)"
+MAP_MAX_ZOOM = 19
+# OSM asks consumers to cache tiles for at least a week
+MAP_TILE_MAX_AGE = 7 * 24 * 60 * 60
 
 
 def _int_param(request: web.Request, name: str, default: int, minimum: int = 1, maximum: int = 1000) -> int:
@@ -74,6 +90,10 @@ class WebUI:
         self._last_stats_save = 0.0
         self._setup_routes()
         self._runner: web.AppRunner | None = None
+        self._tile_session: aiohttp.ClientSession | None = None
+        self._supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
+        # Cleared once core answers 404, i.e. it predates the map_tiles proxy
+        self._ha_map_tiles = bool(self._supervisor_token)
         # Optional callback (wired to decoder.reload_tts_replacements) so TTS
         # edits apply immediately instead of after a restart
         self.on_tts_changed: Callable[[], None] | None = None
@@ -163,6 +183,7 @@ class WebUI:
         self.app.router.add_get("/api/stats", self._handle_stats)
         self.app.router.add_get("/api/stream", self._handle_stream)
         self.app.router.add_get("/api/history/{location}", self._handle_history)
+        self.app.router.add_get("/api/map-tiles/{z:[0-9]+}/{x:[0-9]+}/{y:[0-9]+}.png", self._handle_map_tile)
 
         # Database management API
         self.app.router.add_get("/api/db/capcodes", self._handle_list_capcodes)
@@ -252,6 +273,8 @@ class WebUI:
     async def stop(self) -> None:
         """Stop the web server."""
         self._save_stats()
+        if self._tile_session and not self._tile_session.closed:
+            await self._tile_session.close()
         if self._runner:
             with contextlib.suppress(Exception):
                 await self._runner.cleanup()
@@ -1158,6 +1181,46 @@ class WebUI:
             self._ignore_changed()
         return web.json_response({"success": True, "deleted": count})
 
+    async def _fetch_tile(self, url: str, headers: dict) -> tuple[int, bytes]:
+        """Fetch one map tile, returning (status, body)."""
+        if self._tile_session is None or self._tile_session.closed:
+            self._tile_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+        async with self._tile_session.get(url, headers=headers) as resp:
+            return resp.status, await resp.read() if resp.status == 200 else b""
+
+    async def _handle_map_tile(self, request: web.Request) -> web.Response:
+        """Serve an OpenStreetMap raster tile via Home Assistant's map tile proxy."""
+        z, x, y = (int(request.match_info[k]) for k in ("z", "x", "y"))
+        if z > MAP_MAX_ZOOM or x >= 2**z or y >= 2**z:
+            return web.Response(status=404)
+
+        try:
+            status = 0
+            if self._ha_map_tiles:
+                status, body = await self._fetch_tile(
+                    HA_MAP_TILES_URL.format(z=z, x=x, y=y),
+                    {"Authorization": f"Bearer {self._supervisor_token}"},
+                )
+                if status == 404:
+                    logger.info("Home Assistant has no map_tiles proxy (core < 2026.9), using OpenStreetMap directly")
+                    self._ha_map_tiles = False
+            if not self._ha_map_tiles:
+                status, body = await self._fetch_tile(
+                    OSM_TILES_URL.format(z=z, x=x, y=y), {"User-Agent": OSM_USER_AGENT}
+                )
+        except (aiohttp.ClientError, TimeoutError) as e:
+            logger.debug(f"Map tile {z}/{x}/{y} failed: {e}")
+            return web.Response(status=502)
+
+        if status != 200:
+            logger.debug(f"Map tile {z}/{x}/{y} returned {status}")
+            return web.Response(status=502)
+        return web.Response(
+            body=body,
+            content_type="image/png",
+            headers={"Cache-Control": f"private, max-age={MAP_TILE_MAX_AGE}"},
+        )
+
     async def _handle_get_vehicle_photo(self, request: web.Request) -> web.Response:
         """Serve a stored vehicle photo's raw image bytes."""
         if not self.database:
@@ -2037,8 +2100,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         const map = L.map('map').setView([52.2, 5.3], 8);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-            attribution: '© OpenStreetMap'
+        // Tiles come through the add-on (and Home Assistant's built-in map tile
+        // proxy); OSM blocks browsers requesting them directly from here.
+        L.tileLayer(basePath + 'api/map-tiles/{z}/{x}/{y}.png', {
+            attribution: '© <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> contributors',
+            maxZoom: 19
         }).addTo(map);
         setTimeout(() => map.invalidateSize(), 100);
 

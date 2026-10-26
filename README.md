@@ -332,6 +332,7 @@ automation:
 
 - Home Assistant with Supervisor
 - RTL-SDR, HackRF One, or network access to rtl_tcp server
+- Home Assistant 2026.9 or newer is recommended: the dashboard map loads its OpenStreetMap tiles through Home Assistant's built-in map tile proxy (older versions fall back to fetching tiles from OpenStreetMap via the add-on)
 
 ## Credits
 

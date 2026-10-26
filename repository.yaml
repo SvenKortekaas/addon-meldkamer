@@ -1,0 +1,4 @@
+# https://developers.home-assistant.io/docs/add-ons/repository#repository-configuration
+name: Meldkamer add-on repository
+url: 'https://github.com/cyberjunky/addon-meldkamer'
+maintainer: cyberjunky
