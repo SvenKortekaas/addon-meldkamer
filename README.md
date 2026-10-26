@@ -1,3 +1,6 @@
+[![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg?style=for-the-badge&logo=paypal)](https://www.paypal.me/cyberjunkynl/)
+[![Sponsor on GitHub](https://img.shields.io/badge/Sponsor-GitHub-red.svg?style=for-the-badge&logo=github)](https://github.com/sponsors/cyberjunky)
+
 # Meldkamer
 
 P2000 FLEX pager decoder dashboard for Home Assistant — decode Dutch emergency services messages using RTL-SDR, HackRF, or network streaming.
@@ -344,3 +347,14 @@ automation:
 - [Bommel](https://p2000.bommel.net/) — P2000 Capcode Database
 - [BAG](https://bag.basisregistraties.nl/) — Basisregistratie Adressen en Gebouwen
 - [PDOK Locatieserver](https://www.pdok.nl/) — Dutch address/place lookup for BAG imports
+
+## Support This Project
+
+If you find this add-on useful, please consider supporting its development:
+
+[![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg?style=for-the-badge&logo=paypal)](https://www.paypal.me/cyberjunkynl/)
+[![Sponsor on GitHub](https://img.shields.io/badge/Sponsor-GitHub-red.svg?style=for-the-badge&logo=github)](https://github.com/sponsors/cyberjunky)
+
+- Star this repository
+- [Report issues](https://github.com/cyberjunky/addon-meldkamer/issues)
+- Share with other Home Assistant users
