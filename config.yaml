@@ -15,6 +15,7 @@ boot: auto
 map:
   - config:rw
   - share:rw
+  - ssl:ro
 udev: true
 usb: true
 host_network: false
@@ -80,12 +81,12 @@ options:
 schema:
   receiver:
     type: list(rtl-sdr|hackrf|soapysdr|network)?
-    network_host: str?
+    network_host: 'match(^[A-Za-z0-9.:\[\]-]*$)?'
     network_port: int?
-    sdr_gain: int?
+    sdr_gain: int(0,50)?
     ppm_correction: int?
-    hackrf_lna_gain: int?
-    hackrf_vga_gain: int?
+    hackrf_lna_gain: int(0,40)?
+    hackrf_vga_gain: int(0,62)?
     hackrf_amp_enable: bool?
   geocoding:
     enabled: bool

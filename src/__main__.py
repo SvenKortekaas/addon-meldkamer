@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import signal
+import sys
 
 from .config import Config
 from .database import Database
@@ -19,14 +20,18 @@ logger = logging.getLogger(__name__)
 _shutting_down = False
 
 
-async def main() -> None:
-    """Main application entry point."""
+async def main() -> int:
+    """Main application entry point. Returns the process exit code."""
     global _shutting_down
 
     logger.info("Meldkamer starting...")
 
     # Load configuration from options.json (Home Assistant addon)
-    config = Config.from_options_file()
+    try:
+        config = Config.from_options_file()
+    except ValueError as e:
+        logger.error(f"{e} - fix the add-on configuration and restart")
+        return 1
 
     if config.log_level == "debug":
         logging.getLogger().setLevel(logging.DEBUG)
@@ -54,8 +59,16 @@ async def main() -> None:
     webui.set_network_name(config.network_name)
     webui.set_config(config.frequency, config.sample_rate, config.decoder)
 
-    # Build command once (this also sets device_type and device_driver)
-    _ = decoder.command
+    # Build command once (this also sets device_type and device_driver). An
+    # invalid receiver config must not crash-loop the add-on: keep the web UI
+    # up and show the error there instead of starting the decoder.
+    decoder_ok = True
+    try:
+        _ = decoder.command
+    except RuntimeError as e:
+        decoder_ok = False
+        decoder.last_error = f"{e} - fix the add-on configuration and restart"
+        logger.error(decoder.last_error)
     webui.set_device_info(decoder.device_type, decoder.device_driver)
     # Map zone circles are a pure visualization aid, so they're shown regardless
     # of whether sensor publishing (REST/MQTT) is actually enabled - reuse the
@@ -86,26 +99,30 @@ async def main() -> None:
     async def update_decoder_status():
         ticks = 0
         while True:
-            webui.update_status(decoder_running=decoder.is_running)
-            webui.set_decoder_error(decoder.last_error)
-            webui.set_geocoder_info(
-                configured=config.opencage_enabled,
-                enabled=decoder.geocoder.enabled,
-                rate_remaining=decoder.geocoder.rate_remaining,
-                rate_limited=decoder.geocoder.rate_limited,
-            )
-            ticks += 1
-            if ticks % 15 == 0:
-                # Refresh DB counts so the Advanced tab reflects imports
-                # without needing a restart
-                db_stats = database.get_stats()
-                webui.update_db_stats(
-                    db_stats["places"],
-                    db_stats["streets"],
-                    db_stats["capcodes"],
-                    db_stats["texts"],
-                    db_stats["geocodes"],
+            # Never let one failure (e.g. a locked database) kill the loop
+            try:
+                webui.update_status(decoder_running=decoder.is_running)
+                webui.set_decoder_error(decoder.last_error)
+                webui.set_geocoder_info(
+                    configured=config.opencage_enabled,
+                    enabled=decoder.geocoder.enabled,
+                    rate_remaining=decoder.geocoder.rate_remaining,
+                    rate_limited=decoder.geocoder.rate_limited,
                 )
+                ticks += 1
+                if ticks % 15 == 0:
+                    # Refresh DB counts so the Advanced tab reflects imports
+                    # without needing a restart
+                    db_stats = database.get_stats()
+                    webui.update_db_stats(
+                        db_stats["places"],
+                        db_stats["streets"],
+                        db_stats["capcodes"],
+                        db_stats["texts"],
+                        db_stats["geocodes"],
+                    )
+            except Exception:
+                logger.exception("Status update failed")
             await asyncio.sleep(2)
 
     # Keep a reference so the task isn't garbage-collected mid-run; it lives
@@ -124,21 +141,30 @@ async def main() -> None:
         _shutting_down = True
 
         logger.info("Shutting down...")
-        try:
-            await decoder.stop()
-        except Exception as e:
-            logger.debug(f"Decoder stop error: {e}")
-        try:
-            await server.stop()
-        except Exception as e:
-            logger.debug(f"Server stop error: {e}")
-        try:
-            await webui.stop()
-        except Exception as e:
-            logger.debug(f"WebUI stop error: {e}")
 
-        # Give subprocesses time to fully terminate
-        await asyncio.sleep(0.5)
+        async def stop_services():
+            try:
+                await decoder.stop()
+            except Exception as e:
+                logger.debug(f"Decoder stop error: {e}")
+            try:
+                await server.stop()
+            except Exception as e:
+                logger.debug(f"Server stop error: {e}")
+            try:
+                await webui.stop()
+            except Exception as e:
+                logger.debug(f"WebUI stop error: {e}")
+
+            # Give subprocesses time to fully terminate
+            await asyncio.sleep(0.5)
+
+        # Stay within S6_SERVICES_GRACETIME (see Dockerfile), or s6 kills us
+        # mid-shutdown and the SDR pipeline may be left running
+        try:
+            await asyncio.wait_for(stop_services(), timeout=7.0)
+        except TimeoutError:
+            logger.warning("Shutdown took too long, stopping anyway")
 
         # Cancel all running tasks
         tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
@@ -151,24 +177,40 @@ async def main() -> None:
 
     # Setup graceful shutdown
     loop = asyncio.get_event_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(do_shutdown()))
 
-    # Start services
+    def on_signal():
+        task = asyncio.create_task(do_shutdown())
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, on_signal)
+
+    # Start services. A service failing (e.g. port already in use) is fatal:
+    # exit non-zero so the finish script stops the add-on instead of
+    # restarting it in a loop.
+    exit_code = 0
+    services = [server.start(), webui.start()]
+    if decoder_ok:
+        services.append(decoder.start())
     try:
-        await asyncio.gather(decoder.start(), server.start(), webui.start())
+        await asyncio.gather(*services)
     except asyncio.CancelledError:
         pass
-    except Exception as e:
-        logger.error(f"Service error: {e}")
+    except Exception:
+        logger.exception("Service error")
+        exit_code = 1
     finally:
         # Ensure cleanup happens
         if not _shutting_down:
             await do_shutdown()
 
     logger.info("Meldkamer stopped")
+    return exit_code
 
 
 if __name__ == "__main__":
+    exit_code = 0
     with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(main())
+        exit_code = asyncio.run(main())
+    sys.exit(exit_code)
