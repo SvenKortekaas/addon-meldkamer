@@ -6,7 +6,8 @@ Woonplaatsen-province mapping is stored locally for reliability.
 
 import json
 import logging
-import sqlite3
+import threading
+import time
 import urllib.parse
 import urllib.request
 from typing import Any
@@ -38,6 +39,10 @@ PROVINCES = [
     "Zuid-Holland",
 ]
 
+LOCATIE_BASE = "https://api.pdok.nl/bzk/locatieserver/search/v3_1/free"
+PDOK_ROWS = 100  # Max rows per Locatieserver request
+PDOK_MAX_START = 10000  # Locatieserver rejects start > 10000
+
 # Global progress tracking
 _import_progress: dict[str, Any] = {
     "running": False,
@@ -47,7 +52,9 @@ _import_progress: dict[str, Any] = {
     "phase": "",
     "percent": 0,
     "status": "idle",
+    "warnings": [],
 }
+_start_lock = threading.Lock()
 
 
 def get_provinces() -> list[str]:
@@ -70,8 +77,78 @@ def reset_progress(province: str = "") -> None:
         "streets": 0,
         "phase": "Starting",
         "percent": 0,
-        "status": f"Starting import for {province}...",
+        "status": f"Starting import for {province or 'all places'}...",
+        "warnings": [],
     }
+
+
+def try_start_import(province: str = "") -> bool:
+    """Atomically check that no import is running and mark one as started.
+
+    Call this before starting the import thread. Returns False if an import
+    is already running. Raises ValueError for an unknown province (an empty
+    province means the all-places import).
+    """
+    if province and province not in PROVINCES:
+        raise ValueError(f"Unknown province: {province!r}")
+    with _start_lock:
+        if _import_progress.get("running"):
+            return False
+        reset_progress(province)
+        return True
+
+
+def _warn(message: str) -> None:
+    """Log a partial/truncated import and record it in the progress state."""
+    logger.warning(message)
+    _import_progress.setdefault("warnings", []).append(message)
+
+
+def _solr_quote(value: str) -> str:
+    """Quote a value for a Solr fq clause."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _pdok_search(params: dict[str, str], label: str, on_page=None) -> tuple[list[dict], bool]:
+    """Fetch all pages of a PDOK Locatieserver query.
+
+    Each page is retried a few times. Returns (docs, complete) where
+    complete is False if a page kept failing or the result set exceeds what
+    the Locatieserver lets us page through.
+    """
+    docs_out: list[dict] = []
+    start = 0
+    while True:
+        query = {**params, "rows": str(PDOK_ROWS), "start": str(start)}
+        url = f"{LOCATIE_BASE}?{urllib.parse.urlencode(query)}"
+        data = None
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "P2000-Studio/2.1"})
+                with urllib.request.urlopen(req, timeout=60) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                break
+            except Exception as e:
+                if attempt < 2:
+                    logger.debug(f"PDOK request for {label} failed (attempt {attempt + 1}), retrying: {e}")
+                    time.sleep(2 * (attempt + 1))
+                else:
+                    logger.warning(f"PDOK request for {label} failed at offset {start}: {e}")
+        if data is None:
+            return docs_out, False
+
+        docs = data.get("response", {}).get("docs", [])
+        total = data.get("response", {}).get("numFound", 0)
+        docs_out.extend(docs)
+        start += len(docs)
+        if on_page:
+            on_page(start, total)
+
+        if not docs or start >= total:
+            return docs_out, True
+        if start > PDOK_MAX_START:
+            logger.warning(f"PDOK results for {label} truncated at {start} of {total}")
+            return docs_out, False
 
 
 def fetch_all_woonplaatsen() -> list[dict[str, str]]:
@@ -83,53 +160,25 @@ def fetch_all_woonplaatsen() -> list[dict[str, str]]:
     _import_progress["status"] = "Loading all Dutch places from PDOK..."
     _import_progress["phase"] = "Fetching woonplaatsen"
 
+    def on_page(fetched: int, total: int) -> None:
+        _import_progress["cities"] = fetched
+        _import_progress["status"] = f"Loaded {fetched} places..."
+        _import_progress["percent"] = min(95, int(fetched / max(total, 1) * 100))
+
+    docs, complete = _pdok_search(
+        {"q": "type:woonplaats", "fl": "woonplaatsnaam,gemeentenaam,provincienaam"}, "all woonplaatsen", on_page
+    )
+    if not complete:
+        _warn(f"Woonplaatsen list is incomplete ({len(docs)} loaded)")
+
     woonplaatsen = []
-    start = 0
-    rows = 100  # Max per request
-    max_requests = 100  # Safety limit (max ~10000 places)
+    for doc in docs:
+        name = doc.get("woonplaatsnaam", "").strip()
+        gemeente = doc.get("gemeentenaam", "").strip()
+        province = doc.get("provincienaam", "").strip()
 
-    LOCATIE_BASE = "https://api.pdok.nl/bzk/locatieserver/search/v3_1/free"
-
-    for i in range(max_requests):
-        params = {
-            "q": "type:woonplaats",
-            "rows": str(rows),
-            "start": str(start),
-            "fl": "woonplaatsnaam,gemeentenaam,provincienaam",
-        }
-
-        url = f"{LOCATIE_BASE}?{urllib.parse.urlencode(params)}"
-
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "P2000-Studio/2.1"})
-            with urllib.request.urlopen(req, timeout=60) as response:
-                data = json.loads(response.read().decode("utf-8"))
-
-            docs = data.get("response", {}).get("docs", [])
-            total = data.get("response", {}).get("numFound", 0)
-
-            if not docs:
-                break
-
-            for doc in docs:
-                name = doc.get("woonplaatsnaam", "").strip()
-                gemeente = doc.get("gemeentenaam", "").strip()
-                province = doc.get("provincienaam", "").strip()
-
-                if name and len(name) >= 2:
-                    woonplaatsen.append({"name": name, "gemeente": gemeente, "province": province})
-
-            start += len(docs)
-            _import_progress["cities"] = len(woonplaatsen)
-            _import_progress["status"] = f"Loaded {len(woonplaatsen)} places..."
-            _import_progress["percent"] = min(95, int(start / max(total, 1) * 100))
-
-            if start >= total:
-                break
-
-        except Exception as e:
-            logger.warning(f"Failed to fetch woonplaatsen batch {i}: {e}")
-            break
+        if name and len(name) >= 2:
+            woonplaatsen.append({"name": name, "gemeente": gemeente, "province": province})
 
     logger.info(f"Fetched {len(woonplaatsen)} woonplaatsen from PDOK")
     return woonplaatsen
@@ -157,31 +206,19 @@ def import_all_places(database) -> int:
         _import_progress["status"] = f"Importing {len(woonplaatsen)} places into database..."
         _import_progress["phase"] = "Importing"
 
-        imported = 0
-        for i, wp in enumerate(woonplaatsen):
-            name = wp["name"]
-            abbreviation = get_abbreviation(name)
+        # Upsert keeps existing ids (streets link to them) and coordinates
+        imported = database.upsert_places(
+            [
+                {"city": wp["name"], "abbreviation": get_abbreviation(wp["name"]), "province": wp["province"]}
+                for wp in woonplaatsen
+            ]
+        )
 
-            # Insert or update place
-            try:
-                database.cursor.execute(
-                    """
-                    INSERT OR REPLACE INTO places (city, abbreviation) VALUES (?, ?)
-                """,
-                    (name, abbreviation),
-                )
-                imported += 1
-            except Exception as e:
-                logger.debug(f"Failed to insert place {name}: {e}")
-
-            if i % 100 == 0:
-                _import_progress["percent"] = int(i / len(woonplaatsen) * 100)
-                _import_progress["cities"] = imported
-                database.conn.commit()
-
-        database.conn.commit()
-
-        _import_progress["status"] = f"Imported {imported} places successfully!"
+        warnings = _import_progress.get("warnings", [])
+        if warnings:
+            _import_progress["status"] = f"Imported {imported} places - INCOMPLETE: {'; '.join(warnings)}"
+        else:
+            _import_progress["status"] = f"Imported {imported} places successfully!"
         _import_progress["percent"] = 100
         _import_progress["cities"] = imported
         _import_progress["running"] = False
@@ -199,57 +236,35 @@ def import_all_places(database) -> int:
 def _fetch_streets_for_woonplaats(woonplaats: str) -> list[dict[str, str]]:
     """
     Fetch unique streets for a woonplaats from PDOK Locatieserver.
-    Uses the 'type:weg' (street) search which returns all streets.
+    Uses the 'type:weg' (street) search which returns one record per street.
+    Postcode areas (first 4 digits) are added best-effort from 'type:postcode',
+    which returns one record per postcode and is capped by the Locatieserver
+    paging limit for large cities.
     Returns list of dicts with: street, postcode
     """
-    # PDOK Locatieserver API - much more reliable than WFS
-    LOCATIE_BASE = "https://api.pdok.nl/bzk/locatieserver/search/v3_1/free"
-
-    streets = {}  # dict to dedupe: street_name -> postcode
-    start = 0
-    rows = 100  # Max 100 per request
-    max_requests = 100  # Safety limit (10000 entries max per city)
-
-    # Search for all postcodes (type:postcode) in this woonplaats - includes street+postcode
     # fq with a quoted value handles multi-word names like "Hoek van Holland"
-    for _ in range(max_requests):
-        params = {
-            "q": "type:postcode",
-            "fq": f'woonplaatsnaam:"{woonplaats}"',
-            "rows": str(rows),
-            "start": str(start),
-            "fl": "straatnaam,postcode",
-        }
+    fq = f"woonplaatsnaam:{_solr_quote(woonplaats)}"
+    streets = {}  # dict to dedupe: street_name -> postcode
 
-        url = f"{LOCATIE_BASE}?{urllib.parse.urlencode(params)}"
+    docs, complete = _pdok_search({"q": "type:weg", "fq": fq, "fl": "straatnaam"}, f"streets of {woonplaats}")
+    if not complete:
+        _warn(f"Street list for {woonplaats} is incomplete ({len(docs)} loaded)")
+    for doc in docs:
+        street = doc.get("straatnaam", "").strip()
+        # Skip very short street names (e.g., "A", "B") - they match too many messages
+        if street and len(street) >= 3:
+            streets.setdefault(street, "")
 
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "P2000-Studio/2.1"})
-            with urllib.request.urlopen(req, timeout=60) as response:
-                data = json.loads(response.read().decode("utf-8"))
-
-            docs = data.get("response", {}).get("docs", [])
-            total = data.get("response", {}).get("numFound", 0)
-
-            if not docs:
-                break
-
-            for doc in docs:
-                street = doc.get("straatnaam", "").strip()
-                postcode = doc.get("postcode", "").strip()
-
-                # Skip very short street names (e.g., "A", "B") - they match too many messages
-                if street and len(street) >= 3 and street not in streets:
-                    streets[street] = postcode[:4] if postcode else ""
-
-            start += len(docs)
-
-            if start >= total:
-                break
-
-        except Exception as e:
-            logger.warning(f"Failed to fetch streets for {woonplaats}: {e}")
-            break
+    docs, complete = _pdok_search(
+        {"q": "type:postcode", "fq": fq, "fl": "straatnaam,postcode"}, f"postcodes of {woonplaats}"
+    )
+    if not complete:
+        logger.info(f"Postcodes for {woonplaats} incomplete - some streets will have no postcode")
+    for doc in docs:
+        street = doc.get("straatnaam", "").strip()
+        postcode = doc.get("postcode", "").strip()
+        if street and len(street) >= 3 and not streets.get(street):
+            streets[street] = postcode[:4] if postcode else ""
 
     # Convert to list format
     return [{"street": name, "postcode": pc} for name, pc in streets.items()]
@@ -263,51 +278,24 @@ def _fetch_woonplaatsen_for_province(province: str) -> list[str]:
     the places import already uses successfully.
     """
     global _import_progress
-    woonplaatsen = set()
-    start = 0
-    rows = 100
-    max_requests = 100  # Safety limit (~10000 places)
-
-    LOCATIE_BASE = "https://api.pdok.nl/bzk/locatieserver/search/v3_1/free"
-
     _import_progress["status"] = f"Loading woonplaatsen for {province}..."
 
-    for _ in range(max_requests):
-        params = {
-            "q": "type:woonplaats",
-            "fq": f'provincienaam:"{province}"',
-            "rows": str(rows),
-            "start": str(start),
-            "fl": "woonplaatsnaam",
-        }
+    def on_page(fetched: int, total: int) -> None:
+        _import_progress["status"] = f"Loading woonplaatsen for {province}: {fetched}/{total}..."
 
-        url = f"{LOCATIE_BASE}?{urllib.parse.urlencode(params)}"
+    docs, complete = _pdok_search(
+        {"q": "type:woonplaats", "fq": f"provincienaam:{_solr_quote(province)}", "fl": "woonplaatsnaam"},
+        f"woonplaatsen of {province}",
+        on_page,
+    )
+    if not complete:
+        _warn(f"Woonplaatsen list for {province} is incomplete ({len(docs)} loaded)")
 
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "P2000-Studio/2.1"})
-            with urllib.request.urlopen(req, timeout=60) as response:
-                data = json.loads(response.read().decode("utf-8"))
-
-            docs = data.get("response", {}).get("docs", [])
-            total = data.get("response", {}).get("numFound", 0)
-
-            if not docs:
-                break
-
-            for doc in docs:
-                name = doc.get("woonplaatsnaam", "").strip()
-                if name and len(name) >= 2:
-                    woonplaatsen.add(name)
-
-            start += len(docs)
-            _import_progress["status"] = f"Loading woonplaatsen for {province}: {len(woonplaatsen)}/{total}..."
-
-            if start >= total:
-                break
-
-        except Exception as e:
-            logger.warning(f"Failed to fetch woonplaatsen batch for {province}: {e}")
-            break
+    woonplaatsen = set()
+    for doc in docs:
+        name = doc.get("woonplaatsnaam", "").strip()
+        if name and len(name) >= 2:
+            woonplaatsen.add(name)
 
     result = sorted(woonplaatsen)
     logger.info(f"Found {len(result)} woonplaatsen in {province}")
@@ -326,6 +314,10 @@ def import_province_data(province: str, database) -> dict[str, Any]:
         Dict with import statistics
     """
     global _import_progress
+
+    if province not in PROVINCES:
+        _import_progress.update({"running": False, "status": f"Unknown province: {province}"})
+        raise ValueError(f"Unknown province: {province!r}")
 
     cities_added = 0
     streets_added = 0
@@ -354,54 +346,40 @@ def import_province_data(province: str, database) -> dict[str, Any]:
                 }
             )
 
-            # Add woonplaats to database
+            # Add woonplaats to database (fills in the province of existing places)
             try:
-                abbreviation = get_abbreviation(woonplaats)
-                success = database.add_place(city=woonplaats, abbreviation=abbreviation, province=province)
-                if success:
+                city_id, created = database.upsert_place(
+                    city=woonplaats, abbreviation=get_abbreviation(woonplaats), province=province
+                )
+                if created:
                     cities_added += 1
             except Exception as e:
-                logger.debug(f"Woonplaats {woonplaats} might already exist: {e}")
+                _warn(f"Failed to store woonplaats {woonplaats}: {e}")
+                continue
 
-            # Get city_id
-            city_id = None
-            try:
-                database.cursor.execute("SELECT id FROM places WHERE city = ? LIMIT 1", (woonplaats,))
-                row = database.cursor.fetchone()
-                if row:
-                    city_id = row[0]
-            except sqlite3.Error:
-                pass
-
-            # Fetch and add streets
+            # Fetch and add streets (one transaction per woonplaats)
             try:
                 streets = _fetch_streets_for_woonplaats(woonplaats)
-
-                for street_data in streets:
-                    try:
-                        success = database.add_street(
-                            street=street_data["street"], city_id=city_id, postalcode=street_data["postcode"]
-                        )
-                        if success:
-                            streets_added += 1
-                    except Exception:
-                        pass
-
+                streets_added += database.add_streets(city_id, streets)
             except Exception as e:
-                logger.warning(f"Failed to fetch streets for {woonplaats}: {e}")
+                _warn(f"Failed to import streets for {woonplaats}: {e}")
 
             # Log progress every 20 cities
             if (i + 1) % 20 == 0:
                 logger.info(f"Progress: {i + 1}/{len(woonplaatsen)} woonplaatsen, {streets_added} streets")
 
         # Complete
+        status = f"Complete! {cities_added} cities, {streets_added} streets"
+        warnings = _import_progress.get("warnings", [])
+        if warnings:
+            status += f" - INCOMPLETE, {len(warnings)} warning(s): {'; '.join(warnings[:5])}"
         _import_progress.update(
             {
                 "running": False,
                 "cities": cities_added,
                 "streets": streets_added,
                 "percent": 100,
-                "status": f"Complete! {cities_added} cities, {streets_added} streets",
+                "status": status,
             }
         )
 

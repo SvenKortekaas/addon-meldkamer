@@ -6,6 +6,7 @@ Fetches P2000 capcode data from the bommel.net CSV export.
 import csv
 import io
 import logging
+import threading
 import urllib.request
 from typing import Any
 
@@ -22,6 +23,7 @@ _import_progress: dict[str, Any] = {
     "percent": 0,
     "status": "idle",
 }
+_start_lock = threading.Lock()
 
 
 def get_import_progress() -> dict[str, Any]:
@@ -39,6 +41,19 @@ def reset_progress() -> None:
         "percent": 0,
         "status": "Downloading capcodes from bommel.net...",
     }
+
+
+def try_start_import() -> bool:
+    """Atomically check that no import is running and mark one as started.
+
+    Call this before starting the import thread. Returns False if an import
+    is already running.
+    """
+    with _start_lock:
+        if _import_progress.get("running"):
+            return False
+        reset_progress()
+        return True
 
 
 def import_all_capcodes(database) -> dict[str, Any]:

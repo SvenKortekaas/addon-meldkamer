@@ -230,6 +230,24 @@ class Database:
         with self._lock:
             self.conn.commit()
 
+    @contextlib.contextmanager
+    def _transaction(self):
+        """Run a block in one explicit transaction, rolled back on any exception.
+
+        Holds the lock for the whole block so no other thread's statements or
+        commits can interleave with (or commit) a half-finished bulk change.
+        """
+        with self._lock:
+            if self._conn.in_transaction:
+                self._conn.commit()
+            self._conn.execute("BEGIN")
+            try:
+                yield self._conn
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+
     # =========================================================================
     # TEXT MATCHING CACHES (places / streets / abbreviations)
     # =========================================================================
@@ -307,9 +325,13 @@ class Database:
         """Load places once and build first-word prefilter indexes."""
         abbrev_rows = self.cursor.execute("SELECT city, abbreviation FROM places WHERE abbreviation != ''").fetchall()
         city_rows = self.cursor.execute("SELECT city FROM places ORDER BY LENGTH(city) DESC").fetchall()
+        by_normalized = {}
+        for row in city_rows:
+            by_normalized.setdefault(self.normalize_city(row[0]), row[0])
         return {
             "abbrevs": self._build_match_index(abbrev_rows, lambda row: row[1]),
             "cities": self._build_match_index(city_rows, lambda row: row[0]),
+            "by_normalized": by_normalized,
         }
 
     def _build_streets_cache(self) -> dict[str, Any]:
@@ -359,12 +381,10 @@ class Database:
             # Then, add missing columns to existing tables (for upgrades)
             migrations = [
                 # Places table migrations
-                ("places", "id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
                 ("places", "province", "TEXT"),
                 ("places", "latitude", "REAL"),
                 ("places", "longitude", "REAL"),
                 # Streets table migrations
-                ("streets", "id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
                 ("streets", "postalcode", "TEXT"),
             ]
 
@@ -377,11 +397,68 @@ class Database:
                         self.cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
                         logger.info(f"Added column {column} to {table}")
                     except sqlite3.OperationalError as e:
-                        logger.debug(f"Could not add column {column} to {table}: {e}")
+                        logger.warning(f"Could not add column {column} to {table}: {e}")
 
             self._commit()
+
+            # SQLite cannot ADD COLUMN a PRIMARY KEY - rebuild legacy tables
+            # that predate the id column (rowid is kept as id so existing
+            # streets.city_id links survive)
+            self._rebuild_table_with_id("places", ["city", "abbreviation", "province", "latitude", "longitude"])
+            self._rebuild_table_with_id("streets", ["street", "city_id", "postalcode"])
+            self._ensure_unique_streets()
         except sqlite3.Error as e:
             logger.error(f"Schema migration failed: {e}")
+
+    def _table_sql(self, table: str) -> str:
+        """Return the CREATE TABLE statement for a table from SCHEMA."""
+        match = re.search(rf"CREATE TABLE IF NOT EXISTS {table} \(.*?\n    \);", self.SCHEMA, re.DOTALL)
+        return match.group(0)
+
+    def _rebuild_table_with_id(self, table: str, columns: list[str]) -> None:
+        """Rebuild a legacy table without an id column (create, copy, drop, rename)."""
+        with self._lock:
+            existing = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if not existing or "id" in existing:
+                return
+            copy_cols = [c for c in columns if c in existing]
+            col_list = ", ".join(copy_cols)
+            create_sql = self._table_sql(table).replace(f"EXISTS {table} (", f"EXISTS {table}_new (", 1)
+            try:
+                with self._transaction() as conn:
+                    conn.execute(f"DROP TABLE IF EXISTS {table}_new")
+                    conn.execute(create_sql)
+                    # OR IGNORE: legacy rows may violate the new UNIQUE/NOT NULL constraints
+                    conn.execute(
+                        f"INSERT OR IGNORE INTO {table}_new (id, {col_list}) SELECT rowid, {col_list} FROM {table}"
+                    )
+                    conn.execute(f"DROP TABLE {table}")
+                    conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
+                logger.info(f"Rebuilt table {table} with id column")
+            except sqlite3.Error as e:
+                logger.warning(f"Could not rebuild table {table} with id column: {e}")
+                return
+        # Recreate the indexes that were dropped together with the old table
+        self.conn.executescript(self.SCHEMA)
+
+    def _ensure_unique_streets(self) -> None:
+        """Deduplicate streets and add the UNIQUE (street, city_id) index."""
+        with self._lock:
+            exists = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_streets_unique'"
+            ).fetchone()
+            if exists:
+                return
+            try:
+                with self._transaction() as conn:
+                    removed = conn.execute(
+                        "DELETE FROM streets WHERE id NOT IN (SELECT MIN(id) FROM streets GROUP BY street, city_id)"
+                    ).rowcount
+                    conn.execute("CREATE UNIQUE INDEX idx_streets_unique ON streets(street, city_id)")
+                if removed:
+                    logger.info(f"Removed {removed} duplicate streets")
+            except sqlite3.Error as e:
+                logger.warning(f"Could not add unique street index: {e}")
 
     def get_stats(self) -> dict:
         """Get database statistics for WebUI."""
@@ -492,53 +569,38 @@ class Database:
     # PLACES CRUD OPERATIONS
     # =========================================================================
 
+    @staticmethod
+    def normalize_city(city: str) -> str:
+        """Normalise a city name for exact matching.
+
+        Drops apostrophes (so 's-Hertogenbosch, s-Hertogenbosch and
+        'S-HERTOGENBOSCH compare equal), surrounding punctuation, extra
+        whitespace and case.
+        """
+        city = city.replace("'", "").replace("\u2019", "")
+        return " ".join(city.split()).strip(".,;:!?()").casefold()
+
+    def find_city_name(self, city: str) -> str | None:
+        """Return the stored place name that exactly matches city (normalised), or None."""
+        if not city:
+            return None
+        cache = self._get_text_cache("places", "places", self._build_places_cache)
+        return cache["by_normalized"].get(self.normalize_city(city))
+
     def check_city(self, city: str) -> bool:
-        """Check if city exists in places table or as a city in streets."""
-        clean_city = city.replace("'", "")
-
-        # First check places table
-        self.cursor.execute(
-            "SELECT 1 FROM places WHERE city = ? OR city LIKE ? LIMIT 1",
-            (
-                clean_city,
-                clean_city + "%",
-            ),
-        )
-        if self.cursor.fetchone():
-            return True
-
-        # Also check if any street has this city via the places join
-        try:
-            self.cursor.execute(
-                """
-                SELECT 1 FROM streets s
-                JOIN places p ON s.city_id = p.id
-                WHERE p.city = ? OR p.city LIKE ?
-                LIMIT 1
-            """,
-                (
-                    clean_city,
-                    clean_city + "%",
-                ),
-            )
-            return self.cursor.fetchone() is not None
-        except sqlite3.Error:
-            return False
+        """Check if city is a known place (exact, case/apostrophe-insensitive match)."""
+        return self.find_city_name(city) is not None
 
     def get_place_coordinates(self, city: str) -> dict[str, float] | None:
         """Get approximate coordinates for a city from the places table."""
-        if not city:
+        name = self.find_city_name(city)
+        if not name:
             return None
-        clean_city = city.replace("'", "")
         try:
             self.cursor.execute(
                 "SELECT latitude, longitude FROM places "
-                "WHERE (city = ? OR city LIKE ?) AND latitude IS NOT NULL AND longitude IS NOT NULL "
-                "LIMIT 1",
-                (
-                    clean_city,
-                    clean_city + "%",
-                ),
+                "WHERE city = ? AND latitude IS NOT NULL AND longitude IS NOT NULL LIMIT 1",
+                (name,),
             )
             row = self.cursor.fetchone()
             if row:
@@ -674,6 +736,57 @@ class Database:
         except sqlite3.IntegrityError:
             return False
 
+    # Upsert that keeps the row id (streets.city_id points at it) and only
+    # overwrites province/abbreviation/coordinates with non-empty values
+    _UPSERT_PLACE_SQL = (
+        "INSERT INTO places (city, abbreviation, province, latitude, longitude) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(city) DO UPDATE SET "
+        "abbreviation = COALESCE(NULLIF(excluded.abbreviation, ''), places.abbreviation), "
+        "province = COALESCE(NULLIF(excluded.province, ''), places.province), "
+        "latitude = COALESCE(excluded.latitude, places.latitude), "
+        "longitude = COALESCE(excluded.longitude, places.longitude)"
+    )
+
+    def upsert_place(
+        self,
+        city: str,
+        abbreviation: str = "",
+        province: str = "",
+        latitude: float | None = None,
+        longitude: float | None = None,
+    ) -> tuple[int, bool]:
+        """Insert a place, or fill in empty fields of an existing one.
+
+        Returns (place_id, created).
+        """
+        with self._transaction() as conn:
+            created = conn.execute("SELECT 1 FROM places WHERE city = ?", (city,)).fetchone() is None
+            conn.execute(self._UPSERT_PLACE_SQL, (city, abbreviation, province, latitude, longitude))
+            place_id = conn.execute("SELECT id FROM places WHERE city = ?", (city,)).fetchone()[0]
+        self.invalidate_text_caches()
+        return place_id, created
+
+    def upsert_places(self, places: list[dict[str, Any]]) -> int:
+        """Bulk upsert places (dicts with city/abbreviation/province/latitude/longitude) in one transaction.
+
+        Returns the number of rows processed.
+        """
+        params = [
+            (
+                p["city"],
+                p.get("abbreviation", ""),
+                p.get("province", ""),
+                p.get("latitude"),
+                p.get("longitude"),
+            )
+            for p in places
+            if p.get("city")
+        ]
+        with self._transaction() as conn:
+            conn.executemany(self._UPSERT_PLACE_SQL, params)
+        self.invalidate_text_caches()
+        return len(params)
+
     def update_place(
         self,
         place_id: int,
@@ -761,16 +874,37 @@ class Database:
         return {"items": rows, "total": total, "page": page, "per_page": per_page}
 
     def add_street(self, street: str, city_id: int | None = None, postalcode: str = "") -> bool:
-        """Add a new street."""
+        """Add a new street. Returns False if it already exists for this city."""
         try:
             self.cursor.execute(
-                "INSERT INTO streets (street, city_id, postalcode) VALUES (?, ?, ?)", (street, city_id, postalcode)
+                "INSERT OR IGNORE INTO streets (street, city_id, postalcode) VALUES (?, ?, ?)",
+                (street, city_id, postalcode),
             )
+            added = self.cursor.rowcount > 0
             self._commit()
             self.invalidate_text_caches()
-            return True
+            return added
         except sqlite3.Error:
             return False
+
+    def add_streets(self, city_id: int | None, streets: list[dict[str, str]]) -> int:
+        """Bulk add streets (dicts with street/postcode) for one city in one transaction.
+
+        Existing streets are kept; an empty postal code is filled in when the
+        new data has one. Returns the number of newly added streets.
+        """
+        rows = [(s["street"], city_id, s.get("postcode", "")) for s in streets if s.get("street")]
+        with self._transaction() as conn:
+            added = conn.executemany(
+                "INSERT OR IGNORE INTO streets (street, city_id, postalcode) VALUES (?, ?, ?)", rows
+            ).rowcount
+            conn.executemany(
+                "UPDATE streets SET postalcode = ? WHERE street = ? AND city_id IS ? "
+                "AND (postalcode IS NULL OR postalcode = '')",
+                [(pc, street, cid) for street, cid, pc in rows if pc],
+            )
+        self.invalidate_text_caches()
+        return added
 
     def update_street(self, street_id: int, street: str, city_id: int | None = None, postalcode: str = "") -> bool:
         """Update an existing street."""
@@ -890,10 +1024,15 @@ class Database:
     # GEOCODE OPERATIONS (existing)
     # =========================================================================
 
+    @staticmethod
+    def _geocode_key(address: str) -> str:
+        """Cache key for a geocode query - must be identical for lookup and store."""
+        return " ".join(address.split())
+
     def find_geocode(self, address: str) -> dict | None:
         """Find cached geocode for address."""
         self.cursor.execute(
-            "SELECT latitude, longitude, address, mapurl FROM geocodes WHERE query = ?", (address.replace("'", ""),)
+            "SELECT latitude, longitude, address, mapurl FROM geocodes WHERE query = ?", (self._geocode_key(address),)
         )
         row = self.cursor.fetchone()
         return dict(row) if row else None
@@ -914,7 +1053,17 @@ class Database:
         try:
             self.cursor.execute(
                 "INSERT OR REPLACE INTO geocodes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (query, datatype, str(latitude), str(longitude), postalcode, street, city, address, mapurl),
+                (
+                    self._geocode_key(query),
+                    datatype,
+                    str(latitude),
+                    str(longitude),
+                    postalcode,
+                    street,
+                    city,
+                    address,
+                    mapurl,
+                ),
             )
             self._commit()
         except sqlite3.Error as e:
@@ -1121,90 +1270,149 @@ class Database:
 
         return output.getvalue()
 
-    def import_capcodes_csv(self, csv_content: str, replace: bool = False) -> dict[str, int]:
-        """Import capcodes from CSV. Returns counts of imported/skipped."""
-        if replace:
-            self.cursor.execute("DELETE FROM capcodes")
+    @staticmethod
+    def _read_csv(csv_content: str, required: tuple[str, ...]) -> list[dict[str, str]]:
+        """Parse and validate CSV content before anything touches the database.
 
-        reader = csv.DictReader(io.StringIO(csv_content))
+        Accepts comma, semicolon or tab delimiters (picked by which one yields
+        the required header columns). Header names are matched
+        case-insensitively. Raises ValueError for unusable input.
+        """
+        if not isinstance(csv_content, str):
+            raise ValueError("CSV content must be a string")
+        text = csv_content.lstrip("\ufeff")
+        if not text.strip():
+            raise ValueError("CSV is empty")
+
+        header_line = text.splitlines()[0]
+        for delimiter in (",", ";", "\t"):
+            header = [h.strip().lower() for h in next(csv.reader([header_line], delimiter=delimiter))]
+            if all(col in header for col in required):
+                break
+        else:
+            raise ValueError(f"CSV header must contain column(s): {', '.join(required)} (got: {header_line[:100]!r})")
+
+        reader = csv.reader(io.StringIO(text), delimiter=delimiter, strict=True)
+        try:
+            rows = list(reader)
+        except csv.Error as e:
+            raise ValueError(f"Invalid CSV near line {reader.line_num}: {e}") from e
+        return [dict(zip(header, (v.strip() for v in row), strict=False)) for row in rows[1:] if any(row)]
+
+    def import_capcodes_csv(self, csv_content: str, replace: bool = False) -> dict[str, int]:
+        """Import capcodes from CSV. Returns counts of imported/skipped.
+
+        Raises ValueError for invalid CSV; the table is left untouched then.
+        """
+        rows = self._read_csv(csv_content, ("capcode",))
         imported = 0
         skipped = 0
 
-        for row in reader:
-            try:
-                self.cursor.execute(
-                    "INSERT OR REPLACE INTO capcodes (capcode, discipline, region, location, description, remark) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        row.get("capcode", ""),
-                        row.get("discipline", ""),
-                        row.get("region", ""),
-                        row.get("location", ""),
-                        row.get("description", ""),
-                        row.get("remark", ""),
-                    ),
-                )
-                imported += 1
-            except Exception:
-                skipped += 1
+        with self._transaction() as conn:
+            if replace:
+                conn.execute("DELETE FROM capcodes")
+            for row in rows:
+                if not row.get("capcode"):
+                    skipped += 1
+                    continue
+                try:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO capcodes (capcode, discipline, region, location, description, remark) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            row["capcode"],
+                            row.get("discipline", ""),
+                            row.get("region", ""),
+                            row.get("location", ""),
+                            row.get("description", ""),
+                            row.get("remark", ""),
+                        ),
+                    )
+                    imported += 1
+                except sqlite3.Error:
+                    skipped += 1
 
-        self._commit()
         self.invalidate_text_caches()
         return {"imported": imported, "skipped": skipped}
 
     def import_places_csv(self, csv_content: str, replace: bool = False) -> dict[str, int]:
-        """Import places from CSV. Returns counts of imported/skipped."""
-        if replace:
-            self.cursor.execute("DELETE FROM places")
+        """Import places from CSV. Returns counts of imported/skipped.
 
-        reader = csv.DictReader(io.StringIO(csv_content))
+        Existing places are updated in place so their id (and the streets
+        linked to it) is kept; empty CSV values never wipe stored data.
+        With replace=True, places missing from the CSV are removed together
+        with their streets. Raises ValueError for invalid CSV; nothing is
+        changed then.
+        """
+        rows = self._read_csv(csv_content, ("city",))
         imported = 0
         skipped = 0
+        cities = set()
 
-        for row in reader:
-            try:
-                lat = float(row["latitude"]) if row.get("latitude") else None
-                lon = float(row["longitude"]) if row.get("longitude") else None
-                self.cursor.execute(
-                    "INSERT OR REPLACE INTO places (city, abbreviation, province, latitude, longitude) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (row.get("city", ""), row.get("abbreviation", ""), row.get("province", ""), lat, lon),
-                )
-                imported += 1
-            except Exception:
-                skipped += 1
+        with self._transaction() as conn:
+            for row in rows:
+                try:
+                    lat = float(row["latitude"]) if row.get("latitude") else None
+                    lon = float(row["longitude"]) if row.get("longitude") else None
+                except ValueError:
+                    skipped += 1
+                    continue
+                if not row.get("city"):
+                    skipped += 1
+                    continue
+                try:
+                    conn.execute(
+                        self._UPSERT_PLACE_SQL,
+                        (row["city"], row.get("abbreviation", ""), row.get("province", ""), lat, lon),
+                    )
+                    cities.add(row["city"])
+                    imported += 1
+                except sqlite3.Error:
+                    skipped += 1
 
-        self._commit()
+            if replace:
+                stale = [(r[0],) for r in conn.execute("SELECT id, city FROM places").fetchall() if r[1] not in cities]
+                conn.executemany("DELETE FROM streets WHERE city_id = ?", stale)
+                conn.executemany("DELETE FROM places WHERE id = ?", stale)
+
         self.invalidate_text_caches()
         return {"imported": imported, "skipped": skipped}
 
     def import_streets_csv(self, csv_content: str, replace: bool = False) -> dict[str, int]:
-        """Import streets from CSV. Returns counts of imported/skipped."""
-        if replace:
-            self.cursor.execute("DELETE FROM streets")
+        """Import streets from CSV. Returns counts of imported/skipped.
 
-        reader = csv.DictReader(io.StringIO(csv_content))
+        Streets already present for the same city are skipped. Raises
+        ValueError for invalid CSV; the table is left untouched then.
+        """
+        rows = self._read_csv(csv_content, ("street",))
         imported = 0
         skipped = 0
 
-        for row in reader:
-            try:
-                # Look up city_id
-                city_id = None
-                if row.get("city"):
-                    self.cursor.execute("SELECT id FROM places WHERE city = ?", (row["city"],))
-                    city_row = self.cursor.fetchone()
-                    city_id = city_row[0] if city_row else None
+        with self._transaction() as conn:
+            if replace:
+                conn.execute("DELETE FROM streets")
+            for row in rows:
+                if not row.get("street"):
+                    skipped += 1
+                    continue
+                try:
+                    # Look up city_id
+                    city_id = None
+                    if row.get("city"):
+                        city_row = conn.execute("SELECT id FROM places WHERE city = ?", (row["city"],)).fetchone()
+                        city_id = city_row[0] if city_row else None
 
-                self.cursor.execute(
-                    "INSERT INTO streets (street, city_id, postalcode) VALUES (?, ?, ?)",
-                    (row.get("street", ""), city_id, row.get("postalcode", "")),
-                )
-                imported += 1
-            except Exception:
-                skipped += 1
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO streets (street, city_id, postalcode) VALUES (?, ?, ?)",
+                        (row["street"], city_id, row.get("postalcode", "")),
+                    )
+                    if cur.rowcount > 0:
+                        imported += 1
+                    else:
+                        skipped += 1
+                except sqlite3.Error:
+                    skipped += 1
 
-        self._commit()
         self.invalidate_text_caches()
         return {"imported": imported, "skipped": skipped}
 
@@ -1415,15 +1623,16 @@ class Database:
             else "INSERT OR IGNORE INTO abbreviations (abbreviation, full_text) VALUES (?, ?)"
         )
         try:
-            for item in abbrevs:
-                abbrev = item.get("abbreviation", "").upper()
-                full_text = item.get("full_text", "")
-                if abbrev and full_text:
-                    self.cursor.execute(sql, (abbrev, full_text))
-                    count += self.cursor.rowcount if not replace else 1
-            self._commit()
+            with self._transaction() as conn:
+                for item in abbrevs:
+                    abbrev = item.get("abbreviation", "").upper()
+                    full_text = item.get("full_text", "")
+                    if abbrev and full_text:
+                        cur = conn.execute(sql, (abbrev, full_text))
+                        count += cur.rowcount if not replace else 1
             self.invalidate_text_caches()
         except Exception as e:
+            count = 0
             logger.error(f"Failed to import abbreviations: {e}")
         return count
 
@@ -1522,17 +1731,18 @@ class Database:
         """Bulk import TTS replacements from config. Returns count imported."""
         count = 0
         try:
-            for item in replacements:
-                pattern = item.get("pattern", "")
-                replacement = item.get("replacement", "")
-                if pattern:
-                    self.cursor.execute(
-                        "INSERT OR IGNORE INTO tts_replacements (pattern, replacement) VALUES (?, ?)",
-                        (pattern, replacement),
-                    )
-                    count += self.cursor.rowcount
-            self._commit()
+            with self._transaction() as conn:
+                for item in replacements:
+                    pattern = item.get("pattern", "")
+                    replacement = item.get("replacement", "")
+                    if pattern:
+                        cur = conn.execute(
+                            "INSERT OR IGNORE INTO tts_replacements (pattern, replacement) VALUES (?, ?)",
+                            (pattern, replacement),
+                        )
+                        count += cur.rowcount
         except Exception as e:
+            count = 0
             logger.error(f"Failed to import TTS replacements: {e}")
         return count
 
@@ -1624,12 +1834,13 @@ class Database:
         """Bulk import ignore-text patterns from config. Returns count imported."""
         count = 0
         try:
-            for pattern in patterns:
-                if pattern:
-                    self.cursor.execute("INSERT OR IGNORE INTO ignore_text (pattern) VALUES (?)", (pattern,))
-                    count += self.cursor.rowcount
-            self._commit()
+            with self._transaction() as conn:
+                for pattern in patterns:
+                    if pattern:
+                        cur = conn.execute("INSERT OR IGNORE INTO ignore_text (pattern) VALUES (?)", (pattern,))
+                        count += cur.rowcount
         except Exception as e:
+            count = 0
             logger.error(f"Failed to import ignore-text patterns: {e}")
         return count
 
