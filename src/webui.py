@@ -21,6 +21,14 @@ from .sensor_manager import SensorConfig, SensorManager
 logger = logging.getLogger(__name__)
 
 MAX_MESSAGES = 500
+# Only per_page is capped tightly; page just needs to keep SQL OFFSET in range
+MAX_PAGE = 1_000_000_000
+# CSV imports arrive as one JSON body; aiohttp's default limit is 1 MiB
+MAX_REQUEST_SIZE = 50 * 1024 * 1024
+# Vehicle photo uploads (multipart, which client_max_size does not bound)
+MAX_PHOTO_SIZE = 5 * 1024 * 1024
+MAX_FORM_FIELD_SIZE = 4 * 1024
+PHOTO_MIME_TYPES = ("image/jpeg", "image/png", "image/webp", "image/gif")
 
 ADDON_VERSION = "1.0.0"
 
@@ -46,6 +54,47 @@ def _int_param(request: web.Request, name: str, default: int, minimum: int = 1, 
     except (TypeError, ValueError):
         return default
     return max(minimum, min(maximum, value))
+
+
+def _bad_request(message: str) -> web.HTTPBadRequest:
+    """Build a 400 with the same {"error": ...} JSON body the handlers return."""
+    return web.HTTPBadRequest(text=json.dumps({"error": message}), content_type="application/json")
+
+
+async def _json_object(request: web.Request) -> dict:
+    """Parse the request body as a JSON object, raising a JSON 400 otherwise."""
+    try:
+        data = await request.json()
+    except ValueError:
+        raise _bad_request("Invalid JSON body") from None
+    if not isinstance(data, dict):
+        raise _bad_request("JSON body must be an object")
+    return data
+
+
+def _city_id(value) -> int | None:
+    """Convert a street's city_id form value to int, or None when blank."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, bool):
+        raise _bad_request("city_id must be an integer")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise _bad_request("city_id must be an integer") from None
+
+
+def _sniff_image_type(data: bytes) -> str | None:
+    """Return the image MIME type from the file's magic bytes, or None."""
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 class _DictMessageView:
@@ -81,7 +130,7 @@ class WebUI:
     def __init__(self, port: int = 8099, database: Database | None = None):
         self.port = port
         self.database = database
-        self.app = web.Application()
+        self.app = web.Application(client_max_size=MAX_REQUEST_SIZE)
         self.messages: deque = deque(maxlen=MAX_MESSAGES)
         self.sensors: list[SensorConfig] = []
         self._sensor_manager: SensorManager | None = None
@@ -473,7 +522,7 @@ class WebUI:
         """List capcodes with pagination and search."""
         if not self.database:
             return web.json_response({"error": "Database not available"}, status=500)
-        page = _int_param(request, "page", 1)
+        page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
         search = request.query.get("search", "")
         result = self.database.list_capcodes(page, per_page, search)
@@ -483,7 +532,7 @@ class WebUI:
         """Add a new capcode."""
         if not self.database:
             return web.json_response({"error": "Database not available"}, status=500)
-        data = await request.json()
+        data = await _json_object(request)
         success = self.database.add_capcode(
             data.get("capcode", ""),
             data.get("discipline", ""),
@@ -501,7 +550,7 @@ class WebUI:
         if not self.database:
             return web.json_response({"error": "Database not available"}, status=500)
         capcode = request.match_info.get("capcode", "")
-        data = await request.json()
+        data = await _json_object(request)
         success = self.database.update_capcode(
             capcode,
             data.get("discipline", ""),
@@ -524,7 +573,7 @@ class WebUI:
         """List places with pagination and search."""
         if not self.database:
             return web.json_response({"error": "Database not available"}, status=500)
-        page = _int_param(request, "page", 1)
+        page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
         search = request.query.get("search", "")
         result = self.database.list_places(page, per_page, search)
@@ -534,7 +583,7 @@ class WebUI:
         """Add a new place."""
         if not self.database:
             return web.json_response({"error": "Database not available"}, status=500)
-        data = await request.json()
+        data = await _json_object(request)
         success = self.database.add_place(
             data.get("city", ""),
             data.get("abbreviation", ""),
@@ -554,7 +603,7 @@ class WebUI:
             place_id = int(request.match_info.get("id", 0))
         except (TypeError, ValueError):
             place_id = 0
-        data = await request.json()
+        data = await _json_object(request)
         success = self.database.update_place(
             place_id,
             data.get("city", ""),
@@ -580,7 +629,7 @@ class WebUI:
         """List streets with pagination and search."""
         if not self.database:
             return web.json_response({"error": "Database not available"}, status=500)
-        page = _int_param(request, "page", 1)
+        page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
         search = request.query.get("search", "")
         city_id = request.query.get("city_id")
@@ -595,8 +644,10 @@ class WebUI:
         """Add a new street."""
         if not self.database:
             return web.json_response({"error": "Database not available"}, status=500)
-        data = await request.json()
-        success = self.database.add_street(data.get("street", ""), data.get("city_id"), data.get("postalcode", ""))
+        data = await _json_object(request)
+        success = self.database.add_street(
+            data.get("street", ""), _city_id(data.get("city_id")), data.get("postalcode", "")
+        )
         if success:
             return web.json_response({"success": True})
         return web.json_response({"error": "Failed to add street"}, status=400)
@@ -609,9 +660,9 @@ class WebUI:
             street_id = int(request.match_info.get("id", 0))
         except (TypeError, ValueError):
             street_id = 0
-        data = await request.json()
+        data = await _json_object(request)
         success = self.database.update_street(
-            street_id, data.get("street", ""), data.get("city_id"), data.get("postalcode", "")
+            street_id, data.get("street", ""), _city_id(data.get("city_id")), data.get("postalcode", "")
         )
         return web.json_response({"success": success})
 
@@ -630,7 +681,7 @@ class WebUI:
         """List cached geocodes with pagination and search."""
         if not self.database:
             return web.json_response({"error": "Database not available"}, status=500)
-        page = _int_param(request, "page", 1)
+        page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
         search = request.query.get("search", "")
         result = self.database.list_geocodes(page, per_page, search)
@@ -657,24 +708,21 @@ class WebUI:
             return web.json_response({"error": "Database not available"}, status=500)
         table = request.match_info.get("table", "")
 
-        if table == "capcodes":
-            csv_data = self.database.export_capcodes_csv()
-        elif table == "places":
-            csv_data = self.database.export_places_csv()
-        elif table == "streets":
-            csv_data = self.database.export_streets_csv()
-        elif table == "messages":
-            csv_data = self.database.export_messages_csv()
-        elif table == "abbreviations":
-            csv_data = self.database.export_abbreviations_csv()
-        elif table == "tts_replacements":
-            csv_data = self.database.export_tts_csv()
-        elif table == "ignore_text":
-            csv_data = self.database.export_ignore_text_csv()
-        elif table == "ignore_capcodes":
-            csv_data = self.database.export_ignore_capcodes_csv()
-        else:
+        exporters = {
+            "capcodes": self.database.export_capcodes_csv,
+            "places": self.database.export_places_csv,
+            "streets": self.database.export_streets_csv,
+            "messages": self.database.export_messages_csv,
+            "abbreviations": self.database.export_abbreviations_csv,
+            "tts_replacements": self.database.export_tts_csv,
+            "ignore_text": self.database.export_ignore_text_csv,
+            "ignore_capcodes": self.database.export_ignore_capcodes_csv,
+        }
+        exporter = exporters.get(table)
+        if exporter is None:
             return web.json_response({"error": "Invalid table"}, status=400)
+        # Off the event loop so SSE and the decoder feed don't stall on big tables
+        csv_data = await asyncio.to_thread(exporter)
 
         return web.Response(
             text=csv_data, content_type="text/csv", headers={"Content-Disposition": f"attachment; filename={table}.csv"}
@@ -686,23 +734,32 @@ class WebUI:
             return web.json_response({"error": "Database not available"}, status=500)
         table = request.match_info.get("table", "")
 
-        data = await request.json()
+        data = await _json_object(request)
         csv_content = data.get("csv", "")
-        replace = data.get("replace", False)
+        replace = bool(data.get("replace", False))
+        if not isinstance(csv_content, str):
+            return web.json_response({"error": "csv must be a string"}, status=400)
 
-        if table == "capcodes":
-            result = self.database.import_capcodes_csv(csv_content, replace)
-        elif table == "places":
-            result = self.database.import_places_csv(csv_content, replace)
-        elif table == "streets":
-            result = self.database.import_streets_csv(csv_content, replace)
-        elif table == "messages":
+        importers = {
+            "capcodes": self.database.import_capcodes_csv,
+            "places": self.database.import_places_csv,
+            "streets": self.database.import_streets_csv,
+        }
+        if table == "messages":
             return web.json_response(
                 {"error": "Messages cannot be imported. They come from the P2000 decoder."}, status=400
             )
-        else:
+        importer = importers.get(table)
+        if importer is None:
             return web.json_response({"error": "Invalid table"}, status=400)
+        if busy := self._import_running():
+            return web.json_response({"error": busy}, status=409)
 
+        try:
+            # Off the event loop so SSE and the decoder feed don't stall on big files
+            result = await asyncio.to_thread(importer, csv_content, replace)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
         return web.json_response(result)
 
     async def _handle_list_provinces(self, request: web.Request) -> web.Response:
@@ -721,7 +778,10 @@ class WebUI:
 
         import threading
 
-        from .bag_import import get_import_progress, import_province_data, reset_progress
+        from .bag_import import PROVINCES, get_import_progress, import_province_data, reset_progress
+
+        if province not in PROVINCES:
+            return web.json_response({"error": f"Unknown province '{province}'"}, status=400)
 
         # Check if already running
         progress = get_import_progress()
@@ -748,12 +808,15 @@ class WebUI:
 
         import threading
 
-        from .bag_import import get_import_progress, import_all_places
+        from .bag_import import get_import_progress, import_all_places, reset_progress
 
         # Check if already running
         progress = get_import_progress()
         if progress.get("running"):
             return web.json_response({"error": "Import already in progress"}, status=400)
+
+        # Reset progress BEFORE starting thread so the first poll can't see the previous run's result
+        reset_progress("all places")
 
         # Start import in background thread
         def run_import():
@@ -824,7 +887,7 @@ class WebUI:
         if not self.database:
             return web.json_response({"error": "Database not available"}, status=500)
 
-        page = _int_param(request, "page", 1)
+        page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
         search = request.query.get("search", "")
         discipline = request.query.get("discipline", "")
@@ -864,11 +927,24 @@ class WebUI:
         self._save_stats()
         return web.json_response({"success": True, "deleted": count})
 
+    @staticmethod
+    def _import_running() -> str | None:
+        """Return an error message while a BAG or capcode import thread is running."""
+        from . import bag_import, capcode_import
+
+        if bag_import.get_import_progress().get("running"):
+            return "A BAG import is running; wait for it to finish"
+        if capcode_import.get_import_progress().get("running"):
+            return "A capcode import is running; wait for it to finish"
+        return None
+
     async def _handle_clear_table(self, request: web.Request) -> web.Response:
         """Delete all rows from a single table (whitelisted in database.clear_table)."""
         if not self.database:
             return web.json_response({"error": "Database not available"}, status=500)
         table = request.match_info.get("table", "")
+        if busy := self._import_running():
+            return web.json_response({"error": busy}, status=409)
         count = self.database.clear_table(table)
         if count < 0:
             return web.json_response({"error": f"Cannot clear table '{table}'"}, status=400)
@@ -889,6 +965,8 @@ class WebUI:
         """Reset the database - delete all data and recreate schema."""
         if not self.database:
             return web.json_response({"error": "Database not available"}, status=500)
+        if busy := self._import_running():
+            return web.json_response({"error": busy}, status=409)
 
         try:
             # Drop all tables
@@ -903,6 +981,7 @@ class WebUI:
                 "tts_replacements",
                 "ignore_text",
                 "ignore_capcodes",
+                "vehicle_photos",
             ]
             for table in tables:
                 with contextlib.suppress(Exception):
@@ -936,7 +1015,7 @@ class WebUI:
         """List abbreviations with pagination and search."""
         if not self.database:
             return web.json_response({"error": "No database"}, status=500)
-        page = _int_param(request, "page", 1)
+        page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
         search = request.query.get("search", "")
         result = self.database.list_abbreviations(page, per_page, search)
@@ -946,7 +1025,7 @@ class WebUI:
         """Add a new abbreviation."""
         if not self.database:
             return web.json_response({"error": "No database"}, status=500)
-        data = await request.json()
+        data = await _json_object(request)
         abbrev = data.get("abbreviation", "")
         full_text = data.get("full_text", "")
         if not abbrev or not full_text:
@@ -982,8 +1061,8 @@ class WebUI:
         """Find abbreviations in text and return their full meanings."""
         if not self.database:
             return web.json_response({"error": "No database"}, status=500)
+        data = await _json_object(request)
         try:
-            data = await request.json()
             text = data.get("text", "")
             found = self.database.find_abbreviations_in_text(text)
             return web.json_response({"abbreviations": found})
@@ -995,7 +1074,7 @@ class WebUI:
         """List TTS replacements with pagination and search."""
         if not self.database:
             return web.json_response({"error": "No database"}, status=500)
-        page = _int_param(request, "page", 1)
+        page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
         search = request.query.get("search", "")
         result = self.database.list_tts_replacements(page, per_page, search)
@@ -1005,7 +1084,7 @@ class WebUI:
         """Add a TTS replacement."""
         if not self.database:
             return web.json_response({"error": "No database"}, status=500)
-        data = await request.json()
+        data = await _json_object(request)
         pattern = data.get("pattern", "")
         replacement = data.get("replacement", "")
         if not pattern:
@@ -1023,7 +1102,7 @@ class WebUI:
             tts_id = int(request.match_info.get("id", 0))
         except (TypeError, ValueError):
             return web.json_response({"error": "Invalid id"}, status=400)
-        data = await request.json()
+        data = await _json_object(request)
         pattern = data.get("pattern", "")
         if not pattern:
             return web.json_response({"error": "Pattern is required"}, status=400)
@@ -1059,7 +1138,7 @@ class WebUI:
         """List ignore-text patterns with pagination and search."""
         if not self.database:
             return web.json_response({"error": "No database"}, status=500)
-        page = _int_param(request, "page", 1)
+        page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
         search = request.query.get("search", "")
         result = self.database.list_ignore_text(page, per_page, search)
@@ -1069,7 +1148,7 @@ class WebUI:
         """Add an ignore-text pattern."""
         if not self.database:
             return web.json_response({"error": "No database"}, status=500)
-        data = await request.json()
+        data = await _json_object(request)
         pattern = data.get("pattern", "")
         if not pattern:
             return web.json_response({"error": "Pattern is required"}, status=400)
@@ -1086,7 +1165,7 @@ class WebUI:
             rule_id = int(request.match_info.get("id", 0))
         except (TypeError, ValueError):
             return web.json_response({"error": "Invalid id"}, status=400)
-        data = await request.json()
+        data = await _json_object(request)
         pattern = data.get("pattern", "")
         if not pattern:
             return web.json_response({"error": "Pattern is required"}, status=400)
@@ -1122,7 +1201,7 @@ class WebUI:
         """List ignored capcodes with pagination and search."""
         if not self.database:
             return web.json_response({"error": "No database"}, status=500)
-        page = _int_param(request, "page", 1)
+        page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
         search = request.query.get("search", "")
         result = self.database.list_ignore_capcodes(page, per_page, search)
@@ -1132,7 +1211,7 @@ class WebUI:
         """Add an ignored capcode."""
         if not self.database:
             return web.json_response({"error": "No database"}, status=500)
-        data = await request.json()
+        data = await _json_object(request)
         capcode = data.get("capcode", "")
         if not capcode:
             return web.json_response({"error": "Capcode is required"}, status=400)
@@ -1149,7 +1228,7 @@ class WebUI:
             rule_id = int(request.match_info.get("id", 0))
         except (TypeError, ValueError):
             return web.json_response({"error": "Invalid id"}, status=400)
-        data = await request.json()
+        data = await _json_object(request)
         capcode = data.get("capcode", "")
         if not capcode:
             return web.json_response({"error": "Capcode is required"}, status=400)
@@ -1230,10 +1309,14 @@ class WebUI:
         photo = self.database.get_vehicle_photo(key_type, key_value)
         if not photo:
             return web.json_response({"error": "Not found"}, status=404)
+        # Rows stored before upload validation may hold an SVG or a parameterised type
+        mime_type = photo["mime_type"].split(";", 1)[0].strip().lower()
+        if mime_type not in PHOTO_MIME_TYPES:
+            mime_type = "application/octet-stream"
         return web.Response(
             body=photo["image"],
-            content_type=photo["mime_type"],
-            headers={"Cache-Control": "no-cache, must-revalidate"},
+            content_type=mime_type,
+            headers={"Cache-Control": "no-cache, must-revalidate", "X-Content-Type-Options": "nosniff"},
         )
 
     async def _handle_set_vehicle_photo(self, request: web.Request) -> web.Response:
@@ -1244,13 +1327,18 @@ class WebUI:
             reader = await request.multipart()
             fields: dict[str, str] = {}
             image_bytes = b""
-            mime_type = ""
             async for part in reader:
+                if not isinstance(part, aiohttp.BodyPartReader):
+                    continue
                 if part.name == "file":
-                    mime_type = part.headers.get("Content-Type", "application/octet-stream")
-                    image_bytes = await part.read(decode=False)
+                    image_bytes = await self._read_part_limited(part, MAX_PHOTO_SIZE)
+                    if image_bytes is None:
+                        return web.json_response({"error": "Image too large (max 5MB)"}, status=400)
                 elif part.name:
-                    fields[part.name] = (await part.read(decode=False)).decode("utf-8", errors="replace")
+                    value = await self._read_part_limited(part, MAX_FORM_FIELD_SIZE)
+                    if value is None:
+                        return web.json_response({"error": f"Field '{part.name}' too large"}, status=400)
+                    fields[part.name] = value.decode("utf-8", errors="replace")
         except Exception as e:
             return web.json_response({"error": f"Invalid upload: {e}"}, status=400)
 
@@ -1264,13 +1352,26 @@ class WebUI:
             return web.json_response({"error": "key_value is required"}, status=400)
         if not image_bytes:
             return web.json_response({"error": "file is required"}, status=400)
-        if not mime_type.startswith("image/"):
-            return web.json_response({"error": "file must be an image"}, status=400)
-        if len(image_bytes) > 5 * 1024 * 1024:
-            return web.json_response({"error": "Image too large (max 5MB)"}, status=400)
+        # Trust the file's magic bytes, not the client's Content-Type: SVG (script)
+        # or a parameterised type must never be stored and served back same-origin
+        mime_type = _sniff_image_type(image_bytes)
+        if mime_type not in PHOTO_MIME_TYPES:
+            return web.json_response({"error": "file must be a JPEG, PNG, WebP or GIF image"}, status=400)
 
         success = self.database.set_vehicle_photo(key_type, key_value, mime_type, image_bytes, label)
         return web.json_response({"success": success})
+
+    @staticmethod
+    async def _read_part_limited(part: aiohttp.BodyPartReader, limit: int) -> bytes | None:
+        """Read a multipart part in chunks, returning None once it exceeds limit bytes."""
+        chunks = []
+        size = 0
+        while chunk := await part.read_chunk():
+            size += len(chunk)
+            if size > limit:
+                return None
+            chunks.append(chunk)
+        return b"".join(chunks)
 
     async def _handle_delete_vehicle_photo(self, request: web.Request) -> web.Response:
         """Delete a vehicle photo."""
@@ -1292,7 +1393,7 @@ class WebUI:
         """List vehicle photos with pagination and search, for the Database tab."""
         if not self.database:
             return web.json_response({"error": "Database not available"}, status=500)
-        page = _int_param(request, "page", 1)
+        page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
         search = request.query.get("search", "")
         result = self.database.list_vehicle_photos(page, per_page, search)
@@ -2152,7 +2253,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         let currentMarker = null;
         let selectedMsg = null;
-        let selectedMsgIndex = -1;
+        let selectedMsgKey = null;
+        // Stable identity for a message: list positions shift as new ones arrive
+        function msgKey(msg) {
+            return msg.id !== undefined && msg.id !== null ? 'id:' + msg.id : msg.timestamp + '|' + (msg.body || '');
+        }
+        function highlightSelectedMessage() {
+            document.querySelectorAll('.message').forEach(el => el.classList.remove('selected'));
+            if (selectedMsgKey === null) return;
+            const idx = currentMessages.findIndex(m => msgKey(m) === selectedMsgKey);
+            if (idx < 0) return;
+            const card = document.querySelector(`.message[data-msg-index="${idx}"]`);
+            if (card) card.classList.add('selected');
+        }
         const markers = [];
 
         // Configured sensor radii (e.g. "within 3km of Schiphol") - static
@@ -2440,11 +2553,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         function formatTime(ts) { return new Date(ts).toLocaleTimeString(); }
         function formatDate(ts) { return new Date(ts).toLocaleString(); }
 
+        // Safe for element content AND quoted attribute values
+        const HTML_ESCAPES = {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'};
         function escapeHtml(text) {
             if (text === null || text === undefined) return '';
-            const div = document.createElement('div');
-            div.textContent = String(text);
-            return div.innerHTML;
+            return String(text).replace(/[&<>"']/g, ch => HTML_ESCAPES[ch]);
         }
 
         function countUnique(obj) {
@@ -2528,12 +2641,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         function showMessageDetails(msg, idx) {
             selectedMsg = msg;
-            selectedMsgIndex = (typeof idx === 'number') ? idx : -1;
-            document.querySelectorAll('.message').forEach(el => el.classList.remove('selected'));
-            if (selectedMsgIndex >= 0) {
-                const card = document.querySelector(`.message[data-msg-index="${selectedMsgIndex}"]`);
-                if (card) card.classList.add('selected');
-            }
+            selectedMsgKey = (typeof idx === 'number') ? msgKey(msg) : null;
+            highlightSelectedMessage();
 
             // Filter capcodes to only show unmatched ones
             const matchedCapcodes = new Set();
@@ -2921,12 +3030,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             currentMessages = latest;
             if (latest.length > 0) {
                 messagesEl.innerHTML = latest.map(renderMessage).join('');
-                if (selectedMsgIndex >= 0 && selectedMsgIndex < latest.length) {
-                    const card = document.querySelector(`.message[data-msg-index="${selectedMsgIndex}"]`);
-                    if (card) card.classList.add('selected');
-                }
+                highlightSelectedMessage();
             } else {
-                selectedMsgIndex = -1;
+                selectedMsgKey = null;
                 messagesEl.innerHTML = '<div class="empty-state">No messages yet</div>';
             }
             updateMarkers(latest);
@@ -3012,7 +3118,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const url = basePath + 'api/messages' + (currentSensorFilter ? `?sensor=${encodeURIComponent(currentSensorFilter)}` : '');
             fetch(url).then(r => r.json()).then(msgs => {
                 renderMessagesList((msgs || []).slice(0, 50));
-            });
+            }).catch(() => toast('Failed to load messages', 'error'));
         }
 
         function clearSelectedMessage() {
@@ -3020,7 +3126,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             // by clicking a message, independent of the periodic message-list/
             // marker refresh - switching filters must clear them explicitly, or
             // a message that no longer matches the new filter keeps showing.
-            selectedMsgIndex = -1;
+            selectedMsgKey = null;
             if (currentMarker) { map.removeLayer(currentMarker); currentMarker = null; }
             detailContent.innerHTML = '<div class="empty-state">Click a message to view details</div>';
             document.getElementById('history-section').style.display = 'none';
@@ -3048,10 +3154,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     // the feed, so showing everything by default defeats that.
                     currentSensorFilter = '__any__';
                     const pills = [
-                        `<button class="sensor-filter-pill active" data-sensor="__any__" onclick="selectSensorFilter('__any__')">Sensors</button>`,
-                        `<button class="sensor-filter-pill" data-sensor="" onclick="selectSensorFilter('')">All</button>`,
-                    ].concat(sensors.map(s => `<button class="sensor-filter-pill" data-sensor="${escapeHtml(s.name)}" onclick="selectSensorFilter('${escapeHtml(s.name)}')">${escapeHtml(s.name)}</button>`));
+                        `<button class="sensor-filter-pill active" data-sensor="__any__">Sensors</button>`,
+                        `<button class="sensor-filter-pill" data-sensor="">All</button>`,
+                    ].concat(sensors.map(s => `<button class="sensor-filter-pill" data-sensor="${escapeHtml(s.name)}">${escapeHtml(s.name)}</button>`));
                     bar.innerHTML = pills.join('');
+                    bar.addEventListener('click', (e) => {
+                        const pill = e.target.closest('.sensor-filter-pill');
+                        if (pill) selectSensorFilter(pill.dataset.sensor);
+                    });
                 }
                 connectStream();
                 loadMessagesList();
@@ -3062,13 +3172,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         loadSensorFilterBar();
-        fetch(basePath + 'api/stats').then(r => r.json()).then(stats => update({stats, latest: []}));
+        fetch(basePath + 'api/stats').then(r => r.json()).then(stats => update({stats, latest: []}))
+            .catch(() => toast('Failed to load stats', 'error'));
 
         // =====================================================================
         // Database tab
         // =====================================================================
         let dbCurrentTable = null;
         let dbCurrentPage = 1;
+        let dbTotalPages = 1;
         let dbSearchTimeout = null;
         let dbCurrentItems = [];
 
@@ -3262,10 +3374,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             }
 
             document.getElementById('db-count').textContent = `${(data.total || 0).toLocaleString()} items`;
-            const dbTotalPages = Math.max(1, Math.ceil((data.total || 0) / 50));
-            document.getElementById('db-page').textContent = `Page ${data.page || 1} / ${dbTotalPages}`;
-            document.getElementById('db-prev').disabled = (data.page || 1) <= 1;
-            document.getElementById('db-next').disabled = (data.page || 1) * 50 >= (data.total || 0);
+            dbCurrentPage = data.page || 1;
+            dbTotalPages = Math.max(1, Math.ceil((data.total || 0) / (data.per_page || 50)));
+            document.getElementById('db-page').textContent = `Page ${dbCurrentPage} / ${dbTotalPages}`;
+            document.getElementById('db-prev').disabled = dbCurrentPage <= 1;
+            document.getElementById('db-next').disabled = dbCurrentPage >= dbTotalPages;
         }
 
         function dbSearch() {
@@ -3277,7 +3390,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         function dbPrev() { if (dbCurrentPage > 1) { dbCurrentPage--; dbLoadData(); } }
-        function dbNext() { dbCurrentPage++; dbLoadData(); }
+        function dbNext() { if (dbCurrentPage < dbTotalPages) { dbCurrentPage++; dbLoadData(); } }
 
         function dbRowId(item) {
             if (dbCurrentTable === 'capcodes') return item.capcode;
@@ -3334,7 +3447,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             if (dbCurrentTable === 'ignore_capcodes' && f === 'capcode') {
                 return `<input type="text" class="input" data-field="${f}" list="capcode-suggestions" oninput="updateCapcodeSuggestions(this.value)"${valueAttr}>`;
             }
-            return `<input type="text" class="input" data-field="${f}"${valueAttr}>`;
+            // Editing a capcode row: the capcode is the key in the URL and can't change
+            const readonly = value !== undefined && dbCurrentTable === 'capcodes' && f === 'capcode' ? ' readonly' : '';
+            return `<input type="text" class="input" data-field="${f}"${valueAttr}${readonly}>`;
         }
 
         // ----- Add item (modal form) -----
@@ -3453,14 +3568,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({csv, replace})
-                }).then(r => r.json()).then(result => {
+                }).then(r => r.text().then(text => {
+                    let result = null;
+                    try { result = JSON.parse(text); } catch (e) { /* plain-text error page */ }
+                    if (!r.ok) {
+                        const msg = (result && result.error) || (r.status === 413 ? 'CSV file too large (max 50 MB)' : text);
+                        throw new Error(msg || `HTTP ${r.status}`);
+                    }
+                    return result || {};
+                })).then(result => {
                     if (result.error) toast(result.error, 'error');
                     else {
                         toast(`Imported ${result.imported} items, skipped ${result.skipped}`, 'success');
                         closeModal();
                         dbLoadData();
                     }
-                }).catch(() => toast('Import failed', 'error'));
+                }).catch(e => toast('Import failed: ' + e.message, 'error'));
             });
         }
 
@@ -3493,42 +3616,53 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         if (btn) { btn.disabled = true; btn.textContent = '⏳ Starting…'; }
                         const resetBtn = () => { if (btn) { btn.disabled = false; btn.textContent = origLabel; } };
 
-                        bagProgressInterval = setInterval(() => {
-                            fetch(`${basePath}api/db/bag/progress`)
-                                .then(r => r.json())
-                                .then(p => {
-                                    if (btn) btn.textContent = `⏳ ${p.percent}%`;
-                                    if (!p.running) {
-                                        clearInterval(bagProgressInterval);
-                                        bagProgressInterval = null;
-                                        if (p.percent >= 100) {
-                                            toast(`BAG import complete: ${p.cities} cities, ${p.streets} streets`, 'success');
-                                        } else {
-                                            toast('BAG import failed: ' + (p.status || 'unknown error'), 'error');
-                                        }
-                                        resetBtn();
-                                        dbLoadStats();
-                                        if (dbCurrentTable) dbLoadData();
-                                    }
-                                });
-                        }, 500);
+                        const stopPolling = () => {
+                            if (bagProgressInterval) { clearInterval(bagProgressInterval); bagProgressInterval = null; }
+                        };
 
+                        // Poll only once the server has reset progress for this run,
+                        // or the first poll can read the previous run's result
                         fetch(`${basePath}api/db/bag/import/${encodeURIComponent(province)}`, {method: 'POST'})
                             .then(r => r.json())
                             .then(result => {
                                 if (result.error) {
-                                    if (bagProgressInterval) { clearInterval(bagProgressInterval); bagProgressInterval = null; }
                                     toast(result.error, 'error');
                                     resetBtn();
+                                    return;
                                 }
+                                stopPolling();
+                                bagProgressInterval = setInterval(() => {
+                                    fetch(`${basePath}api/db/bag/progress`)
+                                        .then(r => r.json())
+                                        .then(p => {
+                                            if (btn) btn.textContent = `⏳ ${p.percent}%`;
+                                            if (!p.running) {
+                                                stopPolling();
+                                                if (p.percent >= 100) {
+                                                    toast(`BAG import complete: ${p.cities} cities, ${p.streets} streets`, 'success');
+                                                } else {
+                                                    toast('BAG import failed: ' + (p.status || 'unknown error'), 'error');
+                                                }
+                                                resetBtn();
+                                                dbLoadStats();
+                                                if (dbCurrentTable) dbLoadData();
+                                            }
+                                        })
+                                        .catch(() => {
+                                            stopPolling();
+                                            toast('Lost track of BAG import progress', 'error');
+                                            resetBtn();
+                                        });
+                                }, 500);
                             })
                             .catch(() => {
-                                if (bagProgressInterval) { clearInterval(bagProgressInterval); bagProgressInterval = null; }
+                                stopPolling();
                                 toast('BAG import failed', 'error');
                                 resetBtn();
                             });
                     });
-                });
+                })
+                .catch(() => toast('Failed to load provinces', 'error'));
         }
 
         function importAllPlaces(btn) {
@@ -3556,10 +3690,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                                     if (btn) btn.textContent = `⏳ ${p.percent}%`;
                                     if (!p.running) {
                                         clearInterval(pollInterval);
-                                        toast(`Import complete: ${p.cities} places`, 'success');
+                                        if (p.percent >= 100) {
+                                            toast(`Import complete: ${p.cities} places`, 'success');
+                                        } else {
+                                            toast('Import failed: ' + (p.status || 'unknown error'), 'error');
+                                        }
                                         resetBtn();
                                         dbLoadStats();
                                     }
+                                })
+                                .catch(() => {
+                                    clearInterval(pollInterval);
+                                    toast('Lost track of import progress', 'error');
+                                    resetBtn();
                                 });
                         }, 500);
                     })
@@ -3584,37 +3727,46 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 if (btn) { btn.disabled = true; btn.textContent = '⏳ Starting…'; }
                 const resetBtn = () => { if (btn) { btn.disabled = false; btn.textContent = origLabel; } };
 
-                capcodeProgressInterval = setInterval(() => {
-                    fetch(`${basePath}api/db/capcodes/import-progress`)
-                        .then(r => r.json())
-                        .then(p => {
-                            if (btn) btn.textContent = `⏳ ${p.percent}%`;
-                            if (!p.running) {
-                                clearInterval(capcodeProgressInterval);
-                                capcodeProgressInterval = null;
-                                if (p.percent >= 100) {
-                                    toast(`Capcode import complete: ${(p.imported || 0).toLocaleString()} capcodes`, 'success');
-                                } else {
-                                    toast('Capcode import failed: ' + (p.status || 'unknown error'), 'error');
-                                }
-                                resetBtn();
-                                dbLoadStats();
-                                if (dbCurrentTable) dbLoadData();
-                            }
-                        });
-                }, 300);
+                const stopPolling = () => {
+                    if (capcodeProgressInterval) { clearInterval(capcodeProgressInterval); capcodeProgressInterval = null; }
+                };
 
+                // Poll only once the server has reset progress for this run
                 fetch(`${basePath}api/db/capcodes/import-bommel`, {method: 'POST'})
                     .then(r => r.json())
                     .then(result => {
                         if (result.error) {
-                            if (capcodeProgressInterval) { clearInterval(capcodeProgressInterval); capcodeProgressInterval = null; }
                             toast(result.error, 'error');
                             resetBtn();
+                            return;
                         }
+                        stopPolling();
+                        capcodeProgressInterval = setInterval(() => {
+                            fetch(`${basePath}api/db/capcodes/import-progress`)
+                                .then(r => r.json())
+                                .then(p => {
+                                    if (btn) btn.textContent = `⏳ ${p.percent}%`;
+                                    if (!p.running) {
+                                        stopPolling();
+                                        if (p.percent >= 100) {
+                                            toast(`Capcode import complete: ${(p.imported || 0).toLocaleString()} capcodes`, 'success');
+                                        } else {
+                                            toast('Capcode import failed: ' + (p.status || 'unknown error'), 'error');
+                                        }
+                                        resetBtn();
+                                        dbLoadStats();
+                                        if (dbCurrentTable) dbLoadData();
+                                    }
+                                })
+                                .catch(() => {
+                                    stopPolling();
+                                    toast('Lost track of capcode import progress', 'error');
+                                    resetBtn();
+                                });
+                        }, 300);
                     })
                     .catch(() => {
-                        if (capcodeProgressInterval) { clearInterval(capcodeProgressInterval); capcodeProgressInterval = null; }
+                        stopPolling();
                         toast('Capcode import failed', 'error');
                         resetBtn();
                     });
