@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.2.1
+
+- Tabs: **Settings** (was Database; now also holds the ppm calibration) and **Info** (was Advanced), in that order after the views.
+- Message detail always shows the vehicle photo slot, the date and distance from home, an "escalated" badge on the incident, the raw message, and Previous/Next to step through messages.
+- Wallboard and Lanes show the detail floating in the map's corner instead of a centred popup; dialogs no longer dim the page.
+- Draggable dividers between the panes of Console, Wallboard and Lanes (double-click resets).
+- Console's map and detail column grows with the screen; lanes are capped so the map gets the rest.
+- Messages with an A/B urgency code that also reach fire brigade capcodes go in the Ambulance lane.
+- Requires Home Assistant 2026.9 or newer (map tiles always come through its map tile proxy).
+- Fix: the built-in abbreviation dictionary is seeded on startup again.
+- Settings and Info pages use the dashboard's look: flat panels, compact buttons, mono values, no emoji headings, and larger, more readable text.
+- New screenshots.
+
 ## 1.2.0
 
 - New compact dashboard with three views, switched with tabs in the top bar:

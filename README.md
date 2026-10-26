@@ -7,18 +7,32 @@ P2000 FLEX pager decoder dashboard for Home Assistant — decode Dutch emergency
 
 [![Add repository to my Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fcyberjunky%2Faddon-meldkamer)
 
-![Message details with map, vehicle classification, and abbreviation tags](https://raw.githubusercontent.com/cyberjunky/addon-meldkamer/main/screenshots/message-details.png)
+![Console view: message table, map and message detail with incident timeline](https://raw.githubusercontent.com/cyberjunky/addon-meldkamer/main/screenshots/console-dark.webp)
 
 <details>
-<summary>More screenshots (Advanced, Database tabs)</summary>
+<summary>More screenshots (light theme, Wallboard, Lanes, Settings, Info)</summary>
 
-**Advanced** — receiver/device status, database stats, live charts
-![Advanced tab](https://raw.githubusercontent.com/cyberjunky/addon-meldkamer/main/screenshots/advanced.png)
+**Console, light theme** — follows Home Assistant's light/dark mode
+![Console view in the light theme](https://raw.githubusercontent.com/cyberjunky/addon-meldkamer/main/screenshots/console-light.webp)
 
-**Database** — guided setup for reference data, auto-managed tables
-![Database tab](https://raw.githubusercontent.com/cyberjunky/addon-meldkamer/main/screenshots/database.png)
+**Wallboard** — large map, live counts, incidents by priority and a ticker of the newest messages
+![Wallboard view](https://raw.githubusercontent.com/cyberjunky/addon-meldkamer/main/screenshots/wallboard.webp)
+
+**Wallboard with a message selected** — the detail floats in the map's corner
+![Wallboard view with the message detail](https://raw.githubusercontent.com/cyberjunky/addon-meldkamer/main/screenshots/wallboard-detail.webp)
+
+**Lanes** — one column per discipline next to the map
+![Lanes view](https://raw.githubusercontent.com/cyberjunky/addon-meldkamer/main/screenshots/lanes.webp)
+
+**Settings** — reference data, tables and receiver tuning (ppm calibration)
+![Settings tab](https://raw.githubusercontent.com/cyberjunky/addon-meldkamer/main/screenshots/settings.webp)
+
+**Info** — receiver, device, database, reception quality and statistics
+![Info tab](https://raw.githubusercontent.com/cyberjunky/addon-meldkamer/main/screenshots/info.webp)
 
 </details>
+
+> The screenshots show made-up messages, capcodes and units.
 
 ## Features
 
@@ -65,11 +79,11 @@ Access via Home Assistant sidebar → Meldkamer:
   - **Wallboard** — large map with live counts, incidents sorted by priority and a ticker of the newest messages; for an always-on screen
   - **Lanes** — one column per discipline (Brandweer, Ambulance, Politie, other) next to the map
 
-  Wallboard and Lanes open the message detail in a popup. The sensor filter, sound, speech and auto-focus toggles sit in the top bar. The theme follows Home Assistant's light/dark mode; the 🌓 button switches between automatic, light and dark.
-- **Advanced Tab** — Receiver config, device info, reception quality, ppm calibration, database stats
-- **Database Tab** — Card-based data management for every table below
+  The message detail shows the full message, abbreviations, vehicle photo, incident timeline and earlier messages at the address, with Previous/Next to step through the list. Console docks it under the map; on the Wallboard and Lanes it floats in the map's corner. Drag the dividers between the panes to resize them (double-click resets). The sensor filter, sound, speech and auto-focus toggles sit in the top bar. The theme follows Home Assistant's light/dark mode; the 🌓 button switches between automatic, light and dark.
+- **Settings** — Card-based data management for every table below, and receiver tuning (ppm calibration)
+- **Info** — Receiver, device and database status, reception quality and message statistics
 
-### Database Tab
+### Settings Tab
 
 A fresh install starts with an **empty** database (aside from the built-in P2000 abbreviation dictionary and TTS/ignore-text defaults) — message parsing, badges, geocoding, and map pins all improve as you populate it. Capcodes, Places, and Streets are one-click imports that fetch live, free, public Dutch data over the internet, no API key needed:
 
@@ -161,7 +175,7 @@ To use a remote RTL-SDR via network:
 
 ### Receiver Failover
 
-With `backup_host` set, the decoder watches for FLEX frames. When the active receiver produces none for `offline_after_minutes` (or its pipeline keeps failing), it switches to the other one, and back again if that one goes quiet too. Without a backup it restarts the active receiver instead. The active receiver is shown on the Advanced tab.
+With `backup_host` set, the decoder watches for FLEX frames. When the active receiver produces none for `offline_after_minutes` (or its pipeline keeps failing), it switches to the other one, and back again if that one goes quiet too. Without a backup it restarts the active receiver instead. The active receiver is shown on the Info tab.
 
 ```yaml
 receiver:
@@ -173,11 +187,11 @@ receiver:
 
 ### ppm Calibration
 
-The Advanced tab's **ppm calibration** tries ppm values around the current one (e.g. ±30 in steps of 5, 30 seconds each) on the active receiver and keeps the one that decodes the most FLEX frames. Decoding continues while it runs. Click **Use** next to a result to save it as `ppm_correction` (or `backup_ppm_correction`) in the add-on configuration; the receiver restarts with it right away.
+The Settings tab's **ppm calibration** tries ppm values around the current one (e.g. ±30 in steps of 5, 30 seconds each) on the active receiver and keeps the one that decodes the most FLEX frames. Decoding continues while it runs. Click **Use** next to a result to save it as `ppm_correction` (or `backup_ppm_correction`) in the add-on configuration; the receiver restarts with it right away.
 
 ### Reception Quality
 
-The Advanced tab shows FLEX frames per minute for the last hour, messages per hour, bit errors fixed by error correction per frame, failed decodes and lost synchronisations. Fewer corrected bits and failed decodes mean a cleaner signal, which helps when tuning gain, ppm and the antenna. `rtl_fm` and `rx_fm` don't report an RF signal level, so none is shown.
+The Info tab shows FLEX frames per minute for the last hour, messages per hour, bit errors fixed by error correction per frame, failed decodes and lost synchronisations. Fewer corrected bits and failed decodes mean a cleaner signal, which helps when tuning gain, ppm and the antenna. `rtl_fm` and `rx_fm` don't report an RF signal level, so none is shown.
 
 ### Geocoding
 
@@ -188,7 +202,7 @@ The Advanced tab shows FLEX frames per minute for the last hour, messages per ho
 
 ### Filters
 
-Global message filters are managed live from the dashboard's **Database** tab (no restart needed) rather than the add-on config:
+Global message filters are managed live from the dashboard's **Settings** tab (no restart needed) rather than the add-on config:
 
 - **Ignore Text** — wildcard patterns (e.g. `*TESTOPROEP*`); a message is dropped if its body matches any enabled pattern. Seeded by default with `*TESTOPROEP*` and `*MOB*` (system test calls and mobilofoon checks).
 - **Ignore Capcodes** — exact capcodes to drop; a message is only dropped when **every** capcode on it is on this list (so a single ignored capcode can't kill a multi-capcode group call).
@@ -473,7 +487,7 @@ automation:
 - Home Assistant with Supervisor, on a 64-bit system (`amd64` or `aarch64`, e.g. a Raspberry Pi 4/5 running 64-bit Home Assistant OS)
 - RTL-SDR, HackRF One, or network access to rtl_tcp server
 - For zone filters, `distance_km`, events, announcements and health sensors: the add-on's Home Assistant API access (enabled by default)
-- Home Assistant 2026.9 or newer is recommended: the dashboard map loads its OpenStreetMap tiles through Home Assistant's built-in map tile proxy (older versions fall back to fetching tiles from OpenStreetMap via the add-on)
+- Home Assistant 2026.9 or newer: the dashboard map loads its OpenStreetMap tiles through Home Assistant's built-in map tile proxy
 
 ## Credits
 

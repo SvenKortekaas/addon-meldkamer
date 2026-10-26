@@ -104,6 +104,18 @@ class HAClient:
             return False
         return True
 
+    async def get_map_tile(self, z: int, x: int, y: int) -> bytes:
+        """An OpenStreetMap raster tile from Home Assistant's map_tiles proxy."""
+        try:
+            session = await self._get_session()
+            async with session.get(f"{CORE_API_URL}/map_tiles/raster/{z}/{x}/{y}.png") as resp:
+                status, body = resp.status, await resp.read()
+        except Exception as e:
+            raise HAClientError(f"{type(e).__name__}: {e}") from e
+        if status != 200:
+            raise HAClientError(f"HA API error {status} for map tile {z}/{x}/{y}")
+        return body
+
     async def get_addon_options(self) -> dict[str, Any]:
         """Read this add-on's options from the Supervisor."""
         status, body = await self._request("GET", f"{SUPERVISOR_URL}/addons/self/info")

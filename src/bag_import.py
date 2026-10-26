@@ -12,14 +12,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-# Import city abbreviations from local lookup table
-try:
-    from .city_abbreviations import get_abbreviation
-except ImportError:
-
-    def get_abbreviation(city: str) -> str:
-        return ""
-
+from .city_abbreviations import get_abbreviation
 
 logger = logging.getLogger(__name__)
 

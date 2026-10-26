@@ -6,6 +6,7 @@ import logging
 import time
 from collections.abc import Callable
 
+from . import abbreviation_import
 from .config import Config
 from .database import Database
 from .geocoding import Geocoder
@@ -53,6 +54,12 @@ class MessageProcessor:
         # New message, and a repeat of an earlier one (webui / TCP broadcast)
         self.on_message: Callable[[P2000Message], None] | None = None
         self.on_repeat: Callable[[P2000Message], None] | None = None
+
+        # Seed the built-in P2000 abbreviation dictionary (only new codes, a
+        # user's own edits to an existing abbreviation are kept)
+        imported = abbreviation_import.import_abbreviations(database, replace=False)
+        if imported:
+            logger.info(f"Seeded {imported} default abbreviation(s) into database")
 
         # Seed default global ignore filters into database (only new ones, won't overwrite)
         imported = database.import_ignore_text(DEFAULT_IGNORE_TEXT)
