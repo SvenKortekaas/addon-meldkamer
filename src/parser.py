@@ -66,6 +66,10 @@ class Parser:
         # Body may itself contain '|' characters - rejoin everything after part 6
         body = "|".join(parts[6:]).strip()
 
+        if not body:
+            logger.debug(f"Skipping empty FLEX message: {line[:50]}")
+            return None
+
         capcodes = [c.strip() for c in capcodes_str.split() if c.strip()]
 
         logger.debug(f"FLEX: capcodes={capcodes}, body={body[:50]}...")
@@ -196,7 +200,7 @@ class Parser:
             "nhn",
             "hgl",
         }
-        words = text.replace("'", "").split()
+        words = text.split()
         for i in range(len(words) - 1, max(0, len(words) - 8), -1):
             word = words[i]
             if re.match(r"^\d+$", word):  # Skip pure numbers (capcodes)
@@ -206,35 +210,31 @@ class Parser:
             if word.lower() in skip_city_words:
                 continue
             # Check if this word is a known city in our database
-            if self.database.check_city(word):
+            city_name = self.database.find_city_name(word)
+            if city_name:
                 # Before accepting, check if preceding words form a multi-word city
                 # e.g., "Koog aan de Zaan" instead of just "Zaan"
-                multi_word_city = None
+                start = i
                 for j in range(max(0, i - 4), i):
-                    candidate = " ".join(words[j : i + 1])
-                    if self.database.check_city(candidate):
-                        multi_word_city = candidate
+                    candidate = self.database.find_city_name(" ".join(words[j : i + 1]))
+                    if candidate:
+                        city_name, start = candidate, j
                         break
 
-                if multi_word_city:
-                    found_city = multi_word_city
-                    msg.city = multi_word_city
-                    search_text = text.replace(multi_word_city, " ", 1)
-                    excluded_words.extend(words[j : i + 1])
-                    logger.debug(f"Multi-word city found: {multi_word_city}")
-                else:
-                    found_city = word
-                    msg.city = word
-                    search_text = text.replace(word, " ", 1)
-                    excluded_words.append(word)
-                    logger.debug(f"City found at end of message: {word}")
+                found_city = city_name
+                msg.city = city_name
+                # Remove the matched tokens (not the first substring hit, which
+                # could be inside a street name like "Delftweg")
+                search_text = " ".join(words[:start] + words[i + 1 :])
+                excluded_words.extend(words[start : i + 1])
+                logger.debug(f"City found at end of message: {city_name}")
                 break
             # Check if this is a city abbreviation (e.g., OEGSTG -> Oegstgeest)
             expanded_city = get_city_from_abbreviation(word)
             if expanded_city:
                 found_city = expanded_city
                 msg.city = expanded_city
-                search_text = text.replace(word, " ", 1)
+                search_text = " ".join(words[:i] + words[i + 1 :])
                 excluded_words.append(word)
                 msg.speakable_body = self._speakable_city_replace(msg.speakable_body, word, expanded_city)
                 logger.debug(f"City abbreviation expanded: {word} -> {expanded_city}")
