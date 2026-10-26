@@ -1,4 +1,4 @@
-"""Home Assistant REST API client for sensor updates."""
+"""Home Assistant and Supervisor REST API client."""
 
 import logging
 import os
@@ -8,17 +8,19 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
+SUPERVISOR_URL = "http://supervisor"
+CORE_API_URL = f"{SUPERVISOR_URL}/core/api"
+
 
 class HAClientError(Exception):
     """Home Assistant API request failed (unreachable, auth or server error)."""
 
 
 class HAClient:
-    """Publishes sensor state to Home Assistant via Supervisor REST API."""
+    """Talks to Home Assistant Core (through the Supervisor proxy) and to the Supervisor itself."""
 
     def __init__(self):
         self._token = os.environ.get("SUPERVISOR_TOKEN", "")
-        self._base_url = "http://supervisor/core/api"
         self._session: aiohttp.ClientSession | None = None
 
     @property
@@ -34,65 +36,86 @@ class HAClient:
                     "Authorization": f"Bearer {self._token}",
                     "Content-Type": "application/json",
                 },
-                timeout=aiohttp.ClientTimeout(total=10),
+                # tts.speak waits for the speech to be generated
+                timeout=aiohttp.ClientTimeout(total=30),
             )
         return self._session
 
+    async def _request(self, method: str, url: str, payload: Any = None) -> tuple[int, Any]:
+        """Send a request and return (status, parsed JSON body or text).
+
+        Raises HAClientError when Home Assistant / Supervisor can't be reached.
+        """
+        try:
+            session = await self._get_session()
+            async with session.request(method, url, json=payload) as resp:
+                if resp.content_type == "application/json":
+                    return resp.status, await resp.json()
+                return resp.status, await resp.text()
+        except Exception as e:
+            raise HAClientError(f"{type(e).__name__}: {e}") from e
+
+    async def _core(self, method: str, path: str, payload: Any = None) -> Any:
+        """Call the Core REST API, raising HAClientError on anything but a 2xx answer."""
+        status, body = await self._request(method, f"{CORE_API_URL}{path}", payload)
+        if not 200 <= status < 300:
+            raise HAClientError(f"HA API error {status} for {path}: {body}")
+        return body
+
     async def get_state(self, entity_id: str) -> dict[str, Any] | None:
-        """Get the current state of a sensor in Home Assistant.
+        """Get the current state of an entity.
 
-        Args:
-            entity_id: Sensor entity ID (without 'sensor.' prefix).
-
-        Returns the state dict, or None if the entity does not exist yet (404).
+        Returns the state dict, or None if the entity does not exist (404).
         Raises HAClientError on any other failure, so callers can tell "not
         found" apart from "Home Assistant unreachable".
         """
+        status, body = await self._request("GET", f"{CORE_API_URL}/states/{entity_id}")
+        if status == 404:
+            return None
+        if status != 200:
+            raise HAClientError(f"HA API error {status} for {entity_id}: {body}")
+        return body
+
+    async def set_state(self, entity_id: str, state: str, attributes: dict[str, Any]) -> bool:
+        """Create or update an entity's state. Returns False (and logs) on failure."""
         try:
-            session = await self._get_session()
-            url = f"{self._base_url}/states/sensor.{entity_id}"
-
-            async with session.get(url) as resp:
-                if resp.status == 404:
-                    return None
-                if resp.status == 200:
-                    return await resp.json()
-                text = await resp.text()
-                error = f"HA API error {resp.status}: {text}"
-        except Exception as e:
-            error = f"{type(e).__name__}: {e}"
-        logger.warning(f"Failed to get state for sensor.{entity_id}: {error}")
-        raise HAClientError(error)
-
-    async def update_sensor(
-        self,
-        entity_id: str,
-        state: str,
-        attributes: dict[str, Any],
-    ) -> bool:
-        """Create or update a sensor in Home Assistant.
-
-        Args:
-            entity_id: Sensor entity ID (without 'sensor.' prefix).
-            state: Sensor state value.
-            attributes: Sensor attributes dict.
-        """
-        try:
-            session = await self._get_session()
-            url = f"{self._base_url}/states/sensor.{entity_id}"
-            payload = {"state": state, "attributes": attributes}
-
-            async with session.post(url, json=payload) as resp:
-                if resp.status in (200, 201):
-                    logger.debug(f"Updated sensor: sensor.{entity_id}")
-                    return True
-                else:
-                    text = await resp.text()
-                    logger.error(f"HA API error {resp.status} for sensor.{entity_id}: {text}")
-                    return False
-        except Exception as e:
-            logger.error(f"Failed to update sensor.{entity_id}: {e}")
+            await self._core("POST", f"/states/{entity_id}", {"state": state, "attributes": attributes})
+        except HAClientError as e:
+            logger.error(f"Failed to update {entity_id}: {e}")
             return False
+        logger.debug(f"Updated {entity_id}")
+        return True
+
+    async def fire_event(self, event_type: str, data: dict[str, Any]) -> bool:
+        """Fire an event on the Home Assistant event bus. Returns False (and logs) on failure."""
+        try:
+            await self._core("POST", f"/events/{event_type}", data)
+        except HAClientError as e:
+            logger.error(f"Failed to fire {event_type}: {e}")
+            return False
+        return True
+
+    async def call_service(self, domain: str, service: str, data: dict[str, Any]) -> bool:
+        """Call a Home Assistant service. Returns False (and logs) on failure."""
+        try:
+            await self._core("POST", f"/services/{domain}/{service}", data)
+        except HAClientError as e:
+            logger.error(f"Failed to call {domain}.{service}: {e}")
+            return False
+        return True
+
+    async def get_addon_options(self) -> dict[str, Any]:
+        """Read this add-on's options from the Supervisor."""
+        status, body = await self._request("GET", f"{SUPERVISOR_URL}/addons/self/info")
+        if status != 200:
+            raise HAClientError(f"Supervisor error {status}: {body}")
+        return body["data"]["options"]
+
+    async def set_addon_options(self, options: dict[str, Any]) -> None:
+        """Replace this add-on's options (takes effect in /data/options.json immediately)."""
+        status, body = await self._request("POST", f"{SUPERVISOR_URL}/addons/self/options", {"options": options})
+        if status != 200:
+            raise HAClientError(f"Supervisor error {status}: {body}")
 
     async def close(self):
         """Close the HTTP session."""

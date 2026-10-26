@@ -39,10 +39,10 @@ class P2000Message:
     mapurl: str = ""
     location_accuracy: str = ""  # "street", "city", or empty
 
-    # Distance to the evaluating sensor's center point (km, 2 decimals; "" when not computed)
-    distance: float | str = ""
+    # Distance from Home Assistant's home zone (km, 2 decimals; None without coordinates or home zone)
+    distance_km: float | None = None
 
-    # Message type (FLEX, POCSAG, etc.)
+    # Pager protocol
     message_type: str = "FLEX"
 
     # Expanded abbreviations found in body
@@ -57,9 +57,20 @@ class P2000Message:
     # Same text as `body`, but with any city abbreviation token (e.g. "SGRAVH")
     # replaced by the resolved full city name (e.g. "'s-Gravenhage") - used for
     # TTS so speech reads the same place name shown in `city`/`address` instead
-    # of the raw abbreviation from the pager text. Falls back to `body` when
-    # no substitution was needed.
+    # of the raw abbreviation from the pager text.
     speakable_body: str = ""
+
+    # Spoken form of the message (speakable_body with the TTS replacement rules applied)
+    tts: str = ""
+
+    # Database row id, set once the message is stored
+    id: int | None = None
+
+    # Messages to the same address within the incident window share an incident id
+    incident_id: str = ""
+
+    # How often the pager network resent this exact message within the repeat window
+    repeats: int = 0
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -83,11 +94,14 @@ class P2000Message:
             "longitude": self.longitude,
             "mapurl": self.mapurl,
             "location_accuracy": self.location_accuracy,
-            "distance": self.distance,
+            "distance_km": self.distance_km,
             "message_type": self.message_type,
             "abbreviations": self.abbreviations,
             "vehicle_category": self.vehicle_category,
             "vehicle_number": self.vehicle_number,
             "vehicle_icon": self.vehicle_icon,
-            "speakable_body": self.speakable_body or self.body,
+            "tts": self.tts,
+            "id": self.id,
+            "incident_id": self.incident_id,
+            "repeats": self.repeats,
         }

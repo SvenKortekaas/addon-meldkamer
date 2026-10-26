@@ -11,7 +11,7 @@ import shutil
 import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -136,7 +136,10 @@ class Database:
         latitude REAL,
         longitude REAL,
         receivers TEXT,
-        remarks TEXT
+        remarks TEXT,
+        distance_km REAL,
+        incident_id TEXT,
+        repeats INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
     CREATE INDEX IF NOT EXISTS idx_messages_city ON messages(city);
@@ -386,6 +389,10 @@ class Database:
                 ("places", "longitude", "REAL"),
                 # Streets table migrations
                 ("streets", "postalcode", "TEXT"),
+                # Messages table migrations
+                ("messages", "distance_km", "REAL"),
+                ("messages", "incident_id", "TEXT"),
+                ("messages", "repeats", "INTEGER NOT NULL DEFAULT 0"),
             ]
 
             for table, column, col_type in migrations:
@@ -399,6 +406,8 @@ class Database:
                     except sqlite3.OperationalError as e:
                         logger.warning(f"Could not add column {column} to {table}: {e}")
 
+            # Indexes on migrated columns (SCHEMA runs before the columns exist on upgrades)
+            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_incident ON messages(incident_id)")
             self._commit()
 
             # SQLite cannot ADD COLUMN a PRIMARY KEY - rebuild legacy tables
@@ -586,10 +595,6 @@ class Database:
             return None
         cache = self._get_text_cache("places", "places", self._build_places_cache)
         return cache["by_normalized"].get(self.normalize_city(city))
-
-    def check_city(self, city: str) -> bool:
-        """Check if city is a known place (exact, case/apostrophe-insensitive match)."""
-        return self.find_city_name(city) is not None
 
     def get_place_coordinates(self, city: str) -> dict[str, float] | None:
         """Get approximate coordinates for a city from the places table."""
@@ -1420,50 +1425,82 @@ class Database:
     # Message History
     # =====================
 
-    def save_message(self, msg) -> int:
-        """Save a message to the database. Returns message id."""
+    def save_message(self, msg) -> int | None:
+        """Save a P2000Message to the database. Returns the new row id, None on failure."""
         try:
-            capcodes_json = json.dumps(msg.capcodes) if hasattr(msg, "capcodes") and msg.capcodes else "[]"
-            # receivers is already a ", "-joined string - store it as-is
-            receivers = getattr(msg, "receivers", "") or ""
-            timestamp = getattr(msg, "timestamp", None)
-            if isinstance(timestamp, datetime):
-                # Store as ISO string; passing datetime objects straight to
-                # sqlite3 is deprecated on Python 3.12+
-                timestamp = timestamp.isoformat()
-
             self.cursor.execute(
                 """
                 INSERT INTO messages (
                     timestamp, body, raw_message, capcodes, group_id, message_type,
                     priority, discipline, region, city, street, address,
-                    latitude, longitude, receivers, remarks
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    latitude, longitude, receivers, remarks, distance_km, incident_id, repeats
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
-                    timestamp,
-                    getattr(msg, "body", ""),
-                    getattr(msg, "raw_message", ""),
-                    capcodes_json,
-                    getattr(msg, "group_id", None),
-                    getattr(msg, "message_type", None),
-                    getattr(msg, "priority", None),
-                    getattr(msg, "discipline", None),
-                    getattr(msg, "region", None),
-                    getattr(msg, "city", None),
-                    getattr(msg, "street", None),
-                    getattr(msg, "address", None),
-                    getattr(msg, "latitude", None),
-                    getattr(msg, "longitude", None),
-                    receivers,
-                    getattr(msg, "remarks", None),
+                    # Stored as ISO string; passing datetime objects straight to
+                    # sqlite3 is deprecated on Python 3.12+
+                    msg.timestamp.isoformat(),
+                    msg.body,
+                    msg.raw_message,
+                    json.dumps(msg.capcodes),
+                    msg.group_id,
+                    msg.message_type,
+                    msg.priority,
+                    msg.discipline,
+                    msg.region,
+                    msg.city,
+                    msg.street,
+                    msg.address,
+                    msg.latitude,
+                    msg.longitude,
+                    msg.receivers,
+                    msg.remarks,
+                    msg.distance_km,
+                    msg.incident_id or None,
+                    msg.repeats,
                 ),
             )
             self._commit()
             return self.cursor.lastrowid
         except Exception as e:
             logger.error(f"Failed to save message: {e}")
-            return -1
+            return None
+
+    def set_message_repeats(self, message_id: int, repeats: int) -> None:
+        """Store how often a message was resent."""
+        self.cursor.execute("UPDATE messages SET repeats = ? WHERE id = ?", (repeats, message_id))
+        self._commit()
+
+    def get_messages_since(self, seconds: int) -> list[dict[str, Any]]:
+        """Messages received in the last `seconds`, oldest first."""
+        since = (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
+        self.cursor.execute(
+            "SELECT * FROM messages WHERE julianday(timestamp) >= julianday(?) ORDER BY julianday(timestamp)",
+            (since,),
+        )
+        return [self._message_row_to_dict(row) for row in self.cursor.fetchall()]
+
+    def get_incident_messages(self, incident_id: str) -> list[dict[str, Any]]:
+        """All messages of one incident, oldest first."""
+        self.cursor.execute(
+            "SELECT * FROM messages WHERE incident_id = ? ORDER BY julianday(timestamp)", (incident_id,)
+        )
+        return [self._message_row_to_dict(row) for row in self.cursor.fetchall()]
+
+    def get_map_points(self, hours: int, limit: int = 20000) -> list[dict[str, Any]]:
+        """Located messages of the last `hours`, oldest first, for the map history layer."""
+        since = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+        self.cursor.execute(
+            """
+            SELECT CAST(strftime('%s', timestamp) AS INTEGER) AS time, latitude, longitude, priority
+            FROM messages
+            WHERE latitude IS NOT NULL AND longitude IS NOT NULL AND julianday(timestamp) >= julianday(?)
+            ORDER BY julianday(timestamp) DESC
+            LIMIT ?
+            """,
+            (since, limit),
+        )
+        return [dict(row) for row in reversed(self.cursor.fetchall())]
 
     def get_recent_messages(self, limit: int = 100) -> list[dict[str, Any]]:
         """Get recent messages from the database (same shape as _message_row_to_dict)."""
@@ -1485,14 +1522,6 @@ class Database:
         """Get total number of stored messages."""
         try:
             self.cursor.execute("SELECT COUNT(*) FROM messages")
-            return self.cursor.fetchone()[0]
-        except sqlite3.Error:
-            return 0
-
-    def get_unique_regions(self) -> int:
-        """Get count of unique regions from messages."""
-        try:
-            self.cursor.execute("SELECT COUNT(DISTINCT region) FROM messages WHERE region IS NOT NULL")
             return self.cursor.fetchone()[0]
         except sqlite3.Error:
             return 0

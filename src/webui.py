@@ -7,7 +7,6 @@ import logging
 import os
 import time
 from collections import deque
-from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -15,8 +14,12 @@ import aiohttp
 from aiohttp import web
 
 from .database import Database
+from .decoder import Decoder
+from .ha_client import HAClientError
 from .message import P2000Message
-from .sensor_manager import SensorConfig, SensorManager
+from .processor import MessageProcessor
+from .sensor_manager import SensorManager
+from .tts import SpeechRules
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +33,7 @@ MAX_PHOTO_SIZE = 5 * 1024 * 1024
 MAX_FORM_FIELD_SIZE = 4 * 1024
 PHOTO_MIME_TYPES = ("image/jpeg", "image/png", "image/webp", "image/gif")
 
-ADDON_VERSION = "1.0.0"
+ADDON_VERSION = "1.1.0"
 
 # Home Assistant core (2026.9+) proxies OpenStreetMap raster tiles itself via
 # its built-in map_tiles integration, identifying the requests the way OSM's
@@ -109,6 +112,14 @@ class _DictMessageView:
         return self._data.get(name)
 
 
+# Statistics kept across restarts in the stats file
+PERSISTED_STATS = ("total_messages", "by_region", "by_discipline", "start_time")
+
+# ppm calibration request limits
+CALIBRATION_MAX_SPAN = 100
+CALIBRATION_MAX_STEPS = 41
+
+
 def _float_or_none(value) -> float | None:
     """Convert a form value to float, or None when empty/invalid."""
     if value is None or value == "":
@@ -127,13 +138,23 @@ def get_stats_file() -> Path:
 class WebUI:
     """Web UI server for Meldkamer addon ingress with map support."""
 
-    def __init__(self, port: int = 8099, database: Database | None = None):
+    def __init__(
+        self,
+        port: int,
+        database: Database,
+        speech: SpeechRules,
+        processor: MessageProcessor,
+        decoder: Decoder,
+        sensor_manager: SensorManager,
+    ):
         self.port = port
         self.database = database
+        self.speech = speech
+        self.processor = processor
+        self.decoder = decoder
+        self.sensor_manager = sensor_manager
         self.app = web.Application(client_max_size=MAX_REQUEST_SIZE)
         self.messages: deque = deque(maxlen=MAX_MESSAGES)
-        self.sensors: list[SensorConfig] = []
-        self._sensor_manager: SensorManager | None = None
         self.stats_file = get_stats_file()
         self.stats = self._load_stats()
         self._last_stats_save = 0.0
@@ -143,78 +164,39 @@ class WebUI:
         self._supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
         # Cleared once core answers 404, i.e. it predates the map_tiles proxy
         self._ha_map_tiles = bool(self._supervisor_token)
-        # Optional callback (wired to decoder.reload_tts_replacements) so TTS
-        # edits apply immediately instead of after a restart
-        self.on_tts_changed: Callable[[], None] | None = None
-        # Optional callback (wired to decoder.reload_ignore_filters) so filter
-        # edits apply immediately instead of after a restart
-        self.on_ignore_changed: Callable[[], None] | None = None
 
     def _tts_changed(self) -> None:
-        """Notify listeners that TTS replacement rules changed."""
-        if self.on_tts_changed:
-            try:
-                self.on_tts_changed()
-            except Exception as e:
-                logger.warning(f"on_tts_changed callback failed: {e}")
+        """Apply edited TTS replacement rules right away."""
+        self.speech.reload()
 
     def _ignore_changed(self) -> None:
-        """Notify listeners that global ignore filters changed."""
-        if self.on_ignore_changed:
-            try:
-                self.on_ignore_changed()
-            except Exception as e:
-                logger.warning(f"on_ignore_changed callback failed: {e}")
+        """Apply edited global ignore filters right away."""
+        self.processor.reload_ignore_filters()
 
     def _load_stats(self) -> dict:
         """Load stats from file/database and restore message history."""
-        current_time = datetime.now(UTC).isoformat()
+        db_messages = self.database.get_recent_messages(MAX_MESSAGES)
+        self.messages.extend(db_messages)
+        logger.info(f"Loaded {len(db_messages)} messages from database")
 
-        # Load previous messages from database
-        if self.database:
-            try:
-                db_messages = self.database.get_recent_messages(MAX_MESSAGES)
-                for msg in db_messages:
-                    self.messages.append(msg)
-                logger.info(f"Loaded {len(db_messages)} messages from database")
-            except Exception as e:
-                logger.warning(f"Failed to load messages from database: {e}")
-
-        # Try to load stats from file first (for by_region, by_discipline)
+        stats = {"by_region": {}, "by_discipline": {}, "start_time": datetime.now(UTC).isoformat()}
         if self.stats_file.exists():
             try:
                 with open(self.stats_file) as f:
-                    stats = json.load(f)
-                    # Keep the persisted start_time so uptime survives restarts
-                    stats.setdefault("start_time", current_time)
-                    stats["decoder_running"] = False
-                    # Use database message count as source of truth
-                    if self.database:
-                        stats["total_messages"] = self.database.get_message_count()
-                    logger.info(f"Loaded stats: {stats['total_messages']} messages")
-                    return stats
+                    saved = json.load(f)
+                # Keep the persisted start_time so uptime survives restarts
+                stats.update({key: saved[key] for key in PERSISTED_STATS if key in saved})
             except Exception as e:
                 logger.warning(f"Failed to load stats: {e}")
-
-        # Default stats - use database counts if available
-        total = 0
-        if self.database:
-            total = self.database.get_message_count()
-
-        return {
-            "total_messages": total,
-            "by_region": {},
-            "by_discipline": {},
-            "start_time": current_time,
-            "decoder_running": False,
-            "network_name": "P2000 FLEX",
-        }
+        # The database message count is the source of truth
+        stats["total_messages"] = self.database.get_message_count()
+        return stats
 
     def _save_stats(self) -> None:
         """Save stats to file."""
         try:
             with open(self.stats_file, "w") as f:
-                json.dump(self.stats, f)
+                json.dump({key: self.stats[key] for key in PERSISTED_STATS}, f)
             self._last_stats_save = time.monotonic()
         except Exception as e:
             logger.warning(f"Failed to save stats: {e}")
@@ -233,6 +215,14 @@ class WebUI:
         self.app.router.add_get("/api/stream", self._handle_stream)
         self.app.router.add_get("/api/history/{location}", self._handle_history)
         self.app.router.add_get("/api/map-tiles/{z:[0-9]+}/{x:[0-9]+}/{y:[0-9]+}.png", self._handle_map_tile)
+        self.app.router.add_get("/api/map-history", self._handle_map_history)
+        self.app.router.add_get("/api/incident/{incident_id}", self._handle_incident)
+
+        # Receiver quality and ppm calibration
+        self.app.router.add_get("/api/receiver", self._handle_receiver)
+        self.app.router.add_post("/api/calibration", self._handle_start_calibration)
+        self.app.router.add_delete("/api/calibration", self._handle_cancel_calibration)
+        self.app.router.add_post("/api/calibration/apply", self._handle_apply_ppm)
 
         # Database management API
         self.app.router.add_get("/api/db/capcodes", self._handle_list_capcodes)
@@ -330,18 +320,9 @@ class WebUI:
             self._runner = None
 
     def add_message(self, msg: P2000Message) -> None:
-        """Add a P2000 message and update stats."""
-        logger.debug("WebUI received message")
-        msg_dict = msg.to_dict()
-        self.messages.appendleft(msg_dict)
+        """Add a new (already stored) P2000 message and update stats."""
+        self.messages.appendleft(msg.to_dict())
         self.stats["total_messages"] += 1
-
-        # Save to database for persistent history
-        if self.database:
-            try:
-                self.database.save_message(msg)  # Pass message object, not dict
-            except Exception as e:
-                logger.error(f"Failed to save message to database: {e}")
 
         # Track by region and discipline (split multi-discipline combos so each
         # discipline is counted individually instead of as a combined key)
@@ -351,55 +332,47 @@ class WebUI:
         for discipline in disciplines:
             self.stats["by_discipline"][discipline] = self.stats["by_discipline"].get(discipline, 0) + 1
 
-        logger.debug(f"WebUI now has {len(self.messages)} messages, total={self.stats['total_messages']}")
         self._save_stats_throttled()
 
-    def update_status(self, decoder_running: bool) -> None:
-        """Update system status."""
-        self.stats["decoder_running"] = decoder_running
+    def mark_repeat(self, msg: P2000Message) -> None:
+        """The pager network resent a message: update its repeat count."""
+        for item in self.messages:
+            if item.get("id") == msg.id:
+                item["repeats"] = msg.repeats
+                return
 
-    def set_decoder_error(self, message: str) -> None:
-        """Set or clear the last decoder error for display in the UI."""
-        self.stats["decoder_error"] = message
-
-    def set_geocoder_info(self, configured: bool, enabled: bool, rate_remaining, rate_limited: bool) -> None:
-        """Set geocoding status for the Advanced tab."""
-        self.stats["geocoding_configured"] = configured
-        self.stats["geocoding_enabled"] = enabled
-        self.stats["geocode_rate_remaining"] = rate_remaining
-        self.stats["geocode_rate_limited"] = rate_limited
-
-    def set_network_name(self, name: str) -> None:
-        """Set the active network name for display."""
-        self.stats["network_name"] = name
-
-    def set_config(self, frequency: str, sample_rate: int, decoder: str) -> None:
-        """Set receiver configuration for Advanced tab display."""
-        self.stats["frequency"] = frequency
-        self.stats["sample_rate"] = sample_rate
-        self.stats["decoder"] = decoder
-
-    def set_device_info(self, device_type: str, driver: str) -> None:
-        """Set device info for Advanced tab display."""
-        self.stats["device_type"] = device_type
-        self.stats["device_driver"] = driver
-
-    def set_sensors(self, sensors: list[SensorConfig]) -> None:
-        """Set configured sensors that have a geographic radius, drawn as map overlays."""
-        self.sensors = sensors
-        self._sensor_manager = SensorManager(sensors) if sensors else None
-        zones = [
-            {
-                "name": s.name,
-                "icon": s.icon,
-                "radius_km": s.filters.radius_km,
-                "center_lat": s.filters.center_lat,
-                "center_lon": s.filters.center_lon,
-            }
-            for s in sensors
-            if s.filters.radius_km is not None and s.filters.center_lat is not None and s.filters.center_lon is not None
-        ]
-        self.stats["sensor_zones"] = zones
+    def _stats_payload(self) -> dict:
+        """Stats plus the live receiver/decoder state, for the dashboard."""
+        decoder = self.decoder
+        geocoder = self.processor.geocoder
+        config = decoder.config
+        return {
+            **self.stats,
+            "network_name": config.network_name,
+            "frequency": config.frequency,
+            "sample_rate": config.sample_rate,
+            "decoder": config.decoder,
+            "decoder_running": decoder.is_running,
+            "decoder_error": decoder.last_error,
+            "receiver_online": decoder.stats.online(config.offline_after_minutes),
+            "receiver_source": decoder.source.label,
+            "device_type": decoder.device_type,
+            "device_driver": decoder.device_driver,
+            "geocoding_configured": config.opencage_enabled,
+            "geocoding_enabled": geocoder.enabled,
+            "geocode_rate_remaining": geocoder.rate_remaining,
+            "geocode_rate_limited": geocoder.rate_limited,
+            "sensor_zones": [
+                {
+                    "name": s.name,
+                    "radius_km": s.zone.radius_km,
+                    "center_lat": s.zone.latitude,
+                    "center_lon": s.zone.longitude,
+                }
+                for s in self.sensor_manager.sensors
+                if s.zone
+            ],
+        }
 
     def update_db_stats(self, places: int, streets: int, capcodes: int, texts: int, geocodes: int) -> None:
         """Update database statistics for Advanced tab."""
@@ -425,8 +398,6 @@ class WebUI:
         spoed" to "zonder spoed") is reflected immediately on already-received
         messages, not just newly-decoded ones.
         """
-        if not self.database:
-            return messages
         result = []
         for m in messages:
             body = m.get("body")
@@ -443,41 +414,26 @@ class WebUI:
         re-implementing that logic in JS - keeps "what counts as a match" identical
         to what the HA/MQTT sensor publishing path uses.
         """
-        if not sensor_name or not self._sensor_manager:
+        manager = self.sensor_manager
+        if not sensor_name:
             return messages
         if sensor_name == "__any__":
-            return [m for m in messages if self._sensor_manager.get_matching_sensors(_DictMessageView(m))]
-        sensor = next((s for s in self.sensors if s.name == sensor_name), None)
+            return [m for m in messages if manager.get_matching_sensors(_DictMessageView(m))]
+        sensor = next((s for s in manager.sensors if s.name == sensor_name), None)
         if not sensor:
             return messages
-        return [m for m in messages if self._sensor_manager._message_matches_filters(_DictMessageView(m), sensor)]
+        return [m for m in messages if manager.matches(_DictMessageView(m), sensor)]
 
     async def _handle_sensors(self, request: web.Request) -> web.Response:
         """List configured sensors, for the dashboard's filter toggle."""
-        return web.json_response([{"name": s.name, "icon": s.icon} for s in self.sensors])
+        return web.json_response([{"name": s.name, "icon": s.icon} for s in self.sensor_manager.sensors])
 
     async def _handle_messages(self, request: web.Request) -> web.Response:
         messages = self._filter_by_sensor(list(self.messages), request.query.get("sensor", ""))
         return web.json_response(self._with_fresh_abbreviations(messages))
 
     async def _handle_stats(self, request: web.Request) -> web.Response:
-        stats = self.stats.copy()
-        # Add database-sourced unique counts (disciplines may be stored as
-        # ", "-joined combos - count each individual discipline)
-        if self.database:
-            stats["unique_regions"] = self.database.get_unique_regions()
-            try:
-                self.database.cursor.execute("SELECT DISTINCT discipline FROM messages WHERE discipline IS NOT NULL")
-                unique = set()
-                for (value,) in self.database.cursor.fetchall():
-                    unique.update(d.strip() for d in value.split(",") if d.strip())
-                stats["unique_disciplines"] = len(unique)
-            except Exception:
-                stats["unique_disciplines"] = len(stats.get("by_discipline", {}))
-        else:
-            stats["unique_regions"] = len(stats.get("by_region", {}))
-            stats["unique_disciplines"] = len(stats.get("by_discipline", {}))
-        return web.json_response(stats)
+        return web.json_response(self._stats_payload())
 
     async def _handle_stream(self, request: web.Request) -> web.StreamResponse:
         response = web.StreamResponse()
@@ -489,7 +445,7 @@ class WebUI:
         try:
             while True:
                 latest = self._filter_by_sensor(list(self.messages), sensor_name)[:50]
-                data = json.dumps({"stats": self.stats, "latest": self._with_fresh_abbreviations(latest)})
+                data = json.dumps({"stats": self._stats_payload(), "latest": self._with_fresh_abbreviations(latest)})
                 # Only push when something changed; the client recomputes
                 # uptime locally so idle periods need no traffic
                 if data != last_sent:
@@ -504,15 +460,70 @@ class WebUI:
         """Get message history for a location (address or city)."""
         location = request.match_info.get("location", "")
         limit = _int_param(request, "limit", 20, maximum=100)
-        if self.database:
-            history = self.database.get_history_by_address(location, limit=limit)
-            if not history:
-                # Fall back to a broader search across body/street/city
-                result = self.database.list_messages(page=1, per_page=limit, search=location)
-                history = result.get("items", [])
-        else:
-            history = [m for m in self.messages if location.lower() in m.get("address", "").lower()]
+        history = self.database.get_history_by_address(location, limit=limit)
+        if not history:
+            # Nothing at this exact address: search body/street/city instead
+            history = self.database.list_messages(page=1, per_page=limit, search=location)["items"]
         return web.json_response(history[:limit])
+
+    async def _handle_incident(self, request: web.Request) -> web.Response:
+        """All messages of one incident, oldest first."""
+        return web.json_response(self.database.get_incident_messages(request.match_info["incident_id"]))
+
+    async def _handle_map_history(self, request: web.Request) -> web.Response:
+        """Located messages of the last `hours` hours, for the map's history layer."""
+        hours = _int_param(request, "hours", 24, maximum=24 * 365)
+        return web.json_response(self.database.get_map_points(hours))
+
+    async def _handle_receiver(self, request: web.Request) -> web.Response:
+        """Receiver decode quality per minute and the ppm calibration state."""
+        decoder = self.decoder
+        return web.json_response(
+            {
+                **decoder.stats.snapshot(),
+                "offline_after_minutes": decoder.config.offline_after_minutes,
+                "sources": [
+                    {"label": s.label, "type": s.receiver_type, "ppm": s.ppm, "active": s is decoder.source}
+                    for s in decoder.sources
+                ],
+                "ppm": decoder.ppm,
+                "calibration": decoder.calibration,
+                "can_apply": bool(self._supervisor_token),
+            }
+        )
+
+    async def _handle_start_calibration(self, request: web.Request) -> web.Response:
+        data = await _json_object(request)
+        try:
+            span = int(data.get("span", 30))
+            step = int(data.get("step", 5))
+            dwell = int(data.get("dwell", 30))
+        except (TypeError, ValueError):
+            raise _bad_request("span, step and dwell must be integers") from None
+        if not (1 <= step <= span <= CALIBRATION_MAX_SPAN) or 2 * span // step + 1 > CALIBRATION_MAX_STEPS:
+            raise _bad_request(f"Use a step of at least 1 and at most {CALIBRATION_MAX_STEPS} ppm values to try")
+        if not 10 <= dwell <= 600:
+            raise _bad_request("dwell must be 10-600 seconds")
+        try:
+            self.decoder.start_calibration(span, step, dwell)
+        except RuntimeError as e:
+            raise _bad_request(str(e)) from None
+        return web.json_response({"success": True})
+
+    async def _handle_cancel_calibration(self, request: web.Request) -> web.Response:
+        await self.decoder.cancel_calibration()
+        return web.json_response({"success": True})
+
+    async def _handle_apply_ppm(self, request: web.Request) -> web.Response:
+        data = await _json_object(request)
+        ppm = data.get("ppm")
+        if isinstance(ppm, bool) or not isinstance(ppm, int):
+            raise _bad_request("ppm must be an integer")
+        try:
+            await self.decoder.apply_ppm(ppm)
+        except (RuntimeError, HAClientError) as e:
+            return web.json_response({"error": f"Could not save ppm_correction: {e}"}, status=500)
+        return web.json_response({"success": True})
 
     # =========================================================================
     # Database Management API Handlers
@@ -520,8 +531,6 @@ class WebUI:
 
     async def _handle_list_capcodes(self, request: web.Request) -> web.Response:
         """List capcodes with pagination and search."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
         page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
         search = request.query.get("search", "")
@@ -530,8 +539,6 @@ class WebUI:
 
     async def _handle_add_capcode(self, request: web.Request) -> web.Response:
         """Add a new capcode."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
         data = await _json_object(request)
         success = self.database.add_capcode(
             data.get("capcode", ""),
@@ -547,8 +554,6 @@ class WebUI:
 
     async def _handle_update_capcode(self, request: web.Request) -> web.Response:
         """Update a capcode."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
         capcode = request.match_info.get("capcode", "")
         data = await _json_object(request)
         success = self.database.update_capcode(
@@ -563,16 +568,12 @@ class WebUI:
 
     async def _handle_delete_capcode(self, request: web.Request) -> web.Response:
         """Delete a capcode."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
         capcode = request.match_info.get("capcode", "")
         success = self.database.delete_capcode(capcode)
         return web.json_response({"success": success})
 
     async def _handle_list_places(self, request: web.Request) -> web.Response:
         """List places with pagination and search."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
         page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
         search = request.query.get("search", "")
@@ -581,8 +582,6 @@ class WebUI:
 
     async def _handle_add_place(self, request: web.Request) -> web.Response:
         """Add a new place."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
         data = await _json_object(request)
         success = self.database.add_place(
             data.get("city", ""),
@@ -597,8 +596,6 @@ class WebUI:
 
     async def _handle_update_place(self, request: web.Request) -> web.Response:
         """Update a place."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
         try:
             place_id = int(request.match_info.get("id", 0))
         except (TypeError, ValueError):
@@ -616,8 +613,6 @@ class WebUI:
 
     async def _handle_delete_place(self, request: web.Request) -> web.Response:
         """Delete a place."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
         try:
             place_id = int(request.match_info.get("id", 0))
         except (TypeError, ValueError):
@@ -627,8 +622,6 @@ class WebUI:
 
     async def _handle_list_streets(self, request: web.Request) -> web.Response:
         """List streets with pagination and search."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
         page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
         search = request.query.get("search", "")
@@ -642,8 +635,6 @@ class WebUI:
 
     async def _handle_add_street(self, request: web.Request) -> web.Response:
         """Add a new street."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
         data = await _json_object(request)
         success = self.database.add_street(
             data.get("street", ""), _city_id(data.get("city_id")), data.get("postalcode", "")
@@ -654,8 +645,6 @@ class WebUI:
 
     async def _handle_update_street(self, request: web.Request) -> web.Response:
         """Update a street."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
         try:
             street_id = int(request.match_info.get("id", 0))
         except (TypeError, ValueError):
@@ -668,8 +657,6 @@ class WebUI:
 
     async def _handle_delete_street(self, request: web.Request) -> web.Response:
         """Delete a street."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
         try:
             street_id = int(request.match_info.get("id", 0))
         except (TypeError, ValueError):
@@ -679,8 +666,6 @@ class WebUI:
 
     async def _handle_list_geocodes(self, request: web.Request) -> web.Response:
         """List cached geocodes with pagination and search."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
         page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
         search = request.query.get("search", "")
@@ -689,23 +674,17 @@ class WebUI:
 
     async def _handle_delete_geocode(self, request: web.Request) -> web.Response:
         """Delete a cached geocode."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
         query = request.match_info.get("query", "")
         success = self.database.delete_geocode(query)
         return web.json_response({"success": success})
 
     async def _handle_delete_all_geocodes(self, request: web.Request) -> web.Response:
         """Delete all cached geocodes."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
         count = self.database.delete_all_geocodes()
         return web.json_response({"success": True, "deleted": count})
 
     async def _handle_export_csv(self, request: web.Request) -> web.Response:
         """Export a table to CSV."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
         table = request.match_info.get("table", "")
 
         exporters = {
@@ -730,8 +709,6 @@ class WebUI:
 
     async def _handle_import_csv(self, request: web.Request) -> web.Response:
         """Import CSV data to a table."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
         table = request.match_info.get("table", "")
 
         data = await _json_object(request)
@@ -771,8 +748,6 @@ class WebUI:
 
     async def _handle_import_province(self, request: web.Request) -> web.Response:
         """Start BAG import for a specific Dutch province in background thread."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
 
         province = request.match_info.get("province", "")
 
@@ -803,8 +778,6 @@ class WebUI:
 
     async def _handle_import_all_places(self, request: web.Request) -> web.Response:
         """Import ALL Dutch woonplaatsen (places) into database."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
 
         import threading
 
@@ -841,8 +814,6 @@ class WebUI:
 
     async def _handle_import_bommel(self, request: web.Request) -> web.Response:
         """Start capcode import from bommel.net in background thread."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
 
         import threading
 
@@ -884,8 +855,6 @@ class WebUI:
 
     async def _handle_list_messages(self, request: web.Request) -> web.Response:
         """List messages with pagination and search."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
 
         page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
@@ -900,8 +869,6 @@ class WebUI:
 
     async def _handle_delete_message(self, request: web.Request) -> web.Response:
         """Delete a single message."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
 
         try:
             message_id = int(request.match_info["id"])
@@ -915,8 +882,6 @@ class WebUI:
 
     async def _handle_delete_all_messages(self, request: web.Request) -> web.Response:
         """Delete all messages."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
 
         count = self.database.delete_all_messages()
         # Clear in-memory cache and counters so the dashboard reflects the wipe
@@ -940,8 +905,6 @@ class WebUI:
 
     async def _handle_clear_table(self, request: web.Request) -> web.Response:
         """Delete all rows from a single table (whitelisted in database.clear_table)."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
         table = request.match_info.get("table", "")
         if busy := self._import_running():
             return web.json_response({"error": busy}, status=409)
@@ -963,8 +926,6 @@ class WebUI:
 
     async def _handle_reset_database(self, request: web.Request) -> web.Response:
         """Reset the database - delete all data and recreate schema."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
         if busy := self._import_running():
             return web.json_response({"error": busy}, status=409)
 
@@ -1013,8 +974,6 @@ class WebUI:
 
     async def _handle_list_abbreviations(self, request: web.Request) -> web.Response:
         """List abbreviations with pagination and search."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
         search = request.query.get("search", "")
@@ -1023,8 +982,6 @@ class WebUI:
 
     async def _handle_add_abbreviation(self, request: web.Request) -> web.Response:
         """Add a new abbreviation."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         data = await _json_object(request)
         abbrev = data.get("abbreviation", "")
         full_text = data.get("full_text", "")
@@ -1035,8 +992,6 @@ class WebUI:
 
     async def _handle_delete_abbreviation(self, request: web.Request) -> web.Response:
         """Delete an abbreviation by id."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         try:
             abbrev_id = int(request.match_info.get("id", 0))
         except (TypeError, ValueError):
@@ -1046,8 +1001,6 @@ class WebUI:
 
     async def _handle_import_abbreviations(self, request: web.Request) -> web.Response:
         """Import abbreviations from Bommel."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         try:
             from .abbreviation_import import import_abbreviations
 
@@ -1059,8 +1012,6 @@ class WebUI:
 
     async def _handle_find_abbreviations(self, request: web.Request) -> web.Response:
         """Find abbreviations in text and return their full meanings."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         data = await _json_object(request)
         try:
             text = data.get("text", "")
@@ -1072,8 +1023,6 @@ class WebUI:
 
     async def _handle_list_tts(self, request: web.Request) -> web.Response:
         """List TTS replacements with pagination and search."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
         search = request.query.get("search", "")
@@ -1082,8 +1031,6 @@ class WebUI:
 
     async def _handle_add_tts(self, request: web.Request) -> web.Response:
         """Add a TTS replacement."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         data = await _json_object(request)
         pattern = data.get("pattern", "")
         replacement = data.get("replacement", "")
@@ -1096,8 +1043,6 @@ class WebUI:
 
     async def _handle_update_tts(self, request: web.Request) -> web.Response:
         """Update a TTS replacement."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         try:
             tts_id = int(request.match_info.get("id", 0))
         except (TypeError, ValueError):
@@ -1114,8 +1059,6 @@ class WebUI:
 
     async def _handle_delete_tts(self, request: web.Request) -> web.Response:
         """Delete a TTS replacement."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         try:
             tts_id = int(request.match_info.get("id", 0))
         except (TypeError, ValueError):
@@ -1127,8 +1070,6 @@ class WebUI:
 
     async def _handle_delete_all_tts(self, request: web.Request) -> web.Response:
         """Delete all TTS replacements."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         count = self.database.delete_all_tts_replacements()
         if count:
             self._tts_changed()
@@ -1136,8 +1077,6 @@ class WebUI:
 
     async def _handle_list_ignore_text(self, request: web.Request) -> web.Response:
         """List ignore-text patterns with pagination and search."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
         search = request.query.get("search", "")
@@ -1146,8 +1085,6 @@ class WebUI:
 
     async def _handle_add_ignore_text(self, request: web.Request) -> web.Response:
         """Add an ignore-text pattern."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         data = await _json_object(request)
         pattern = data.get("pattern", "")
         if not pattern:
@@ -1159,8 +1096,6 @@ class WebUI:
 
     async def _handle_update_ignore_text(self, request: web.Request) -> web.Response:
         """Update an ignore-text pattern."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         try:
             rule_id = int(request.match_info.get("id", 0))
         except (TypeError, ValueError):
@@ -1177,8 +1112,6 @@ class WebUI:
 
     async def _handle_delete_ignore_text(self, request: web.Request) -> web.Response:
         """Delete an ignore-text pattern."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         try:
             rule_id = int(request.match_info.get("id", 0))
         except (TypeError, ValueError):
@@ -1190,8 +1123,6 @@ class WebUI:
 
     async def _handle_delete_all_ignore_text(self, request: web.Request) -> web.Response:
         """Delete all ignore-text patterns."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         count = self.database.delete_all_ignore_text()
         if count:
             self._ignore_changed()
@@ -1199,8 +1130,6 @@ class WebUI:
 
     async def _handle_list_ignore_capcodes(self, request: web.Request) -> web.Response:
         """List ignored capcodes with pagination and search."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
         search = request.query.get("search", "")
@@ -1209,8 +1138,6 @@ class WebUI:
 
     async def _handle_add_ignore_capcode(self, request: web.Request) -> web.Response:
         """Add an ignored capcode."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         data = await _json_object(request)
         capcode = data.get("capcode", "")
         if not capcode:
@@ -1222,8 +1149,6 @@ class WebUI:
 
     async def _handle_update_ignore_capcode(self, request: web.Request) -> web.Response:
         """Update an ignored capcode."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         try:
             rule_id = int(request.match_info.get("id", 0))
         except (TypeError, ValueError):
@@ -1240,8 +1165,6 @@ class WebUI:
 
     async def _handle_delete_ignore_capcode(self, request: web.Request) -> web.Response:
         """Delete an ignored capcode."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         try:
             rule_id = int(request.match_info.get("id", 0))
         except (TypeError, ValueError):
@@ -1253,8 +1176,6 @@ class WebUI:
 
     async def _handle_delete_all_ignore_capcodes(self, request: web.Request) -> web.Response:
         """Delete all ignored capcodes."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         count = self.database.delete_all_ignore_capcodes()
         if count:
             self._ignore_changed()
@@ -1302,8 +1223,6 @@ class WebUI:
 
     async def _handle_get_vehicle_photo(self, request: web.Request) -> web.Response:
         """Serve a stored vehicle photo's raw image bytes."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         key_type = request.match_info.get("key_type", "")
         key_value = request.match_info.get("key_value", "")
         photo = self.database.get_vehicle_photo(key_type, key_value)
@@ -1321,8 +1240,6 @@ class WebUI:
 
     async def _handle_set_vehicle_photo(self, request: web.Request) -> web.Response:
         """Upload/replace a vehicle photo (multipart form: key_type, key_value, label, file)."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         try:
             reader = await request.multipart()
             fields: dict[str, str] = {}
@@ -1375,8 +1292,6 @@ class WebUI:
 
     async def _handle_delete_vehicle_photo(self, request: web.Request) -> web.Response:
         """Delete a vehicle photo."""
-        if not self.database:
-            return web.json_response({"error": "No database"}, status=500)
         key_type = request.match_info.get("key_type", "")
         key_value = request.match_info.get("key_value", "")
         success = self.database.delete_vehicle_photo(key_type, key_value)
@@ -1391,8 +1306,6 @@ class WebUI:
 
     async def _handle_list_vehicle_photos(self, request: web.Request) -> web.Response:
         """List vehicle photos with pagination and search, for the Database tab."""
-        if not self.database:
-            return web.json_response({"error": "Database not available"}, status=500)
         page = _int_param(request, "page", 1, maximum=MAX_PAGE)
         per_page = _int_param(request, "per_page", 50)
         search = request.query.get("search", "")
@@ -1408,6 +1321,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <title>Meldkamer</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
     <style>
         :root {
             --ha-card-background: #1a1d21;
@@ -1543,6 +1457,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             margin-bottom: 14px;
         }
         #map { height: 400px; min-height: 200px; max-height: 80vh; }
+        .map-history {
+            position: absolute; top: 10px; right: 10px; z-index: 1000;
+            display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end;
+            padding: 6px 10px; border-radius: 8px; max-width: calc(100% - 70px);
+            background: var(--ha-card-background); border: var(--card-border); box-shadow: var(--shadow-sm);
+            font-size: 12px;
+        }
+        .map-history select { padding: 3px 6px; font-size: 12px; }
+        .map-history input[type=range] { width: 180px; }
+        .map-history .until { color: var(--secondary-text-color); white-space: nowrap; }
         .map-resize-handle {
             position: absolute; bottom: 0; left: 0; right: 0; height: 10px;
             cursor: ns-resize; z-index: 1000;
@@ -1615,6 +1539,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
         .badge.discipline { background: rgba(255,152,0,0.14); color: var(--accent-color); }
         .badge.prio { background: rgba(229,72,77,0.14); color: #ef5350; }
+        .badge.incident { background: rgba(229,72,77,0.22); color: #ef5350; }
+        .pill-warning { background: rgba(245,124,0,0.16); color: var(--prio-2); }
 
         /* ---------- Detail panel ---------- */
         .detail-panel { position: sticky; top: 0; }
@@ -1910,6 +1836,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
             <div class="map-wrapper">
                 <div id="map"></div>
+                <div class="map-history">
+                    <label for="map-history-hours">History</label>
+                    <select id="map-history-hours" class="input" onchange="loadMapHistory()">
+                        <option value="">Off</option>
+                        <option value="24">24 hours</option>
+                        <option value="168">7 days</option>
+                        <option value="720">30 days</option>
+                        <option value="8760">1 year</option>
+                    </select>
+                    <input id="map-history-until" type="range" style="display:none;" oninput="renderMapHistory()" title="Show incidents up to this moment">
+                    <span id="map-history-label" class="until"></span>
+                </div>
                 <div class="map-resize-handle" id="map-resize-handle" title="Drag to resize map"></div>
             </div>
 
@@ -1930,6 +1868,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     <div class="panel-head"><span class="panel-title">Message details</span></div>
                     <div class="panel-body">
                         <div id="detail-content" class="detail-wrap"><div class="empty-state">Click a message to view details</div></div>
+                    </div>
+                    <div id="incident-section" class="history-section" style="display:none;">
+                        <h4>Incident</h4>
+                        <div id="incident-list"></div>
                     </div>
                     <div id="history-section" class="history-section" style="display:none;">
                         <h4>Location history</h4>
@@ -1970,6 +1912,40 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         <div class="info-row"><span class="info-label">Capcodes</span><span class="info-value" id="adv-capcodes">0</span></div>
                         <div class="info-row"><span class="info-label">Texts</span><span class="info-value" id="adv-texts">0</span></div>
                         <div class="info-row"><span class="info-label">Geocodes</span><span class="info-value" id="adv-geocodes">0</span></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="info-grid" style="margin-top: 14px;">
+                <div class="panel info-card">
+                    <div class="panel-body">
+                        <h3>📶 Reception</h3>
+                        <div class="info-row"><span class="info-label">Active receiver</span><span class="info-value" id="rx-source">-</span></div>
+                        <div class="info-row"><span class="info-label">Last FLEX frame</span><span class="info-value" id="rx-last">-</span></div>
+                        <div class="info-row"><span class="info-label">Frames last minute</span><span class="info-value" id="rx-frames-min">-</span></div>
+                        <div class="info-row"><span class="info-label">Messages last hour</span><span class="info-value" id="rx-msgs-hour">-</span></div>
+                        <div class="info-row"><span class="info-label">Corrected bit errors per frame</span><span class="info-value" id="rx-corrected">-</span></div>
+                        <div class="info-row"><span class="info-label">Failed decodes last hour</span><span class="info-value" id="rx-failed">-</span></div>
+                        <div class="info-row"><span class="info-label">Sync lost last hour</span><span class="info-value" id="rx-sync">-</span></div>
+                        <div class="chart-title" style="margin-top: 14px;">FLEX frames per minute, last hour</div>
+                        <div id="frames-chart"></div>
+                        <div class="panel-sub" style="margin-top: 8px;">Fewer corrected bit errors and failed decodes mean a cleaner signal - use them when tuning gain and ppm. rtl_fm and rx_fm don't report an RF signal level.</div>
+                    </div>
+                </div>
+
+                <div class="panel info-card">
+                    <div class="panel-body">
+                        <h3>🎯 ppm calibration</h3>
+                        <div class="panel-sub" style="margin-bottom: 10px;">Tries ppm values around the current one on the active receiver and keeps the one that decodes the most FLEX frames. Decoding continues while it runs.</div>
+                        <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end;">
+                            <div class="form-field"><label>± range (ppm)</label><input id="cal-span" class="input" type="number" value="30" min="1" max="100" style="width: 90px;"></div>
+                            <div class="form-field"><label>Step</label><input id="cal-step" class="input" type="number" value="5" min="1" max="50" style="width: 70px;"></div>
+                            <div class="form-field"><label>Seconds each</label><input id="cal-dwell" class="input" type="number" value="30" min="10" max="600" style="width: 90px;"></div>
+                            <button id="cal-start" class="btn btn-primary" onclick="startCalibration()">Start</button>
+                            <button id="cal-cancel" class="btn btn-danger" onclick="cancelCalibration()" style="display: none;">Cancel</button>
+                        </div>
+                        <div id="cal-status" class="panel-sub" style="margin-top: 12px;"></div>
+                        <div id="cal-results" style="margin-top: 8px;"></div>
                     </div>
                 </div>
             </div>
@@ -2251,6 +2227,56 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             }
         })();
 
+        // Heatmap of past incidents from the message history; the slider
+        // replays them up to the chosen moment
+        let historyLayer = null;
+        let historyPoints = [];
+
+        function loadMapHistory() {
+            const hours = document.getElementById('map-history-hours').value;
+            const slider = document.getElementById('map-history-until');
+            const label = document.getElementById('map-history-label');
+            if (!hours) {
+                if (historyLayer) { map.removeLayer(historyLayer); historyLayer = null; }
+                slider.style.display = 'none';
+                label.textContent = '';
+                return;
+            }
+            fetch(basePath + `api/map-history?hours=${hours}`)
+                .then(r => r.json())
+                .then(points => {
+                    historyPoints = points;
+                    if (!points.length) {
+                        slider.style.display = 'none';
+                        label.textContent = 'No located messages';
+                    } else {
+                        slider.min = points[0].time;
+                        slider.max = Math.max(points[points.length - 1].time, points[0].time + 1);
+                        slider.value = slider.max;
+                        slider.style.display = '';
+                    }
+                    renderMapHistory();
+                })
+                .catch(() => toast('Failed to load map history', 'error'));
+        }
+
+        function renderMapHistory() {
+            const slider = document.getElementById('map-history-until');
+            const until = Number(slider.value);
+            const shown = historyPoints.filter(p => p.time <= until);
+            // Urgent (P1) incidents weigh more in the heatmap
+            const latlngs = shown.map(p => [p.latitude, p.longitude, p.priority === 1 ? 1 : 0.5]);
+            if (historyLayer) {
+                historyLayer.setLatLngs(latlngs);
+            } else {
+                historyLayer = L.heatLayer(latlngs, { radius: 20, blur: 15, maxZoom: 12 }).addTo(map);
+            }
+            if (historyPoints.length) {
+                document.getElementById('map-history-label').textContent =
+                    `${shown.length} until ${new Date(until * 1000).toLocaleString([], {dateStyle: 'short', timeStyle: 'short'})}`;
+            }
+        }
+
         let currentMarker = null;
         let selectedMsg = null;
         let selectedMsgKey = null;
@@ -2268,17 +2294,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
         const markers = [];
 
-        // Configured sensor radii (e.g. "within 3km of Schiphol") - static
-        // config, so drawn once rather than redrawn on every live update.
-        let sensorZonesRendered = false;
+        // Home Assistant zones that sensors filter on. They are read from Home
+        // Assistant after startup, so redraw only when the set changes.
+        const sensorZoneLayer = L.layerGroup().addTo(map);
+        let sensorZonesSig = null;
         function renderSensorZones(zones) {
-            if (sensorZonesRendered || !zones || !zones.length) return;
-            sensorZonesRendered = true;
-            zones.forEach(z => {
+            const sig = JSON.stringify(zones || []);
+            if (sig === sensorZonesSig) return;
+            sensorZonesSig = sig;
+            sensorZoneLayer.clearLayers();
+            (zones || []).forEach(z => {
                 L.circle([z.center_lat, z.center_lon], {
                     radius: z.radius_km * 1000,
                     color: '#03a9f4', weight: 1.5, fillColor: '#03a9f4', fillOpacity: 0.06, dashArray: '4,4'
-                }).addTo(map).bindTooltip(`${escapeHtml(z.name)} (${z.radius_km} km)`, { sticky: true });
+                }).addTo(sensorZoneLayer).bindTooltip(`${escapeHtml(z.name)} (${z.radius_km.toFixed(1)} km)`, { sticky: true });
             });
         }
 
@@ -2445,9 +2474,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         // Browser text-to-speech
         // =====================================================================
         let ttsEnabled = localStorage.getItem('p2000_tts_enabled') === 'true';
-        let ttsReplacements = [];
-        let ttsReplacementsLoadedAt = 0;
-
         function initTtsToggle() {
             const btn = document.getElementById('tts-toggle');
             const icon = document.getElementById('tts-icon');
@@ -2465,53 +2491,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             }
         }
 
-        // TTS replacement rules from the database (same rules used for HA
-        // sensors); cached for 5 minutes
-        function loadTtsReplacements(force) {
-            if (!force && ttsReplacementsLoadedAt && Date.now() - ttsReplacementsLoadedAt < 300000) return;
-            fetch(basePath + 'api/db/tts_replacements?page=1&per_page=500')
-                .then(r => r.json())
-                .then(data => {
-                    ttsReplacements = (data.items || []).filter(i => i.enabled);
-                    ttsReplacementsLoadedAt = Date.now();
-                })
-                .catch(() => {});
-        }
-
-        function applyTtsReplacements(text, discipline) {
-            let result = text;
-            // B1/B2 mean "Brandweer ... spoed" for fire, but an unrelated,
-            // always-non-urgent "besteld vervoer" code for ambulance - consume
-            // them here first so the generic fire-meaning rule below never
-            // gets a literal B1/B2 to match on an ambulance message.
-            if (discipline && /ambulance/i.test(discipline)) {
-                result = result.replace(/\\bB\\s?1\\b/gi, 'Ambulance besteld vervoer');
-                result = result.replace(/\\bB\\s?2\\b/gi, 'Ambulance besteld vervoer');
-            }
-            ttsReplacements.forEach(rule => {
-                try {
-                    result = result.replace(new RegExp(rule.pattern, 'gi'), rule.replacement || '');
-                } catch (e) {}
-            });
-            // A1/A2/B1/B2 already speak "Ambulance ... spoed"; collapse a
-            // following bare "Ambulance" (e.g. from an AMBU rule) so it isn't
-            // said twice, regardless of what order the rules above ran in.
-            result = result.replace(/\\bAmbulance\\b((?:\\s+(?:met|zonder)\\s+spoed)?)\\s+Ambulance\\b/gi, 'Ambulance$1');
-            // Same issue for Brand - e.g. "(Zeer gr. BR) BR bijeenkomst" both
-            // expand to "Brand", separated by just punctuation/whitespace
-            result = result.replace(/\\bBrand\\b([^\\w]{0,3})Brand\\b\\s*/gi, 'Brand$1');
-            return result;
-        }
-
         function speakMessage(msg) {
-            if (!ttsEnabled || !window.speechSynthesis || !msg || !msg.body) return;
-            // No separate "Prio N." prefix here - the priority code (P1/A1/B1/...)
-            // is always present in the body itself (that's how msg.priority gets
-            // set in the first place) and the TTS replacement rules already turn
-            // it into a spoken form, so prefixing it here would speak it twice.
-            // speakable_body has any city abbreviation (e.g. "SGRAVH") already
-            // swapped for the resolved full name (e.g. "'s-Gravenhage") server-side.
-            const utterance = new SpeechSynthesisUtterance(applyTtsReplacements(msg.speakable_body || msg.body, msg.discipline));
+            if (!ttsEnabled || !window.speechSynthesis || !msg || !msg.tts) return;
+            // msg.tts is the spoken form built server-side with the TTS
+            // replacement rules - the same text Home Assistant speakers get
+            const utterance = new SpeechSynthesisUtterance(msg.tts);
             utterance.lang = 'nl-NL';
             speechSynthesis.cancel();  // Newest message takes priority
             speechSynthesis.speak(utterance);
@@ -2535,6 +2519,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             if (topTimestamp && topTimestamp !== lastSeenTopTimestamp) {
                 playNotificationSound();
                 speakMessage(top);
+                const earlier = top.incident_id && currentMessages.filter(m => m.incident_id === top.incident_id);
+                if (earlier && earlier.length) {
+                    toast(`Incident escalated: ${top.address || top.city || ''} (${earlier.length + 1} messages)`, 'error');
+                }
                 if (autoMapEnabled) {
                     autoShowLatestOnMap(latest);
                 }
@@ -2545,7 +2533,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         initSoundToggle();
         initAutoMapToggle();
         initTtsToggle();
-        loadTtsReplacements();
 
         // =====================================================================
         // Formatting helpers
@@ -2570,6 +2557,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tabName));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
             document.getElementById('tab-' + tabName).classList.add('active');
+            if (tabName === 'advanced') loadReceiver();
             if (tabName === 'dashboard') {
                 setTimeout(() => map.invalidateSize(), 100);
                 resyncIfStale();
@@ -2606,6 +2594,129 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             if (advUp) advUp.textContent = text;
         }
         setInterval(renderUptime, 30000);
+
+        // =====================================================================
+        // Reception quality & ppm calibration (Advanced tab)
+        // =====================================================================
+        function formatAgo(epochSeconds) {
+            if (!epochSeconds) return 'never';
+            const secs = Math.max(0, Math.round(Date.now() / 1000 - epochSeconds));
+            if (secs < 60) return `${secs}s ago`;
+            if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
+            return `${Math.floor(secs / 3600)}h ${Math.floor(secs % 3600 / 60)}m ago`;
+        }
+
+        // Single-series bar chart: one bar per minute, hover shows the details
+        function renderFramesChart(history) {
+            const el = document.getElementById('frames-chart');
+            if (!history.length) { el.innerHTML = '<div class="empty-state" style="padding: 20px;">No data yet</div>'; return; }
+            const width = 600, height = 120, slot = width / 60;
+            const max = Math.max(1, ...history.map(b => b.frames));
+            const now = Math.floor(Date.now() / 60000) * 60;
+            const bars = history.map(b => {
+                const x = width - (now - b.minute) / 60 * slot;
+                const h = Math.max(b.frames ? 2 : 0, b.frames / max * (height - 4));
+                const tip = `${new Date(b.minute * 1000).toLocaleTimeString([], {timeStyle: 'short'})}: ${b.frames} frames, ${b.messages} messages, ${b.corrected_bits} corrected bits, ${b.failed} failed`;
+                // Rounded top, square base on the axis; the full-height rect is the hover target
+                const r = Math.min(2, h);
+                return `<g><title>${escapeHtml(tip)}</title>` +
+                    `<rect x="${x}" y="0" width="${slot}" height="${height}" fill="transparent"/>` +
+                    `<path d="M${x + 1},${height} v${r - h} q0,${-r} ${r},${-r} h${slot - 2 - 2 * r} q${r},0 ${r},${r} v${h - r} z" fill="var(--primary-color)"/></g>`;
+            }).join('');
+            el.innerHTML = `<svg viewBox="0 0 ${width} ${height + 16}" style="width:100%;height:auto;display:block;">` +
+                `<line x1="0" y1="${height}" x2="${width}" y2="${height}" stroke="var(--divider-color)"/>${bars}` +
+                `<text x="0" y="${height + 13}" font-size="10" fill="var(--secondary-text-color)">-60 min</text>` +
+                `<text x="${width}" y="${height + 13}" font-size="10" text-anchor="end" fill="var(--secondary-text-color)">now · max ${max}/min</text></svg>`;
+        }
+
+        function renderCalibration(rx) {
+            const cal = rx.calibration;
+            const status = document.getElementById('cal-status');
+            const results = document.getElementById('cal-results');
+            const running = !!(cal && cal.running);
+            document.getElementById('cal-start').style.display = running ? 'none' : '';
+            document.getElementById('cal-cancel').style.display = running ? '' : 'none';
+            if (!cal) {
+                status.textContent = `Current ppm correction: ${rx.ppm}`;
+                results.innerHTML = '';
+                return;
+            }
+            if (running) {
+                status.textContent = `Calibrating the ${cal.source} receiver: ${cal.results.length} of ${cal.candidates.length} done, trying ${cal.current} ppm…`;
+            } else if (cal.error) {
+                status.textContent = cal.error;
+            } else {
+                status.textContent = `Best: ${cal.best} ppm (configured: ${cal.configured_ppm} ppm)`;
+            }
+            const maxFrames = Math.max(1, ...cal.results.map(r => r.frames));
+            results.innerHTML = cal.results.length ? `
+                <table class="db-table">
+                    <thead><tr><th>ppm</th><th>Frames</th><th>Failed</th><th></th></tr></thead>
+                    <tbody>${cal.results.map(r => `
+                        <tr>
+                            <td>${r.ppm}${r.ppm === cal.best ? ' ★' : ''}</td>
+                            <td><div class="progress" style="width: 120px; display: inline-block; vertical-align: middle;"><div style="width: ${r.frames / maxFrames * 100}%"></div></div> ${r.frames}</td>
+                            <td>${r.failed}</td>
+                            <td>${!running && rx.can_apply ? `<button class="btn" onclick="applyPpm(${r.ppm})">Use</button>` : ''}</td>
+                        </tr>`).join('')}
+                    </tbody>
+                </table>` : '';
+        }
+
+        let receiverTimer = null;
+        function loadReceiver() {
+            clearTimeout(receiverTimer);
+            if (!document.getElementById('tab-advanced').classList.contains('active')) return;
+            fetch(basePath + 'api/receiver').then(r => r.json()).then(rx => {
+                const active = rx.sources.find(src => src.active);
+                document.getElementById('rx-source').textContent = active
+                    ? `${active.label} (${active.type}, ${rx.ppm} ppm)` + (rx.sources.length > 1 ? ' · failover on' : '')
+                    : '-';
+                document.getElementById('rx-last').textContent = rx.silent_for === null ? 'never' : formatAgo(Date.now() / 1000 - rx.silent_for);
+                document.getElementById('rx-frames-min').textContent = rx.frames_last_minute;
+                document.getElementById('rx-msgs-hour').textContent = rx.messages_last_hour;
+                document.getElementById('rx-corrected').textContent = rx.corrected_bits_per_frame ?? '-';
+                document.getElementById('rx-failed').textContent = rx.failed_last_hour;
+                document.getElementById('rx-sync').textContent = rx.sync_lost_last_hour;
+                renderFramesChart(rx.history);
+                renderCalibration(rx);
+            }).catch(() => {}).finally(() => { receiverTimer = setTimeout(loadReceiver, 5000); });
+        }
+
+        function startCalibration() {
+            const body = {
+                span: Number(document.getElementById('cal-span').value),
+                step: Number(document.getElementById('cal-step').value),
+                dwell: Number(document.getElementById('cal-dwell').value),
+            };
+            fetch(basePath + 'api/calibration', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) })
+                .then(r => r.json())
+                .then(result => {
+                    if (result.error) toast(result.error, 'error');
+                    loadReceiver();
+                })
+                .catch(() => toast('Failed to start calibration', 'error'));
+        }
+
+        function cancelCalibration() {
+            fetch(basePath + 'api/calibration', { method: 'DELETE' }).then(() => loadReceiver());
+        }
+
+        async function applyPpm(ppm) {
+            const ok = await confirmDialog({
+                title: 'Use this ppm correction?',
+                message: `Saves ${ppm} ppm in the add-on configuration and restarts the receiver with it.`,
+                confirmLabel: 'Save',
+            });
+            if (!ok) return;
+            fetch(basePath + 'api/calibration/apply', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ppm}) })
+                .then(r => r.json())
+                .then(result => {
+                    toast(result.error || `ppm correction set to ${ppm}`, result.error ? 'error' : 'success');
+                    loadReceiver();
+                })
+                .catch(() => toast('Failed to save ppm correction', 'error'));
+        }
 
         // =====================================================================
         // Dashboard rendering
@@ -2657,7 +2768,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const geocodeLevel = (msg.latitude && msg.longitude)
                 ? (msg.location_accuracy === 'street' ? 'Street' : (msg.location_accuracy === 'city' ? 'City' : 'Unknown'))
                 : '—';
-            const hasDistance = msg.distance !== '' && msg.distance !== null && msg.distance !== undefined;
+            const hasDistance = msg.distance_km !== null && msg.distance_km !== undefined;
 
             const leftRows = [
                 ['Time', formatDate(msg.timestamp)],
@@ -2670,7 +2781,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 ['Address', msg.address || '—'],
                 ['City', msg.city || '—'],
                 ['Geocode level', geocodeLevel],
-                hasDistance ? ['Distance', `${msg.distance} km`] : null,
+                hasDistance ? ['Distance from home', `${msg.distance_km} km`] : null,
+                msg.repeats ? ['Repeats', `resent ${msg.repeats} times`] : null,
                 unmatchedCapcodes.length > 0 ? ['Capcodes', unmatchedCapcodes.join(', ')] : null,
                 ['Receivers', msg.receivers || '—'],
             ].filter(Boolean);
@@ -2730,6 +2842,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 } catch (e) {}
             }
 
+            renderIncident(msg);
+
             // Location history (exact address preferred, city as fallback)
             const renderHistory = (items, extraFilter) => {
                 historyList.innerHTML = items
@@ -2755,6 +2869,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             } else {
                 historyList.innerHTML = '<div class="empty-state" style="padding: 12px;">No location data</div>';
             }
+        }
+
+        function renderIncident(msg) {
+            const section = document.getElementById('incident-section');
+            const list = document.getElementById('incident-list');
+            section.style.display = 'none';
+            if (!msg.incident_id) return;
+            fetch(basePath + `api/incident/${encodeURIComponent(msg.incident_id)}`)
+                .then(r => r.json())
+                .then(items => {
+                    if (selectedMsg !== msg || items.length < 2) return;
+                    list.innerHTML = items.map(h => `
+                        <div class="history-item">
+                            <div class="time">${formatTime(h.timestamp)} · ${escapeHtml(h.discipline || 'Unknown')}${h.priority ? ' · P' + h.priority : ''}</div>
+                            <div>${escapeHtml(h.body || '-')}</div>
+                        </div>
+                    `).join('');
+                    section.style.display = 'block';
+                })
+                .catch(() => {});
         }
 
         // ----- Vehicle photos (user-uploaded, keyed by voertuignummer or category) -----
@@ -2935,15 +3069,39 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         let currentMessages = [];
 
-        function renderMessage(msg, idx) {
-            const prio = msg.priority ? `prio-${msg.priority}` : '';
+        // Messages sharing an incident id (same address, close in time) are
+        // shown as one card, newest message on top. Returns groups of
+        // {idx, msgs} where idx is the newest message's index in `messages`.
+        function groupByIncident(messages) {
+            const groups = [];
+            const byIncident = {};
+            messages.forEach((msg, idx) => {
+                const group = msg.incident_id && byIncident[msg.incident_id];
+                if (group) {
+                    group.msgs.push(msg);
+                } else {
+                    const created = {idx, msgs: [msg]};
+                    groups.push(created);
+                    if (msg.incident_id) byIncident[msg.incident_id] = created;
+                }
+            });
+            return groups;
+        }
+
+        function renderMessage(group) {
+            const msg = group.msgs[0];
+            const idx = group.idx;
+            const prio = Math.min(...group.msgs.map(m => m.priority || 9));
+            const disciplines = [...new Set(group.msgs.flatMap(m => (m.discipline || '').split(',').map(d => d.trim()).filter(Boolean)))];
             return `
-                <div class="message ${prio}" data-msg-index="${idx}" onclick="handleMessageClick(${idx})">
+                <div class="message ${prio < 9 ? 'prio-' + prio : ''}" data-msg-index="${idx}" onclick="handleMessageClick(${idx})">
                     <div class="message-header">
                         <div class="message-badges">
-                            ${msg.discipline ? `<span class="badge discipline">${escapeHtml(msg.discipline)}</span>` : ''}
+                            ${disciplines.map(d => `<span class="badge discipline">${escapeHtml(d)}</span>`).join('')}
                             ${msg.region ? `<span class="badge">${escapeHtml(msg.region)}</span>` : ''}
-                            ${msg.priority ? `<span class="badge prio">P${msg.priority}</span>` : ''}
+                            ${prio < 9 ? `<span class="badge prio">P${prio}</span>` : ''}
+                            ${group.msgs.length > 1 ? `<span class="badge incident" title="${group.msgs.length} messages for this incident">🚨 ${group.msgs.length}</span>` : ''}
+                            ${msg.repeats ? `<span class="badge" title="Resent ${msg.repeats} times by the pager network">🔁 ${msg.repeats}</span>` : ''}
                         </div>
                         <span class="message-time">${formatTime(msg.timestamp)}</span>
                     </div>
@@ -3023,13 +3181,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         function renderMessagesList(latest) {
-            const sig = latest.length + '|' + (latest.length ? latest[0].timestamp + '|' + latest[latest.length - 1].timestamp : '');
+            const sig = latest.length + '|' + latest.map(m => m.timestamp + (m.repeats || 0)).join('|');
             if (sig === lastMsgsSig) return;
             lastMsgsSig = sig;
 
             currentMessages = latest;
             if (latest.length > 0) {
-                messagesEl.innerHTML = latest.map(renderMessage).join('');
+                messagesEl.innerHTML = groupByIncident(latest).map(renderMessage).join('');
                 highlightSelectedMessage();
             } else {
                 selectedMsgKey = null;
@@ -3062,7 +3220,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 receiverEl.textContent = stats.device_type || '';
             }
 
-            if (stats.decoder_running) {
+            if (stats.decoder_running && !stats.receiver_online) {
+                decoderEl.className = 'pill pill-warning';
+                decoderEl.textContent = 'No FLEX frames';
+                decoderEl.title = 'The decoder runs but has not decoded any FLEX frames recently - check the antenna, gain and ppm';
+            } else if (stats.decoder_running) {
                 decoderEl.className = 'pill pill-success';
                 decoderEl.textContent = 'Decoder running';
                 decoderEl.title = '';
@@ -3130,6 +3292,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             if (currentMarker) { map.removeLayer(currentMarker); currentMarker = null; }
             detailContent.innerHTML = '<div class="empty-state">Click a message to view details</div>';
             document.getElementById('history-section').style.display = 'none';
+            document.getElementById('incident-section').style.display = 'none';
         }
 
         function selectSensorFilter(name) {
@@ -3343,11 +3506,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const search = document.getElementById('db-search').value;
             fetch(`${basePath}api/db/${apiTable}?page=${dbCurrentPage}&per_page=50&search=${encodeURIComponent(search)}`)
                 .then(r => r.json())
-                .then(data => {
-                    dbRenderTable(data);
-                    // Keep the browser speech rules in sync with edits
-                    if (dbCurrentTable === 'tts') loadTtsReplacements(true);
-                })
+                .then(data => dbRenderTable(data))
                 .catch(e => console.error('Failed to load database:', e));
         }
 

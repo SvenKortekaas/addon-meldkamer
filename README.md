@@ -24,8 +24,15 @@ P2000 FLEX pager decoder dashboard for Home Assistant — decode Dutch emergency
 - 🗺️ **Interactive Dashboard** — Live map, statistics, tabbed interface
 - 🎯 **Sensor Filter Toggle** — Narrow the live dashboard feed to a configured sensor's criteria, or view everything
 - 📍 **Geocoding** — Automatic address to coordinates (OpenCage), with city-level fallback when disabled
-- 🏠 **Home Assistant Sensors** — Auto-create sensors with custom filters via REST API or MQTT
-- 🗣️ **Text-to-Speech** — Browser speech reads new messages aloud (nl-NL), using editable TTS replacement rules
+- 🏠 **Home Assistant Sensors** — Auto-create sensors with custom filters via REST API or MQTT, including filters on Home Assistant zones
+- ⚡ **Home Assistant Events** — `meldkamer_message` for every message and `meldkamer_incident_escalated` when an incident grows, ready to use as automation triggers
+- 🩺 **Receiver Health** — `binary_sensor.meldkamer_receiver_online` and `sensor.meldkamer_messages_per_hour`, so a dead SDR stick or `rtl_tcp` link doesn't go unnoticed
+- 🚨 **Incidents** — Messages for the same address within a few minutes are grouped into one incident, with an alert when it escalates (GRIP level, priority, more units or disciplines)
+- 🔁 **Repeat Suppression** — Messages the pager network resends are counted as repeats instead of being published again
+- 🗣️ **Text-to-Speech** — Browser speech and Home Assistant speakers (`tts.speak`) read new messages aloud, using editable TTS replacement rules
+- 🗺️ **Map History** — Heatmap of past incidents with a time slider
+- 📶 **Reception Quality** — FLEX frames per minute, corrected bit errors and failed decodes, plus automatic ppm calibration
+- 🔀 **Receiver Failover** — Switches to a backup `rtl_tcp` receiver when the active one stops producing frames
 - 🚑 **Vehicle Classification** — Best-effort vehicle/unit recognition (ambulance, fire, helicopter, police, water rescue) with user-uploadable photos per vehicle or category
 - 🔔 **Sound Notifications** — Configurable audio alerts for new messages
 - 🔍 **Message Filtering** — Filter by text patterns and capcodes, managed live from the dashboard
@@ -41,7 +48,7 @@ P2000 FLEX pager decoder dashboard for Home Assistant — decode Dutch emergency
 Access via Home Assistant sidebar → Meldkamer:
 
 - **Dashboard Tab** — Live messages, map, charts, statistics, sensor filter toggle
-- **Advanced Tab** — Receiver config, device info, database stats
+- **Advanced Tab** — Receiver config, device info, reception quality, ppm calibration, database stats
 - **Database Tab** — Card-based data management for every table below
 
 ### Database Tab
@@ -79,7 +86,12 @@ Click "Manage" on any card to view/edit/delete that table's rows.
 | `receiver.network_host` | IP address for network receiver (e.g., `192.168.1.100`) |
 | `receiver.network_port` | Port for network receiver (default: `1234`) |
 | `receiver.sdr_gain` | SDR device gain (0-100, for RTL-SDR) |
-| `receiver.ppm_correction` | Frequency correction in PPM for crystal oscillator drift |
+| `receiver.ppm_correction` | Frequency correction in PPM for crystal oscillator drift (see [ppm calibration](#ppm-calibration)) |
+| `receiver.bias_tee` | Power an active antenna or LNA over the coax (`rtl-sdr` only, e.g. RTL-SDR Blog V3/V4) |
+| `receiver.offline_after_minutes` | Minutes without FLEX frames before the receiver counts as offline and the decoder fails over / restarts (default: `10`) |
+| `receiver.backup_host` | Optional backup `rtl_tcp` server, used when the active receiver goes quiet |
+| `receiver.backup_port` | Port of the backup `rtl_tcp` server (default: `1234`) |
+| `receiver.backup_ppm_correction` | PPM correction of the backup receiver's stick |
 
 **Receiver Types:**
 - **rtl-sdr** — RTL-SDR dongle, no device probing (uses `rtl_fm`) — default
@@ -129,6 +141,26 @@ To use a remote RTL-SDR via network:
      network_port: 1234
    ```
 
+### Receiver Failover
+
+With `backup_host` set, the decoder watches for FLEX frames. When the active receiver produces none for `offline_after_minutes` (or its pipeline keeps failing), it switches to the other one, and back again if that one goes quiet too. Without a backup it restarts the active receiver instead. The active receiver is shown on the Advanced tab.
+
+```yaml
+receiver:
+  type: rtl-sdr
+  backup_host: "192.168.1.100"
+  backup_port: 1234
+  offline_after_minutes: 10
+```
+
+### ppm Calibration
+
+The Advanced tab's **ppm calibration** tries ppm values around the current one (e.g. ±30 in steps of 5, 30 seconds each) on the active receiver and keeps the one that decodes the most FLEX frames. Decoding continues while it runs. Click **Use** next to a result to save it as `ppm_correction` (or `backup_ppm_correction`) in the add-on configuration; the receiver restarts with it right away.
+
+### Reception Quality
+
+The Advanced tab shows FLEX frames per minute for the last hour, messages per hour, bit errors fixed by error correction per frame, failed decodes and lost synchronisations. Fewer corrected bits and failed decodes mean a cleaner signal, which helps when tuning gain, ppm and the antenna. `rtl_fm` and `rx_fm` don't report an RF signal level, so none is shown.
+
 ### Geocoding
 
 | Option | Description |
@@ -144,6 +176,15 @@ Global message filters are managed live from the dashboard's **Database** tab (n
 - **Ignore Capcodes** — exact capcodes to drop; a message is only dropped when **every** capcode on it is on this list (so a single ignored capcode can't kill a multi-capcode group call).
 
 Both support add/edit/delete/enable-toggle/export from their own "Manage" page, the same way TTS Replacements does.
+
+### Messages
+
+| Option | Description |
+| ------ | ----------- |
+| `repeat_window_seconds` | An identical message received again within this many seconds counts as a repeat (shown as 🔁 on the dashboard) instead of a new message. `0` disables it (default: `60`) |
+| `incident_window_minutes` | Messages for the same street and city within this many minutes of each other form one incident (default: `15`) |
+
+On the dashboard, an incident's messages are shown as one card (🚨 with the message count); its details list every message. When a new message arrives for an incident on screen, a toast alerts you.
 
 ### Sensor Integration
 
@@ -168,23 +209,20 @@ sensors:
     disciplines: "Brandweer"
     cities: "Oegstgeest, Leiden"
 
-  # Ambulance calls within 5km
+  # Ambulance calls inside your home zone, announced on your speakers
   - name: "Ambulance Nearby"
     disciplines: "Ambulance, Ambulancezorg"
-    radius_km: 5.0
-    center_lat: 52.0974
-    center_lon: 4.2776
+    zone: zone.home
+    announce: true
 
   # Specific station capcodes
   - name: "My Fire Station"
     capcodes: "002029583, 001520021"
 
-  # Urgent incidents within 3km of Schiphol Airport
+  # Urgent incidents inside a zone you created in Home Assistant
   - name: "Schiphol Airport"
     icon: "mdi:airplane"
-    radius_km: 3.0
-    center_lat: 52.3086
-    center_lon: 4.7639
+    zone: zone.schiphol
     priorities: "P1, A1"
 
   # High priority alerts
@@ -208,17 +246,16 @@ All filters within a sensor use **AND** logic — message must match ALL filters
 | `cities` | string | Comma-separated cities (case-insensitive) | `"Oegstgeest, Leiden"` |
 | `capcodes` | string | Comma-separated capcodes (leading zeros optional) | `"002029583, 001520021"` |
 | `priorities` | string | Comma-separated priorities: `P1`/`A1` = 1, `P2`/`A2` = 2, `P3`/`B1`–`B3` = 3, `P4` = 4 (a plain number works too). For GRIP use `text_contains: "GRIP"` | `"P1, A1"` |
-| `radius_km` | float | Distance from center (requires lat/lon) | `5.0` |
-| `center_lat` | float | Latitude for radius filter | `52.0974` |
-| `center_lon` | float | Longitude for radius filter | `4.2776` |
+| `zone` | string | Only messages inside this Home Assistant zone (its location and radius). Create zones under Settings → Areas, labels & zones → Zones | `zone.home` |
 | `text_contains` | string | Keyword search in message body | `"woningbrand"` |
 | `icon` | string | MDI icon override | `"mdi:fire-truck"` |
+| `announce` | bool | Speak matching messages on Home Assistant speakers (see [Announcements](#announcements)) | `true` |
 
 ### Sensor State & Attributes
 
-**State**: Message text, truncated to 255 characters (Home Assistant's state limit); the full text is in the attributes
+**State**: The spoken form of the message (TTS replacement rules applied), truncated to 255 characters (Home Assistant's state limit); the full text is in the `tts` and `body` attributes
 ```
-A2 HA Doude v Troostwijk/Goeskens Frankenslag SGRAVH : 15121...
+Ambulance zonder spoed HA Doude v Troostwijk/Goeskens Frankenslag Den Haag
 ```
 
 **Attributes** (available in automations):
@@ -237,6 +274,88 @@ postalcode: "2582"
 latitude: 52.0973458
 longitude: 4.2776374
 location_accuracy: "street"
+distance_km: 3.42        # from Home Assistant's home zone
+distance: 1.27           # from the centre of this sensor's zone
+incident_id: "3f9c2a1b7d4e"
+tts: "Ambulance zonder spoed HA Doude v Troostwijk/Goeskens Frankenslag Den Haag"
+```
+
+### Receiver Health Sensors
+
+With `sensors_enabled`, Meldkamer also publishes (every minute, and over MQTT with discovery when MQTT is enabled):
+
+| Entity | Description |
+|--------|-------------|
+| `binary_sensor.meldkamer_receiver_online` | `on` while FLEX frames arrive, `off` after `receiver.offline_after_minutes` without any |
+| `sensor.meldkamer_messages_per_hour` | Messages decoded in the last hour |
+
+### Home Assistant Events
+
+With `ha_events: true` (default) Meldkamer fires on the Home Assistant event bus:
+
+- **`meldkamer_message`** for every new message, with all message fields (`body`, `tts`, `priority`, `discipline`, `capcodes`, `region`, `city`, `street`, `address`, `latitude`, `longitude`, `distance_km`, `incident_id`, …) plus `sensors`, the names of the sensors it matched.
+- **`meldkamer_incident_escalated`** when a later message for an incident raises the GRIP level or priority, or alerts more units or disciplines: `incident_id`, `address`, `disciplines`, `units`, `priority`, `grip`, `message_count`, `reasons` and the new message's `body`.
+
+```yaml
+automation:
+  - alias: "P2000 GRIP nearby"
+    triggers:
+      - trigger: event
+        event_type: meldkamer_incident_escalated
+    conditions:
+      - condition: template
+        value_template: "{{ trigger.event.data.grip >= 1 }}"
+    actions:
+      - action: notify.mobile_app_phone
+        data:
+          title: "GRIP {{ trigger.event.data.grip }}"
+          message: "{{ trigger.event.data.address }}: {{ trigger.event.data.reasons | join(', ') }}"
+```
+
+```yaml
+automation:
+  - alias: "P2000 P1 within 5 km"
+    triggers:
+      - trigger: event
+        event_type: meldkamer_message
+    conditions:
+      - condition: template
+        value_template: >
+          {{ trigger.event.data.priority == 1 and trigger.event.data.distance_km is not none
+             and trigger.event.data.distance_km < 5 }}
+    actions:
+      - action: notify.mobile_app_phone
+        data:
+          message: "{{ trigger.event.data.tts }}"
+```
+
+### Announcements
+
+Speak messages on Home Assistant speakers with `tts.speak`, using the same TTS replacement rules as the dashboard. Only messages matching a sensor with `announce: true` are spoken.
+
+```yaml
+announce:
+  tts_entity: tts.google_translate_nl_nl
+  media_players: "media_player.kitchen, media_player.living_room"
+  language: nl
+sensors:
+  - name: "Thuis"
+    zone: zone.home
+    announce: true
+```
+
+### Map Card
+
+The sensors carry `latitude`/`longitude` attributes, so Home Assistant's standard Map card shows where their latest message was:
+
+```yaml
+type: map
+title: P2000
+hours_to_show: 6
+entities:
+  - entity: sensor.thuis
+  - entity: sensor.brandweer
+  - entity: zone.home
 ```
 
 ### MQTT
@@ -287,14 +406,14 @@ mqtt:
 ```yaml
 automation:
   - alias: "P2000 Ambulance Alert"
-    trigger:
-      - platform: state
+    triggers:
+      - trigger: state
         entity_id: sensor.ambulance_nearby
-    condition:
+    conditions:
       - condition: template
         value_template: "{{ trigger.to_state.state != trigger.from_state.state }}"
-    action:
-      - service: notify.mobile_app
+    actions:
+      - action: notify.mobile_app
         data:
           title: "🚑 Ambulance Alert"
           message: "{{ trigger.to_state.state }}"
@@ -305,11 +424,11 @@ automation:
 ```yaml
 automation:
   - alias: "P2000 Station Alert"
-    trigger:
-      - platform: state
+    triggers:
+      - trigger: state
         entity_id: sensor.my_fire_station
-    action:
-      - service: persistent_notification.create
+    actions:
+      - action: persistent_notification.create
         data:
           title: "🚒 Station Called Out"
           message: >
@@ -335,6 +454,7 @@ automation:
 
 - Home Assistant with Supervisor
 - RTL-SDR, HackRF One, or network access to rtl_tcp server
+- For zone filters, `distance_km`, events, announcements and health sensors: the add-on's Home Assistant API access (enabled by default)
 - Home Assistant 2026.9 or newer is recommended: the dashboard map loads its OpenStreetMap tiles through Home Assistant's built-in map tile proxy (older versions fall back to fetching tiles from OpenStreetMap via the add-on)
 
 ## Credits

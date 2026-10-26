@@ -2,147 +2,428 @@
 
 import asyncio
 import contextlib
-import fnmatch
 import logging
 import os
 import re
 import shlex
 import signal
 import subprocess
-from collections.abc import Callable
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
-from . import abbreviation_import
 from .config import Config
-from .database import Database
-from .geocoding import Geocoder
-from .ha_client import HAClient, HAClientError
-from .message import P2000Message
-from .mqtt_client import MQTTClient
-from .parser import Parser
-from .sensor_manager import SensorManager, load_sensors_from_config
+from .ha_client import HAClient
+from .stats import ReceiverStats
 
 logger = logging.getLogger(__name__)
 
+# multimon-ng prints FLEX frame info and error correction details at verbosity 3
+MULTIMON_VERBOSITY = 3
+_CORRECTED_RE = re.compile(r"^FLEX: Phase \w Fixed (\d+) errors")
+_FAILED_MARKERS = ("Unable to fix errors", "Unable to decode FIW", "Garbled message", "Bad Checksum")
+
+# How often the watchdog checks for a silent receiver
+WATCHDOG_INTERVAL = 15
+
+
+@dataclass
+class Source:
+    """One receiver the decoder can run on."""
+
+    label: str  # "primary" or "backup"
+    receiver_type: str  # rtl-sdr, hackrf, soapysdr, network
+    ppm: int
+    options_key: str  # receiver option holding this source's ppm correction
+    host: str = ""
+    port: int = 0
+
 
 class Decoder:
-    """Manages SDR + multimon-ng subprocess pipeline for P2000 FLEX."""
+    """Runs the SDR | multimon-ng pipeline, fails over between receivers and calibrates ppm."""
 
-    def __init__(self, config: Config, database: Database):
+    def __init__(self, config: Config, ha_client: HAClient):
         self.config = config
-        self.database = database
-        self.parser = Parser(database)
+        self.ha_client = ha_client
+        self.stats = ReceiverStats()
 
-        # Only enable geocoder if opencage is enabled and token is provided
-        opencage_token = config.opencage_token if config.opencage_enabled else ""
-        self.geocoder = Geocoder(opencage_token, database)
+        self.sources = [
+            Source(
+                "primary",
+                config.receiver_type,
+                config.ppm_correction,
+                "ppm_correction",
+                config.network_host,
+                config.network_port,
+            )
+        ]
+        if config.backup_host:
+            self.sources.append(
+                Source(
+                    "backup",
+                    "network",
+                    config.backup_ppm_correction,
+                    "backup_ppm_correction",
+                    config.backup_host,
+                    config.backup_port,
+                )
+            )
+        self._active = 0
 
-        # Initialize HA client for sensor publishing
-        self.ha_client = HAClient()
-
-        # Initialize MQTT client (optional, additive alongside the HA REST API sensors above)
-        self.mqtt_client: MQTTClient | None = MQTTClient(config) if config.mqtt_enabled else None
-
-        # Initialize sensor manager if sensors configured and enabled
-        self.sensor_manager: SensorManager | None = None
-        if config.sensors_enabled and config.sensors:
-            sensors = load_sensors_from_config(config.sensors)
-            self.sensor_manager = SensorManager(sensors)
-            if not self.ha_client.available and not (self.mqtt_client and self.mqtt_client.enabled):
-                logger.warning("SUPERVISOR_TOKEN not found and MQTT disabled - sensors will not be published anywhere")
+        # Decoded message lines go to this callback through a queue, so slow
+        # geocoding/HA requests can't stall the reader and let the SDR pipe
+        # overflow (dropping messages)
+        self.on_line: Callable[[str], Awaitable[None]] | None = None
+        self._line_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1000)
+        self._worker_task: asyncio.Task | None = None
 
         self._process: asyncio.subprocess.Process | None = None
         self._running = False
-        self.on_message: Callable[[P2000Message], None] | None = None
+        self._restart_requested = False
 
-        # Decoded lines are handed from the stdout reader to a worker task, so
-        # slow geocoding/HA requests can't stall the reader and let the SDR
-        # pipe overflow (dropping messages)
-        self._line_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1000)
-        self._worker_task: asyncio.Task | None = None
-        self._register_task: asyncio.Task | None = None
+        # ppm calibration: overrides the active source's ppm while it runs
+        self._ppm_override: int | None = None
+        self._calibration_task: asyncio.Task | None = None
+        self.calibration: dict | None = None
+        self._calibration_frames = 0
+        self._calibration_failed = 0
 
-        # Seed the built-in P2000 abbreviation dictionary (only new codes, won't
-        # overwrite a user's own edits to an existing abbreviation's text)
-        imported_abbrevs = abbreviation_import.import_abbreviations(database, replace=False)
-        if imported_abbrevs:
-            logger.info(f"Seeded {imported_abbrevs} default abbreviation(s) into database")
-
-        # Seed default TTS replacements into database (only new ones, won't overwrite)
-        DEFAULT_TTS_REPLACEMENTS = [
-            # Priority codes - real messages use e.g. "A1"/"P1" with no space, but
-            # allow an optional one since the parser itself sees both forms
-            {"pattern": r"\bA\s?1\b", "replacement": "Ambulance met spoed"},
-            {"pattern": r"\bA\s?2\b", "replacement": "Ambulance zonder spoed"},
-            {"pattern": r"\bB\s?1\b", "replacement": "Brandweer met spoed"},
-            {"pattern": r"\bB\s?2\b", "replacement": "Brandweer zonder spoed"},
-            {"pattern": r"\bP\s?1\b", "replacement": "Prio 1"},
-            {"pattern": r"\bP\s?2\b", "replacement": "Prio 2"},
-            # Meldkamer gespreksgroep codes - short spoken forms
-            {"pattern": r"BDH\-[0-9]+", "replacement": "Brandweer Den Haag"},
-            {"pattern": r"BOB\-[0-9]+", "replacement": "Brandweer Oost-Brabant"},
-            {"pattern": r"BON\-[0-9]+", "replacement": "Brandweer Oost-Nederland"},
-            {"pattern": r"BNN\-[0-9]+", "replacement": "Brandweer Noord-Nederland"},
-            {"pattern": r"BNH\-[0-9]+", "replacement": "Brandweer Noord-Holland"},
-            {"pattern": r"BLB\-[0-9]+", "replacement": "Brandweer Limburg"},
-            {"pattern": r"BAD\-[0-9]+", "replacement": "Brandweer Amsterdam-Amstelland"},
-            {"pattern": r"BMD\-[0-9]+", "replacement": "Brandweer Midden-Nederland"},
-            {"pattern": r"BRT\-[0-9]+", "replacement": "Brandweer Rotterdam"},
-            {"pattern": r"BZB\-[0-9]+", "replacement": "Brandweer Zeeland"},
-            # Ambulance dienstposten - short spoken form
-            {"pattern": r"DP[0-9]+", "replacement": "Dienstpost"},
-            {"pattern": r"\bAMBU\b", "replacement": "Ambulance"},
-            # City abbreviations - short spoken forms (see city_abbreviations.py
-            # for the full list used for address/city matching; only ones worth
-            # a distinct spoken form belong here)
-            {"pattern": r"\bSGRAVH\b", "replacement": "Den Haag"},
-            # Status flags - drop the "(... : ja)" wrapper, just speak the label
-            {"pattern": r"\(Directe inzet:\s*ja\)", "replacement": "Directe inzet"},
-            {"pattern": r"\(DIA:\s*ja\)", "replacement": "Directe inzet ambulance"},
-            # Reference numbers - not useful spoken aloud
-            {"pattern": r"\s*\bbon:?\s*\d+", "replacement": ""},
-            {"pattern": r"\s*\brit:?\s*\d+", "replacement": ""},
-            {"pattern": r"\s*\bicnum:?\s*\d+", "replacement": ""},
-            # Common role/discipline abbreviations - spoken in full
-            {"pattern": r"\bGHOR\b", "replacement": "Geneeskundige hulpverlening bij ongevallen en rampen"},
-            {"pattern": r"\bMMT\b", "replacement": "Mobiel medisch team"},
-            {"pattern": r"\bSEH\b", "replacement": "Spoedeisende Hulp"},
-            {"pattern": r"\bOVD-B\b", "replacement": "Officier van Dienst Brandweer"},
-            {"pattern": r"\bOVD-G\b", "replacement": "Officier van Dienst Geneeskundig"},
-            {"pattern": r"\bOVD-P\b", "replacement": "Officier van Dienst Politie"},
-            {"pattern": r"\bOvD\b", "replacement": "Officier van Dienst"},
-            {"pattern": r"\bPOL\b", "replacement": "Politie"},
-            {"pattern": r"\bRAV\b", "replacement": "Regionale ambulancevoorziening"},
-            {"pattern": r"\bBR\b", "replacement": "Brand"},
-            # Long standalone numbers (capcodes, other reference numbers) - postal
-            # codes are 4 digits and ambulance unit numbers are 5 (e.g. "17341"),
-            # so both are left alone; bon/rit/icnum numbers are already stripped
-            # above regardless of length
-            {"pattern": r"\s*\b\d{6,}\b", "replacement": ""},
-        ]
-        imported = database.import_tts_replacements(DEFAULT_TTS_REPLACEMENTS)
-        if imported:
-            logger.info(f"Seeded {imported} default TTS replacement(s) into database")
-        self._tts_replacements = database.get_all_tts_replacements()
-        if self._tts_replacements:
-            logger.info(f"Loaded {len(self._tts_replacements)} TTS replacement(s)")
-
-        # Seed default global ignore filters into database (only new ones, won't overwrite)
-        DEFAULT_IGNORE_TEXT = ["*TESTOPROEP*", "*MOB*"]
-        imported_ignore_text = database.import_ignore_text(DEFAULT_IGNORE_TEXT)
-        if imported_ignore_text:
-            logger.info(f"Seeded {imported_ignore_text} default ignore-text pattern(s) into database")
-        self._ignore_text = database.get_all_ignore_text()
-        self._ignore_capcodes = database.get_all_ignore_capcodes()
-        logger.info(
-            f"Loaded {len(self._ignore_text)} ignore-text pattern(s), {len(self._ignore_capcodes)} ignored capcode(s)"
-        )
-
-        # Cache command and device type (built once)
-        self._cached_command: str | None = None
-        self.device_type: str = ""
-        self.device_driver: str = ""
         # Last fatal SDR error (e.g. "No supported devices found"), shown in the UI
-        self.last_error: str = ""
+        self.last_error = ""
+
+    @property
+    def source(self) -> Source:
+        return self.sources[self._active]
+
+    @property
+    def device_type(self) -> str:
+        source = self.source
+        if source.receiver_type == "network":
+            return f"Network ({source.host}:{source.port})"
+        return {"rtl-sdr": "RTL-SDR", "hackrf": "HackRF", "soapysdr": "SoapySDR"}[source.receiver_type]
+
+    @property
+    def device_driver(self) -> str:
+        return {"network": "rx_fm (rtl_tcp)", "rtl-sdr": "rtl_fm"}.get(self.source.receiver_type, "rx_fm")
+
+    @property
+    def ppm(self) -> int:
+        return self.source.ppm if self._ppm_override is None else self._ppm_override
+
+    def validate(self) -> None:
+        """Raise RuntimeError for receiver settings that can't work."""
+        for source in self.sources:
+            if source.receiver_type == "network" and not source.host:
+                raise RuntimeError("Network receiver requires network_host to be set")
+        if self.config.bias_tee and self.config.receiver_type != "rtl-sdr":
+            raise RuntimeError("bias_tee is only supported with receiver type rtl-sdr")
+
+    @property
+    def command(self) -> str:
+        """The SDR | multimon-ng command for the active source and ppm."""
+        source = self.source
+        freq = self.config.frequency
+        rate = self.config.sample_rate
+        gain = self.config.gain
+        tuning = f"-f {freq} -M fm -s {rate} -p {self.ppm}"
+        multimon = f"multimon-ng -a {self.config.decoder} -v {MULTIMON_VERBOSITY} -t raw -"
+
+        # Gain 0 means automatic gain control: rtl_fm/rx_fm only use AGC when
+        # -g is left out ("-g 0" would be a manual gain of ~0 dB)
+        gain_arg = f" -g {gain}" if gain else ""
+
+        if source.receiver_type == "network":
+            # rtl_tcp server via SoapyRTLTCP (osmocom rtl_fm has no rtl_tcp client).
+            # SoapyRTLTCP needs IPv6 addresses in brackets to split off the port.
+            host = source.host
+            address = f"[{host}]:{source.port}" if ":" in host and not host.startswith("[") else f"{host}:{source.port}"
+            device = shlex.quote(f"driver=rtltcp,rtltcp={address}")
+            return f"rx_fm -d {device}{gain_arg} {tuning} | {multimon}"
+
+        if source.receiver_type == "hackrf":
+            # Separate gain stages: LNA (0-40), VGA (0-62), AMP (0=off/1=on, ~14dB when enabled)
+            amp = 1 if self.config.hackrf_amp_enable else 0
+            gain_str = f"LNA={self.config.hackrf_lna_gain},VGA={self.config.hackrf_vga_gain},AMP={amp}"
+            return f'rx_fm -d driver=hackrf -g "{gain_str}" {tuning} | {multimon}'
+
+        if source.receiver_type == "soapysdr":
+            # SoapySDR devices may not support auto gain
+            return f"rx_fm -g {gain or 40} {tuning} | {multimon}"
+
+        bias_tee = " -T" if self.config.bias_tee else ""
+        return f"rtl_fm{gain_arg}{bias_tee} {tuning} | {multimon}"
+
+    @property
+    def is_running(self) -> bool:
+        """True when the decoder pipeline process is alive and being read."""
+        return self._running and self._process is not None and self._process.returncode is None
+
+    async def start(self) -> None:
+        """Start the decoder pipeline and supervise it: restart on exit, fail over when silent."""
+        logger.info(f"Starting decoder for {self.config.network_name}")
+
+        if self.source.receiver_type == "hackrf":
+            await self._check_and_reset_hackrf()
+
+        self._running = True
+        self._worker_task = asyncio.create_task(self._process_queue())
+
+        backoff = 5  # Seconds between restarts, doubles up to 60 on repeated failures
+        while self._running:
+            started = time.time()
+            outcome = "exit"
+            try:
+                outcome = await self._run_process()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Decoder error: {e}")
+
+            if not self._running:
+                break  # Intentional stop() - do not restart
+            if outcome == "restart":
+                continue
+
+            if outcome == "stalled":
+                logger.warning(
+                    f"No FLEX frames from the {self.source.label} receiver for "
+                    f"{self.config.offline_after_minutes} minutes"
+                )
+            elif self.stats.last_activity and self.stats.last_activity >= started:
+                backoff = 5  # The pipeline did decode, so it basically works
+            self._switch_source()
+
+            logger.warning(f"Decoder pipeline stopped, restarting in {backoff}s...")
+            try:
+                await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                break
+            backoff = min(backoff * 2, 60)
+
+        logger.info("Decoder stopped")
+
+    def _switch_source(self) -> None:
+        """Move on to the next receiver (the same one again when there is no backup)."""
+        if len(self.sources) == 1 or self._calibration_task:
+            return
+        self._active = (self._active + 1) % len(self.sources)
+        logger.warning(f"Switching to the {self.source.label} receiver: {self.device_type}")
+
+    async def _process_queue(self) -> None:
+        """Hand decoded message lines to on_line, one at a time."""
+        while True:
+            line = await self._line_queue.get()
+            try:
+                if self.on_line:
+                    await self.on_line(line)
+            except Exception:
+                logger.exception("Error processing line")
+            finally:
+                self._line_queue.task_done()
+
+    def _handle_line(self, line: str) -> None:
+        """Account a multimon-ng output line and queue decoded messages."""
+        if line.startswith("FLEX|"):
+            self.last_error = ""  # Receiving data again
+            if "|ALN|" not in line:
+                return  # Numeric/tone-only pages carry no P2000 text
+            self.stats.message()
+            try:
+                self._line_queue.put_nowait(line)
+            except asyncio.QueueFull:
+                logger.warning("Message processing is falling behind, dropping line")
+        elif line.startswith("FLEX: FrameInfoWord"):
+            self.last_error = ""
+            self.stats.frame()
+            self._calibration_frames += 1
+        elif line.startswith("FLEX:"):
+            if corrected := _CORRECTED_RE.match(line):
+                self.stats.corrected(int(corrected.group(1)))
+            elif any(marker in line for marker in _FAILED_MARKERS):
+                self.stats.failed()
+                self._calibration_failed += 1
+            elif "Synchronisation Lost" in line:
+                self.stats.sync_lost()
+
+    async def _run_process(self) -> str:
+        """Run the pipeline once. Returns why it ended: "exit", "stalled" or "restart"."""
+        command = self.command
+        logger.info(f"Command: {command}")
+        self._process = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            # Own process group, so stopping it also stops rtl_fm/rx_fm and
+            # multimon-ng instead of only the shell (leaving the SDR busy)
+            start_new_session=True,
+        )
+        process = self._process
+        stderr_task = asyncio.create_task(self._log_stderr(process))
+        started = time.time()
+        offline_after = self.config.offline_after_minutes * 60
+        outcome = "exit"
+
+        try:
+            while self._running:
+                try:
+                    line = await asyncio.wait_for(process.stdout.readline(), timeout=WATCHDOG_INTERVAL)
+                except TimeoutError:
+                    line = None
+                if line == b"":
+                    if not self._restart_requested:
+                        logger.warning(f"Decoder process exited with code {process.returncode}")
+                    break
+                if line:
+                    decoded = line.decode("utf-8", errors="ignore").strip()
+                    if decoded:
+                        logger.debug(f"multimon-ng: {decoded[:100]}")
+                        self._handle_line(decoded)
+                # Watchdog: calibration judges silence itself, per candidate ppm
+                last_activity = max(self.stats.last_activity or 0, started)
+                if not self._calibration_task and time.time() - last_activity > offline_after:
+                    outcome = "stalled"
+                    break
+        finally:
+            if self._restart_requested:
+                self._restart_requested = False
+                outcome = "restart"
+            if not stderr_task.done():
+                stderr_task.cancel()
+            # Make sure the whole pipeline is really dead before a possible restart
+            if process.returncode is None:
+                try:
+                    await self._stop_process(process)
+                except Exception as e:
+                    logger.debug(f"Error stopping decoder process: {e}")
+            self._process = None
+
+        return outcome
+
+    async def _restart(self) -> None:
+        """Restart the pipeline right away (e.g. with a new ppm), without failover or backoff."""
+        if self._process and self._process.returncode is None:
+            self._restart_requested = True
+            await self._stop_process(self._process)
+
+    async def _log_stderr(self, process: asyncio.subprocess.Process) -> None:
+        """Log stderr output for debugging."""
+        while self._running:
+            try:
+                line = await process.stderr.readline()
+                if not line:
+                    break
+                decoded = line.decode("utf-8", errors="ignore").strip()
+                if decoded:
+                    lowered = decoded.lower()
+                    # Fatal SDR device errors: surface them loudly and in the UI
+                    if "no supported devices found" in lowered:
+                        self.last_error = (
+                            "No SDR device found - check that the USB receiver is "
+                            "plugged in and that the addon can access it"
+                        )
+                        logger.error(self.last_error)
+                    elif "usb_claim_interface error" in lowered or "failed to open rtlsdr device" in lowered:
+                        self.last_error = decoded[:200]
+                        logger.error(f"SDR: {decoded[:200]}")
+                    # Format SDR device info nicely
+                    elif (
+                        ("Found" in decoded and "device" in decoded)
+                        or "Using" in decoded
+                        or "Tuned" in decoded
+                        or "tuner" in lowered
+                        or "bias-T" in decoded
+                        or "Sampling" in decoded
+                        or "Output" in decoded
+                    ):
+                        logger.info(f"SDR: {decoded}")
+                    else:
+                        logger.debug(f"stderr: {decoded[:200]}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"Error reading stderr: {e}")
+                break
+
+    # =========================================================================
+    # ppm calibration
+    # =========================================================================
+
+    def start_calibration(self, span: int, step: int, dwell: int) -> None:
+        """Try ppm values around the active source's ppm and find the one decoding the most frames."""
+        if self._calibration_task:
+            raise RuntimeError("A calibration is already running")
+        if not self.is_running:
+            raise RuntimeError("The decoder is not running")
+        center = self.source.ppm
+        candidates = list(range(center - span, center + span + 1, step))
+        self.calibration = {
+            "running": True,
+            "source": self.source.label,
+            "options_key": self.source.options_key,
+            "configured_ppm": center,
+            "candidates": candidates,
+            "dwell": dwell,
+            "current": None,
+            "results": [],
+            "best": None,
+            "error": "",
+        }
+        self._calibration_task = asyncio.create_task(self._calibrate(candidates, dwell))
+
+    async def cancel_calibration(self) -> None:
+        if self._calibration_task:
+            self._calibration_task.cancel()
+            await asyncio.gather(self._calibration_task, return_exceptions=True)
+
+    async def _calibrate(self, candidates: list[int], dwell: int) -> None:
+        calibration = self.calibration
+        try:
+            for ppm in candidates:
+                calibration["current"] = ppm
+                self._ppm_override = ppm
+                await self._restart()
+                # Let the tuner settle and multimon-ng lock on before counting
+                await asyncio.sleep(3)
+                self._calibration_frames = 0
+                self._calibration_failed = 0
+                await asyncio.sleep(dwell)
+                calibration["results"].append(
+                    {"ppm": ppm, "frames": self._calibration_frames, "failed": self._calibration_failed}
+                )
+            configured = calibration["configured_ppm"]
+            best = max(
+                calibration["results"],
+                key=lambda r: (r["frames"], -r["failed"], -abs(r["ppm"] - configured)),
+            )
+            calibration["best"] = best["ppm"] if best["frames"] else None
+            if calibration["best"] is None:
+                calibration["error"] = "No FLEX frames decoded at any ppm - check the antenna and gain"
+            logger.info(f"ppm calibration finished: {calibration['results']}, best: {calibration['best']}")
+        except asyncio.CancelledError:
+            calibration["error"] = "Cancelled"
+        finally:
+            calibration["running"] = False
+            calibration["current"] = None
+            self._ppm_override = None
+            self._calibration_task = None
+            if self._running:
+                await self._restart()
+
+    async def apply_ppm(self, ppm: int) -> None:
+        """Store a ppm correction in the add-on options and use it right away."""
+        if self._calibration_task:
+            raise RuntimeError("Wait for the calibration to finish")
+        source = self.source
+        options = await self.ha_client.get_addon_options()
+        options.setdefault("receiver", {})[source.options_key] = ppm
+        await self.ha_client.set_addon_options(options)
+        source.ppm = ppm
+        logger.info(f"Set {source.options_key} to {ppm}")
+        await self._restart()
+
+    # =========================================================================
+    # Process control
+    # =========================================================================
 
     async def _check_and_reset_hackrf(self) -> bool:
         """Check HackRF status and reset if stuck. Returns True if OK."""
@@ -215,443 +496,6 @@ class Decoder:
         logger.error("HackRF could not be reset - may need physical power cycle")
         return False
 
-    @property
-    def command(self) -> str:
-        """Build the SDR | multimon-ng command for P2000 FLEX.
-
-        Supports: rtl-sdr (default), hackrf, soapysdr, network.
-        "auto" is accepted as an alias for rtl-sdr (no device probing).
-        """
-        # Return cached command if already built
-        if self._cached_command:
-            return self._cached_command
-
-        freq = self.config.frequency
-        rate = self.config.sample_rate
-        decoder = self.config.decoder
-        gain = self.config.gain
-        ppm = self.config.ppm_correction
-        receiver_type = self.config.receiver_type.lower()
-
-        multimon = f"multimon-ng -a {decoder} -t raw -"
-
-        # Gain 0 means automatic gain control: rtl_fm/rx_fm only use AGC when
-        # -g is left out ("-g 0" would be a manual gain of ~0 dB)
-        gain_arg = f" -g {gain}" if gain else ""
-
-        # Network receiver - connect to an rtl_tcp server via SoapyRTLTCP
-        # (osmocom rtl_fm has no rtl_tcp client)
-        if receiver_type == "network":
-            host = self.config.network_host
-            port = self.config.network_port
-            if not host:
-                raise RuntimeError("Network receiver requires network_host to be set")
-            logger.info(f"Using network receiver: rtl_tcp at {host}:{port}")
-            self.device_type = f"Network ({host}:{port})"
-            self.device_driver = "rx_fm (rtl_tcp)"
-            # SoapyRTLTCP needs IPv6 addresses in brackets to split off the port
-            address = f"[{host}]:{port}" if ":" in host and not host.startswith("[") else f"{host}:{port}"
-            device = shlex.quote(f"driver=rtltcp,rtltcp={address}")
-            self._cached_command = f"rx_fm -d {device} -f {freq}{gain_arg} -M fm -s {rate} -p {ppm} | {multimon}"
-
-        # Explicit RTL-SDR
-        elif receiver_type == "rtl-sdr":
-            logger.info("Using rtl_fm (RTL-SDR selected)")
-            self.device_type = "RTL-SDR"
-            self.device_driver = "rtl_fm"
-            self._cached_command = f"rtl_fm -f {freq}{gain_arg} -M fm -s {rate} -p {ppm} | {multimon}"
-
-        # Explicit HackRF
-        elif receiver_type == "hackrf":
-            logger.info("Using rx_fm with HackRF driver")
-            self.device_type = "HackRF"
-            self.device_driver = "rx_fm"
-            # HackRF has separate gain stages: LNA (0-40), VGA (0-62), AMP (0=off/1=on, ~14dB when enabled)
-            lna = self.config.hackrf_lna_gain
-            vga = self.config.hackrf_vga_gain
-            amp = 1 if self.config.hackrf_amp_enable else 0
-            logger.info(f"HackRF gains: LNA={lna}dB, VGA={vga}dB, AMP={amp} (RF amplifier {'on' if amp else 'off'})")
-            # Use SoapySDR gain string format for rx_fm
-            gain_str = f"LNA={lna},VGA={vga},AMP={amp}"
-            self._cached_command = (
-                f'rx_fm -d driver=hackrf -f {freq} -g "{gain_str}" -M fm -s {rate} -p {ppm} | {multimon}'
-            )
-
-        # Explicit SoapySDR (auto-detect device)
-        elif receiver_type == "soapysdr":
-            logger.info("Using rx_fm (SoapySDR auto-detect)")
-            self.device_type = "SoapySDR"
-            self.device_driver = "rx_fm"
-            # SoapySDR devices may not support auto gain, use 40 as default
-            soapy_gain = gain if gain > 0 else 40
-            if gain == 0:
-                logger.info("SoapySDR may not support auto gain, using gain=40")
-            self._cached_command = f"rx_fm -f {freq} -g {soapy_gain} -M fm -s {rate} -p {ppm} | {multimon}"
-
-        # RTL-SDR (default) - "auto" is treated as rtl-sdr, no device probing.
-        # Probing proved unreliable: a failed probe cached the wrong driver
-        # (rx_fm/SoapyRTLSDR) for the whole session, leaving the tuner deaf.
-        else:
-            logger.info("Using rtl_fm (RTL-SDR, default)")
-            self.device_type = "RTL-SDR"
-            self.device_driver = "rtl_fm"
-            self._cached_command = f"rtl_fm -f {freq}{gain_arg} -M fm -s {rate} -p {ppm} | {multimon}"
-
-        return self._cached_command
-
-    @property
-    def is_running(self) -> bool:
-        """True when the decoder pipeline process is alive and being read."""
-        return self._running and self._process is not None and self._process.returncode is None
-
-    async def start(self) -> None:
-        """Start the decoder subprocess and supervise it (restart on unexpected exit)."""
-        logger.info(f"Starting decoder for {self.config.network_name}")
-        logger.info(f"Command: {self.command}")
-
-        # Check and reset HackRF if needed (checks for "HackRF" in device_type)
-        if "HackRF" in self.device_type:
-            await self._check_and_reset_hackrf()
-
-        if self.mqtt_client:
-            await self.mqtt_client.start()
-
-        self._running = True
-
-        # Pre-create sensors in the background (Core may still be starting)
-        if self.sensor_manager and self.ha_client.available:
-            self._register_task = asyncio.create_task(self._register_sensors())
-
-        self._worker_task = asyncio.create_task(self._process_queue())
-
-        backoff = 5  # Seconds between restarts, doubles up to 60 on repeated failures
-
-        while self._running:
-            got_output = False
-            try:
-                got_output = await self._run_process()
-            except asyncio.CancelledError:
-                logger.debug("Decoder cancelled")
-                break
-            except Exception as e:
-                logger.error(f"Decoder error: {e}")
-
-            if not self._running:
-                break  # Intentional stop() - do not restart
-
-            if got_output:
-                backoff = 5  # Pipeline produced output, so it basically works
-            else:
-                # No decoded frames: the auto-detected device/driver may be
-                # wrong or was probed while the device was busy. Drop the cached
-                # command so the next restart re-runs auto-detection.
-                if self._cached_command:
-                    logger.info("No decoded output - will re-detect receiver on restart")
-                self._cached_command = None
-
-            logger.warning(f"Decoder subprocess exited unexpectedly, restarting in {backoff}s...")
-            try:
-                await asyncio.sleep(backoff)
-            except asyncio.CancelledError:
-                break
-            backoff = min(backoff * 2, 60)
-
-        logger.info("Decoder stopped")
-
-    async def _register_sensors(self) -> None:
-        """Pre-create sensors in Home Assistant so they appear immediately.
-
-        Doesn't wipe the state/attributes of sensors that already exist, and
-        retries with backoff while Home Assistant is unreachable (e.g. Core
-        still starting, Supervisor answering 502).
-        """
-        pending = list(self.sensor_manager.sensors)
-        logger.info(f"Registering {len(pending)} sensor(s) in Home Assistant...")
-        backoff = 5
-        while self._running:
-            failed = []
-            for sensor in pending:
-                try:
-                    existing = await self.ha_client.get_state(sensor.entity_id)
-                except HAClientError:
-                    # Unknown whether it exists - don't overwrite a possibly existing state
-                    failed.append(sensor)
-                    continue
-                if existing is not None:
-                    logger.debug(f"sensor.{sensor.entity_id} already exists, keeping current state")
-                    continue
-                created = await self.ha_client.update_sensor(
-                    sensor.entity_id,
-                    state="Waiting for data...",
-                    attributes={
-                        "friendly_name": sensor.name,
-                        "icon": sensor.icon,
-                    },
-                )
-                if not created:
-                    failed.append(sensor)
-            if not failed:
-                logger.info("Sensors registered in Home Assistant")
-                return
-            pending = failed
-            logger.warning(f"Could not register {len(pending)} sensor(s) in Home Assistant, retrying in {backoff}s")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 300)
-
-    async def _process_queue(self) -> None:
-        """Process decoded lines queued by the stdout reader."""
-        while True:
-            line = await self._line_queue.get()
-            try:
-                await self._process_line(line)
-            except Exception:
-                logger.exception("Error processing line")
-            finally:
-                self._line_queue.task_done()
-
-    async def _run_process(self) -> bool:
-        """Run the SDR | multimon-ng pipeline once until it exits.
-
-        Returns True if any output was received (pipeline basically works).
-        """
-        got_output = False
-
-        self._process = await asyncio.create_subprocess_shell(
-            self.command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            # Own process group, so stopping it also stops rtl_fm/rx_fm and
-            # multimon-ng instead of only the shell (leaving the SDR busy)
-            start_new_session=True,
-        )
-
-        logger.debug("Decoder subprocess started, reading output...")
-
-        # Log stderr in a separate task
-        stderr_task = asyncio.create_task(self._log_stderr(self._process))
-
-        try:
-            # Read output line by line
-            while self._running and self._process and self._process.stdout:
-                try:
-                    line = await self._process.stdout.readline()
-                    if not line:
-                        if self._process and self._process.returncode is not None:
-                            logger.warning(f"Decoder process exited with code {self._process.returncode}")
-                        break
-
-                    decoded = line.decode("utf-8", errors="ignore").strip()
-                    if decoded:
-                        # Only real decoded frames count as output. The
-                        # multimon-ng startup banner ("Enabled demodulators:")
-                        # must not reset the restart backoff.
-                        if decoded.startswith("FLEX"):
-                            got_output = True
-                            self.last_error = ""  # Receiving data again
-                        logger.debug(f"Raw line: {decoded[:100]}")
-                        try:
-                            self._line_queue.put_nowait(decoded)
-                        except asyncio.QueueFull:
-                            logger.warning("Message processing is falling behind, dropping line")
-                except asyncio.CancelledError:
-                    logger.debug("Decoder stdout reading cancelled")
-                    raise
-                except Exception as e:
-                    logger.error(f"Error processing line: {e}")
-                    # Continue reading unless cancelled
-                    if not self._running:
-                        break
-        finally:
-            if not stderr_task.done():
-                stderr_task.cancel()
-            # Make sure the whole pipeline is really dead before a possible restart
-            if self._process and self._process.returncode is None:
-                try:
-                    await self._stop_process(self._process)
-                except Exception as e:
-                    logger.debug(f"Error stopping decoder process: {e}")
-            self._process = None
-
-        return got_output
-
-    async def _log_stderr(self, process: asyncio.subprocess.Process) -> None:
-        """Log stderr output for debugging."""
-        if not process or not process.stderr:
-            return
-        while self._running and process.stderr:
-            try:
-                line = await process.stderr.readline()
-                if not line:
-                    break
-                decoded = line.decode("utf-8", errors="ignore").strip()
-                if decoded:
-                    lowered = decoded.lower()
-                    # Fatal SDR device errors: surface them loudly and in the UI
-                    if "no supported devices found" in lowered:
-                        self.last_error = (
-                            "No SDR device found - check that the USB receiver is "
-                            "plugged in and that the addon can access it"
-                        )
-                        logger.error(self.last_error)
-                    elif "usb_claim_interface error" in lowered or "failed to open rtlsdr device" in lowered:
-                        self.last_error = decoded[:200]
-                        logger.error(f"SDR: {decoded[:200]}")
-                    # Format SDR device info nicely
-                    elif (
-                        ("Found" in decoded and "device" in decoded)
-                        or "Using" in decoded
-                        or "Tuned" in decoded
-                        or "tuner" in decoded.lower()
-                        or "Sampling" in decoded
-                        or "Output" in decoded
-                    ):
-                        logger.info(f"SDR: {decoded}")
-                    elif decoded.startswith("multimon-ng") or "(C)" in decoded:
-                        logger.debug(f"multimon-ng: {decoded}")
-                    else:
-                        logger.debug(f"stderr: {decoded[:200]}")
-            except asyncio.CancelledError:
-                logger.debug("Decoder stderr reading cancelled")
-                break
-            except Exception as e:
-                logger.debug(f"Error reading stderr: {e}")
-                break
-
-    def _should_ignore(self, msg: P2000Message) -> bool:
-        """Check the global ignore filters (ignore_text / ignore_capcode).
-
-        A message is dropped when its body matches an ignore_text pattern, or when
-        ALL of its capcodes are in the ignore_capcode list (a single ignored
-        capcode must not kill a multi-capcode group call).
-        """
-        # Check text patterns (supports wildcards like *test*, *TEST*)
-        for pattern in self._ignore_text:
-            if fnmatch.fnmatch(msg.body.lower(), pattern.lower()):
-                logger.debug(f"Ignoring message (text filter): {pattern}")
-                return True
-
-        # Check capcodes: drop only when every capcode on the message is ignored
-        ignore_capcodes = self._ignore_capcodes
-        if ignore_capcodes and msg.capcodes and all(capcode in ignore_capcodes for capcode in msg.capcodes):
-            logger.debug(f"Ignoring message (capcode filter): {msg.capcodes}")
-            return True
-
-        return False
-
-    async def _process_line(self, line: str) -> None:
-        """Process a single FLEX output line."""
-        # Handle FLEX messages only
-        if not line.startswith("FLEX"):
-            return
-
-        logger.debug(f"Received: {line[:80]}...")
-
-        # Parse the message
-        msg = self.parser.parse(line)
-        if not msg:
-            return
-
-        # Global ignore filters - covers HA sensors, webui and TCP broadcast
-        if self._should_ignore(msg):
-            return
-
-        # Geocode if address is available and geocoder is enabled
-        geocoded = False
-        logger.debug(f"Geocoding check: address='{msg.address}', geocoder.enabled={self.geocoder.enabled}")
-        if msg.address and self.geocoder.enabled:
-            # The OpenCage request is synchronous - run it off the event loop
-            loop = asyncio.get_running_loop()
-            geo = await loop.run_in_executor(None, self.geocoder.geocode, msg.address)
-            geocoded = self.geocoder.geocoded
-            if geo:
-                msg.latitude = geo["latitude"]
-                msg.longitude = geo["longitude"]
-                msg.mapurl = geo["mapurl"]
-                logger.debug(f"Geocoded: {msg.latitude}, {msg.longitude}")
-            else:
-                logger.debug(f"Geocoding returned None for: {msg.address}")
-
-        # Fallback: city-level coordinates from the local places database, so the
-        # map and auto-focus also work with geocoding disabled or failed lookups
-        if msg.latitude is None and msg.city:
-            coords = self.database.get_place_coordinates(msg.city)
-            if coords:
-                msg.latitude = coords["latitude"]
-                msg.longitude = coords["longitude"]
-                msg.location_accuracy = "city"
-                logger.debug(f"City-level coords for {msg.city}: {msg.latitude}, {msg.longitude}")
-
-        logger.info(
-            f"{self.config.network_name}: {msg.body[:60]}... "
-            f"[{msg.discipline or 'unknown'}] "
-            f"[{msg.region or 'unknown'}]"
-        )
-
-        # Publish to matching sensors, via Home Assistant REST API and/or MQTT
-        mqtt_active = bool(self.mqtt_client and self.mqtt_client.enabled)
-        if self.sensor_manager and (self.ha_client.available or mqtt_active):
-            matching_sensors = self.sensor_manager.get_matching_sensors(msg)
-            if matching_sensors:
-                # TTS-replaced text: full version as attribute, truncated to 255 chars (HA limit) as state
-                tts_text = self._apply_tts(msg.body) if msg.body else ""
-                opencage_info = (
-                    f"enabled: {self.geocoder.enabled} "
-                    f"ratelimit: {self.geocoder.rate_limited} ({self.geocoder.rate_remaining}) "
-                    f"geocoded: {geocoded}"
-                )
-                for sensor in matching_sensors:
-                    if self.ha_client.available:
-                        attributes = msg.to_dict()
-                        attributes["friendly_name"] = sensor.name
-                        attributes["icon"] = sensor.icon
-                        attributes["tts"] = tts_text
-                        attributes["opencage"] = opencage_info
-                        state_text = tts_text[:255]
-                        await self.ha_client.update_sensor(
-                            sensor.entity_id,
-                            state=state_text,
-                            attributes=attributes,
-                        )
-                    if mqtt_active:
-                        self.mqtt_client.publish_for_sensor(sensor, msg, tts_text, opencage_info)
-
-        # Send to callback (webui / TCP broadcast) - never let it kill the read loop
-        if self.on_message:
-            try:
-                self.on_message(msg)
-            except Exception as e:
-                logger.error(f"on_message callback failed: {e}")
-
-    def _apply_tts(self, text: str) -> str:
-        """Apply TTS regex replacements to text.
-
-        Case-insensitive to match the browser's TTS, which always applies the
-        JS 'i' flag (patterns can't rely on an inline (?i) - it's a Python-only
-        construct and throws in JS, silently no-opping that rule there).
-        """
-        if not self._tts_replacements:
-            return text
-        result = text
-        for rule in self._tts_replacements:
-            try:
-                result = re.sub(rule["pattern"], rule["replacement"], result, flags=re.IGNORECASE)
-            except re.error as e:
-                logger.warning(f"Invalid TTS regex pattern '{rule['pattern']}': {e}")
-        return result
-
-    def reload_tts_replacements(self):
-        """Reload TTS replacements from database (called after DB edits)."""
-        self._tts_replacements = self.database.get_all_tts_replacements()
-        logger.info(f"Reloaded {len(self._tts_replacements)} TTS replacement(s)")
-
-    def reload_ignore_filters(self):
-        """Reload global ignore filters from database (called after DB edits)."""
-        self._ignore_text = self.database.get_all_ignore_text()
-        self._ignore_capcodes = self.database.get_all_ignore_capcodes()
-        logger.info(
-            f"Reloaded {len(self._ignore_text)} ignore-text pattern(s), {len(self._ignore_capcodes)} ignored capcode(s)"
-        )
-
     @staticmethod
     def _signal_group(process: asyncio.subprocess.Process, sig: int) -> None:
         """Send a signal to the whole pipeline (shell, SDR tool and multimon-ng)."""
@@ -671,9 +515,7 @@ class Decoder:
     async def stop(self) -> None:
         """Stop the decoder subprocess."""
         self._running = False
-
-        if self._register_task:
-            self._register_task.cancel()
+        await self.cancel_calibration()
 
         if self._process:
             try:
@@ -685,7 +527,7 @@ class Decoder:
                 # Let the streams close naturally when the process terminates
                 self._process = None
                 # Give USB device time to reset (especially for HackRF)
-                if "HackRF" in self.device_type:
+                if self.source.receiver_type == "hackrf":
                     logger.info("Waiting for HackRF USB reset...")
                     await asyncio.sleep(3.0)
 
@@ -696,9 +538,3 @@ class Decoder:
             self._worker_task.cancel()
             await asyncio.gather(self._worker_task, return_exceptions=True)
             self._worker_task = None
-
-        # Close HA client
-        await self.ha_client.close()
-
-        if self.mqtt_client:
-            await self.mqtt_client.stop()

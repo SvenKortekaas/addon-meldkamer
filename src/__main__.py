@@ -9,9 +9,14 @@ import sys
 from .config import Config
 from .database import Database
 from .decoder import Decoder
-from .sensor_manager import load_sensors_from_config
+from .ha_client import HAClient
+from .processor import MessageProcessor
+from .publisher import Publisher
+from .sensor_manager import SensorManager, load_sensors_from_config
 from .server import P2000Server
+from .tts import SpeechRules
 from .webui import WebUI
+from .zones import HOME_ZONE, load_zones
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 logger = logging.getLogger(__name__)
@@ -41,97 +46,80 @@ async def main() -> int:
     logger.info(f"Decoder: {config.decoder}")
     logger.info(f"Geocoding: {'enabled' if config.opencage_enabled else 'disabled'}")
 
-    # Load P2000 database
     database = Database()
     db_stats = database.get_stats()
     logger.info(
         f"Database loaded: {db_stats['places']} places, {db_stats['capcodes']} capcodes, {db_stats['geocodes']} geocodes"
     )
 
-    # Initialize decoder
-    decoder = Decoder(config=config, database=database)
+    ha_client = HAClient()
+    speech = SpeechRules(database)
+    sensor_manager = SensorManager(load_sensors_from_config(config.sensors))
+    publisher = Publisher(config, ha_client, sensor_manager)
+    processor = MessageProcessor(config, database, sensor_manager, publisher, speech)
+    decoder = Decoder(config, ha_client)
+    decoder.on_line = processor.process
 
-    # Initialize TCP server for integration communication
+    # TCP server for integration communication
     server = P2000Server(host="0.0.0.0", port=5000)
 
-    # Initialize Web UI (ingress)
-    webui = WebUI(port=8099, database=database)
-    webui.set_network_name(config.network_name)
-    webui.set_config(config.frequency, config.sample_rate, config.decoder)
-
-    # Build command once (this also sets device_type and device_driver). An
-    # invalid receiver config must not crash-loop the add-on: keep the web UI
-    # up and show the error there instead of starting the decoder.
-    decoder_ok = True
-    try:
-        _ = decoder.command
-    except RuntimeError as e:
-        decoder_ok = False
-        decoder.last_error = f"{e} - fix the add-on configuration and restart"
-        logger.error(decoder.last_error)
-    webui.set_device_info(decoder.device_type, decoder.device_driver)
-    # Map zone circles are a pure visualization aid, so they're shown regardless
-    # of whether sensor publishing (REST/MQTT) is actually enabled - reuse the
-    # decoder's already-parsed sensors when available to avoid parsing twice.
-    if decoder.sensor_manager:
-        webui.set_sensors(decoder.sensor_manager.sensors)
-    elif config.sensors:
-        webui.set_sensors(load_sensors_from_config(config.sensors))
-
+    webui = WebUI(8099, database, speech, processor, decoder, sensor_manager)
     webui.update_db_stats(
         db_stats["places"], db_stats["streets"], db_stats["capcodes"], db_stats["texts"], db_stats["geocodes"]
     )
 
-    # Connect decoder output to server and webui
-    # (global ignore filters are applied in the decoder, before this callback)
+    # An invalid receiver config must not crash-loop the add-on: keep the web
+    # UI up and show the error there instead of starting the decoder.
+    decoder_ok = True
+    try:
+        decoder.validate()
+    except RuntimeError as e:
+        decoder_ok = False
+        decoder.last_error = f"{e} - fix the add-on configuration and restart"
+        logger.error(decoder.last_error)
+
     def on_message(msg):
         server.broadcast_message(msg)
         webui.add_message(msg)
-        # Update decoder status when we receive messages
-        webui.update_status(decoder_running=decoder.is_running)
 
-    decoder.on_message = on_message
-    # Reload TTS rules / ignore filters in the decoder when edited via the web UI
-    webui.on_tts_changed = decoder.reload_tts_replacements
-    webui.on_ignore_changed = decoder.reload_ignore_filters
+    processor.on_message = on_message
+    processor.on_repeat = webui.mark_repeat
 
-    # Keep the webui decoder status in sync with the actual pipeline state
-    async def update_decoder_status():
-        ticks = 0
+    async def publish_health():
+        """Refresh database counts for the web UI and publish receiver health to Home Assistant."""
         while True:
+            # The receiver gets a minute to decode its first frames before it's reported
+            await asyncio.sleep(60)
             # Never let one failure (e.g. a locked database) kill the loop
             try:
-                webui.update_status(decoder_running=decoder.is_running)
-                webui.set_decoder_error(decoder.last_error)
-                webui.set_geocoder_info(
-                    configured=config.opencage_enabled,
-                    enabled=decoder.geocoder.enabled,
-                    rate_remaining=decoder.geocoder.rate_remaining,
-                    rate_limited=decoder.geocoder.rate_limited,
+                db_stats = database.get_stats()
+                webui.update_db_stats(
+                    db_stats["places"],
+                    db_stats["streets"],
+                    db_stats["capcodes"],
+                    db_stats["texts"],
+                    db_stats["geocodes"],
                 )
-                ticks += 1
-                if ticks % 15 == 0:
-                    # Refresh DB counts so the Advanced tab reflects imports
-                    # without needing a restart
-                    db_stats = database.get_stats()
-                    webui.update_db_stats(
-                        db_stats["places"],
-                        db_stats["streets"],
-                        db_stats["capcodes"],
-                        db_stats["texts"],
-                        db_stats["geocodes"],
-                    )
+                await publisher.publish_health(
+                    decoder.stats.online(config.offline_after_minutes), decoder.stats.messages_last_hour()
+                )
             except Exception:
-                logger.exception("Status update failed")
-            await asyncio.sleep(2)
+                logger.exception("Health update failed")
 
     # Keep a reference so the task isn't garbage-collected mid-run; it lives
     # for the app's lifetime and is cancelled along with everything else in
     # do_shutdown() below.
     background_tasks: set[asyncio.Task] = set()
-    status_task = asyncio.create_task(update_decoder_status())
-    background_tasks.add(status_task)
-    status_task.add_done_callback(background_tasks.discard)
+
+    def run_in_background(coro):
+        task = asyncio.create_task(coro)
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+
+    run_in_background(publish_health())
+    if ha_client.available:
+        # The home zone (distance_km) and the zones sensors filter on
+        run_in_background(load_zones(ha_client, {HOME_ZONE} | sensor_manager.zone_ids, processor.set_zone))
 
     async def do_shutdown():
         """Perform shutdown once."""
@@ -147,6 +135,11 @@ async def main() -> int:
                 await decoder.stop()
             except Exception as e:
                 logger.debug(f"Decoder stop error: {e}")
+            try:
+                await publisher.stop()
+            except Exception as e:
+                logger.debug(f"Publisher stop error: {e}")
+            await ha_client.close()
             try:
                 await server.stop()
             except Exception as e:
@@ -179,9 +172,7 @@ async def main() -> int:
     loop = asyncio.get_event_loop()
 
     def on_signal():
-        task = asyncio.create_task(do_shutdown())
-        background_tasks.add(task)
-        task.add_done_callback(background_tasks.discard)
+        run_in_background(do_shutdown())
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, on_signal)
@@ -190,6 +181,7 @@ async def main() -> int:
     # exit non-zero so the finish script stops the add-on instead of
     # restarting it in a loop.
     exit_code = 0
+    await publisher.start()
     services = [server.start(), webui.start()]
     if decoder_ok:
         services.append(decoder.start())

@@ -10,6 +10,8 @@ Topic layout:
   configured base_topic/ha_autodiscovery_topic.
 - The attribute JSON payload uses descriptive key names (with spaces, e.g.
   "time received") for readability in Lovelace cards/templates.
+- Receiver health is published under "{base_topic}/receiver_online" and
+  "{base_topic}/messages_per_hour".
 """
 
 import asyncio
@@ -151,7 +153,7 @@ class MQTTClient:
         self,
         sensor: SensorConfig,
         msg: P2000Message,
-        tts_text: str,
+        zone_distance: float | None,
         opencage_info: str,
     ) -> None:
         """Publish state/attributes (and HA discovery, once) for one matched sensor."""
@@ -183,8 +185,10 @@ class MQTTClient:
             "latitude": msg.latitude,
             "opencage": opencage_info,
             "mapurl": msg.mapurl,
-            "distance": msg.distance,
-            "tts": tts_text,
+            "distance": zone_distance,
+            "distance_km": msg.distance_km,
+            "incident id": msg.incident_id,
+            "tts": msg.tts,
         }
 
         retain = self.config.mqtt_retain
@@ -217,6 +221,47 @@ class MQTTClient:
             logger.debug(f"Sent MQTT autodiscovery for sensor '{sensor.name}' ({sensor_key})")
         except Exception as e:
             logger.error(f"Failed to publish MQTT discovery for sensor '{sensor.name}': {e}")
+
+    def publish_health(self, online: bool, messages_per_hour: int) -> None:
+        """Publish the receiver online state and message rate (with HA discovery, once per connection)."""
+        if not self.enabled or not self._client or not self._connected:
+            return
+        online_topic = f"{self.base_topic}/receiver_online"
+        rate_topic = f"{self.base_topic}/messages_per_hour"
+        if self.config.mqtt_ha_autodiscovery and "__health__" not in self._discovered:
+            autodiscovery_topic = self.config.mqtt_ha_autodiscovery_topic or "homeassistant"
+            device = {"identifiers": ["meldkamer"], "name": "Meldkamer"}
+            configs = {
+                f"{autodiscovery_topic}/binary_sensor/p2000_rtlsdr/receiver_online/config": {
+                    "name": "Receiver online",
+                    "unique_id": "meldkamer_receiver_online",
+                    "device_class": "connectivity",
+                    "state_topic": online_topic,
+                    "availability_topic": self.availability_topic,
+                    "device": device,
+                },
+                f"{autodiscovery_topic}/sensor/p2000_rtlsdr/messages_per_hour/config": {
+                    "name": "Messages per hour",
+                    "unique_id": "meldkamer_messages_per_hour",
+                    "icon": "mdi:message-flash",
+                    "unit_of_measurement": "msg/h",
+                    "state_class": "measurement",
+                    "state_topic": rate_topic,
+                    "availability_topic": self.availability_topic,
+                    "device": device,
+                },
+            }
+            try:
+                for topic, payload in configs.items():
+                    self._client.publish(topic, payload=json.dumps(payload), qos=1, retain=True)
+                self._discovered.add("__health__")
+            except Exception as e:
+                logger.error(f"Failed to publish MQTT discovery for receiver health: {e}")
+        try:
+            self._client.publish(online_topic, payload="ON" if online else "OFF", retain=True)
+            self._client.publish(rate_topic, payload=str(messages_per_hour), retain=True)
+        except Exception as e:
+            logger.error(f"Failed to publish MQTT receiver health: {e}")
 
     async def stop(self) -> None:
         """Announce offline and disconnect."""
