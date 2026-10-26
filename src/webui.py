@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 MAX_MESSAGES = 500
 
-ADDON_VERSION = "0.0.99"
+ADDON_VERSION = "1.0.0"
 
 
 def _int_param(request: web.Request, name: str, default: int, minimum: int = 1, maximum: int = 1000) -> int:
