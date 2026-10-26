@@ -29,27 +29,9 @@ class Parser:
 
     def parse(self, line: str) -> P2000Message | None:
         """
-        Parse a message line from multimon-ng.
-
-        FLEX format:
-        FLEX|YYYY-MM-DD HH:MM:SS|baud/frame/type|groupid|capcodes|msgtype|body
-
-        POCSAG format:
-        POCSAG1200: Address: 1234567 Function: 0 Alpha: Message text here
+        Parse an alphanumeric FLEX message line from multimon-ng:
+        FLEX|YYYY-MM-DD HH:MM:SS|baud/frame/type|groupid|capcodes|ALN|body
         """
-        if line.startswith("FLEX"):
-            return self._parse_flex(line)
-        elif line.startswith("POCSAG"):
-            return self._parse_pocsag(line)
-        return None
-
-    def _parse_flex(self, line: str) -> P2000Message | None:
-        """Parse FLEX format message."""
-        # Only process ALN (alphanumeric) messages
-        if "|ALN|" not in line:
-            logger.debug(f"Skipping non-ALN FLEX message: {line[:50]}")
-            return None
-
         parts = line.split("|")
         if len(parts) < 7:
             logger.debug(f"Invalid FLEX format (need 7+ parts, got {len(parts)}): {line[:50]}")
@@ -81,52 +63,6 @@ class Parser:
             capcodes=capcodes,
             group_id=group_id,
             message_type="FLEX",
-        )
-
-        # Extract priority
-        msg.priority = self._extract_priority(body)
-
-        # Extract address components
-        self._extract_address(msg)
-
-        # Lookup capcode information
-        self._enrich_from_capcodes(msg)
-
-        # Expand abbreviations in message body
-        self._expand_abbreviations(msg)
-
-        # Best-effort vehicle/unit classification (icon, photo lookup key)
-        self._classify_vehicle(msg)
-
-        return msg
-
-    def _parse_pocsag(self, line: str) -> P2000Message | None:
-        """Parse POCSAG format message."""
-        # Format: POCSAG1200: Address: 1234567 Function: 0 Alpha: Message text
-        import re
-
-        match = re.match(r"POCSAG\d+:\s*Address:\s*(\d+)\s*Function:\s*(\d+)\s*(?:Alpha|Numeric):\s*(.*)", line)
-        if not match:
-            logger.debug(f"Invalid POCSAG format: {line[:50]}")
-            return None
-
-        capcode = match.group(1)
-        function = match.group(2)
-        body = match.group(3).strip()
-
-        if not body:
-            logger.debug(f"Skipping empty POCSAG message: {line[:50]}")
-            return None
-
-        logger.debug(f"POCSAG: capcode={capcode}, body={body[:50]}...")
-
-        msg = P2000Message(
-            timestamp=datetime.now(UTC).astimezone(),
-            body=body,
-            raw_message=line.strip(),
-            capcodes=[capcode],
-            group_id=f"F{function}",
-            message_type="POCSAG",
         )
 
         # Extract priority

@@ -1,25 +1,50 @@
 configuration:
   receiver:
     name: Receiver
-    description: SDR receiver type and settings
+    description: >-
+      SDR receiver type and settings. bias_tee powers an active antenna or LNA
+      (rtl-sdr only). offline_after_minutes is how long without FLEX frames
+      before the receiver counts as offline and the decoder switches to the
+      backup rtl_tcp receiver (backup_host/backup_port), or restarts the
+      active one when no backup is set.
   geocoding:
     name: Geocoding
     description: OpenCage geocoding settings for address lookup and map display
-  filters:
-    name: Filters
+  repeat_window_seconds:
+    name: Repeat window (seconds)
     description: >-
-      Message filtering to ignore specific text patterns or capcodes.
-      Text patterns support wildcards (*). Format: comma-separated.
-      Example text: "*test*,*TEST*" | Example capcodes: "123456789,987654321"
+      An identical message received again within this many seconds is counted
+      as a repeat instead of a new message. 0 disables repeat suppression.
+  incident_window_minutes:
+    name: Incident window (minutes)
+    description: >-
+      Messages for the same address within this many minutes of each other are
+      grouped into one incident.
+  ha_events:
+    name: Home Assistant events
+    description: >-
+      Fire meldkamer_message for every message and
+      meldkamer_incident_escalated when an incident escalates, for use as
+      automation triggers.
+  announce:
+    name: Announce on speakers
+    description: >-
+      Speak messages of sensors with "announce: true" on Home Assistant media
+      players using tts.speak. tts_entity is e.g. tts.google_translate_nl_nl,
+      media_players is a comma-separated list of media_player entities.
   sensors_enabled:
     name: Sensors Enabled
-    description: Enable publishing matching P2000 messages to Home Assistant sensors
+    description: >-
+      Publish matching P2000 messages, receiver health and messages per hour
+      to Home Assistant sensors
   sensors:
     name: Sensors
     description: >-
       Define custom Home Assistant sensors with filters for P2000 messages.
       All text fields (disciplines, cities, capcodes, priorities, text_contains)
-      support comma-separated values for matching multiple items.
+      support comma-separated values for matching multiple items. zone
+      (e.g. zone.home) only matches messages inside that Home Assistant
+      zone, using its location and radius.
   log_level:
     name: Log Level
     description: Logging verbosity

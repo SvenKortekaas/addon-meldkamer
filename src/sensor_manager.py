@@ -1,13 +1,13 @@
 """Sensor manager for filtering and matching P2000 messages."""
 
 import logging
-import math
 import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
 from .message import P2000Message
+from .zones import Zone, distance_km
 
 logger = logging.getLogger(__name__)
 
@@ -61,9 +61,7 @@ class SensorFilter:
     capcodes: list[str] | None = None
     priorities: list[str] | None = None
     region: str | None = None
-    radius_km: float | None = None
-    center_lat: float | None = None
-    center_lon: float | None = None
+    zone: str | None = None  # Home Assistant zone entity id, e.g. "zone.home"
     text_contains: str | None = None
 
 
@@ -78,6 +76,10 @@ class SensorConfig:
     # Optional stable identifier for this sensor's MQTT topics/unique_id.
     # Falls back to entity_id when not set.
     mqtt_id: str | None = None
+    # Speak matching messages on the configured Home Assistant media players
+    announce: bool = False
+    # The zone named in filters.zone, once read from Home Assistant
+    zone: Zone | None = None
 
 
 class SensorManager:
@@ -85,22 +87,28 @@ class SensorManager:
 
     def __init__(self, sensors: list[SensorConfig]):
         self.sensors = sensors
-        self._radius_warned: set = set()  # Sensors already warned about missing center coordinates
         self._priority_warned: set = set()  # (sensor, entry) pairs already warned about as unparseable
         logger.info(f"Loaded {len(sensors)} sensor(s)")
 
+    @property
+    def zone_ids(self) -> set[str]:
+        """Zone entity ids used by sensor filters."""
+        return {s.filters.zone for s in self.sensors if s.filters.zone}
+
+    def set_zone(self, zone: Zone) -> None:
+        """Attach a zone read from Home Assistant to the sensors filtering on it."""
+        for sensor in self.sensors:
+            if sensor.filters.zone == zone.entity_id:
+                sensor.zone = zone
+
     def get_matching_sensors(self, msg: P2000Message) -> list[SensorConfig]:
         """Get all sensors that match the given message."""
-        matching = []
-
-        for sensor in self.sensors:
-            if self._message_matches_filters(msg, sensor):
-                matching.append(sensor)
-                logger.debug(f"Message matched sensor: {sensor.entity_id}")
-
+        matching = [sensor for sensor in self.sensors if self.matches(msg, sensor)]
+        for sensor in matching:
+            logger.debug(f"Message matched sensor: {sensor.entity_id}")
         return matching
 
-    def _message_matches_filters(self, msg: P2000Message, sensor: SensorConfig) -> bool:
+    def matches(self, msg: P2000Message, sensor: SensorConfig) -> bool:
         """Check if message matches all filter criteria (AND logic)."""
         filters = sensor.filters
 
@@ -143,57 +151,21 @@ class SensorManager:
         if filters.region and (not msg.region or filters.region.lower() not in msg.region.lower()):
             return False
 
-        # Geographic radius filter
-        if filters.radius_km is not None and not self._within_radius(msg, sensor):
-            return False
+        # Zone filter: inside the zone's radius (never matches until the zone is read from HA)
+        if filters.zone:
+            distance = self.zone_distance(msg, sensor)
+            if distance is None or distance > sensor.zone.radius_km:
+                return False
 
         # Text contains filter (case-insensitive)
         return not (filters.text_contains and (not msg.body or filters.text_contains.lower() not in msg.body.lower()))
 
-    def _within_radius(self, msg: P2000Message, sensor: SensorConfig) -> bool:
-        """Check if message location is within radius of center point."""
-        filters = sensor.filters
-        if filters.center_lat is None or filters.center_lon is None:
-            # Radius set without center coordinates can never match - warn once per sensor
-            if sensor.name not in self._radius_warned:
-                logger.warning(
-                    f"Sensor '{sensor.name}' has radius_km set but no center_lat/center_lon - "
-                    "radius filter will never match"
-                )
-                self._radius_warned.add(sensor.name)
-            return False
-
-        try:
-            msg_lat = float(msg.latitude)
-            msg_lon = float(msg.longitude)
-        except (TypeError, ValueError):
-            return False  # Message has no usable coordinates
-
-        distance_km = round(self._haversine_distance(msg_lat, msg_lon, filters.center_lat, filters.center_lon), 2)
-
-        # Record the computed distance on the message (keep the smallest across sensors).
-        # msg.distance is "" for a freshly-decoded P2000Message, but messages reloaded
-        # from the database (SQL NULL) or wrapped by _DictMessageView (missing/null key)
-        # come through as None instead - treat both as "not yet set".
-        if msg.distance in ("", None) or distance_km < msg.distance:
-            msg.distance = distance_km
-
-        return distance_km <= filters.radius_km
-
     @staticmethod
-    def _haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-        """Calculate distance between two points in kilometers using Haversine formula."""
-        R = 6371  # Earth's radius in kilometers
-
-        lat1_rad = math.radians(lat1)
-        lat2_rad = math.radians(lat2)
-        delta_lat = math.radians(lat2 - lat1)
-        delta_lon = math.radians(lon2 - lon1)
-
-        a = math.sin(delta_lat / 2) ** 2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(delta_lon / 2) ** 2
-        c = 2 * math.asin(math.sqrt(a))
-
-        return R * c
+    def zone_distance(msg: P2000Message, sensor: SensorConfig) -> float | None:
+        """Distance from the message to the centre of the sensor's zone (km), None when unknown."""
+        if sensor.zone is None:
+            return None
+        return distance_km(msg, sensor.zone.latitude, sensor.zone.longitude)
 
 
 def load_sensors_from_config(config_data: list[dict[str, Any]]) -> list[SensorConfig]:
@@ -204,9 +176,9 @@ def load_sensors_from_config(config_data: list[dict[str, Any]]) -> list[SensorCo
 
     for sensor_data in config_data:
         try:
-            # Auto-generate entity_id from name if not provided; reduce either to a valid HA object id
+            # The entity id is generated from the name, reduced to a valid HA object id
             name = sensor_data["name"]
-            entity_id = slugify(str(sensor_data.get("entity_id") or name))
+            entity_id = slugify(str(name))
             if not entity_id:
                 logger.error(f"Sensor '{name}' skipped: its name gives an empty entity_id (use letters or digits)")
                 continue
@@ -218,25 +190,13 @@ def load_sensors_from_config(config_data: list[dict[str, Any]]) -> list[SensorCo
                     return None
                 return [item.strip() for item in value.split(",") if item.strip()]
 
-            def parse_float(value):
-                """Parse a float from config (number or string), return None if absent/invalid."""
-                if value is None or (isinstance(value, str) and not value.strip()):
-                    return None
-                try:
-                    return float(value)
-                except (TypeError, ValueError):
-                    logger.error(f"Invalid numeric sensor filter value: {value!r}")
-                    return None
-
             filters = SensorFilter(
                 disciplines=parse_csv(sensor_data.get("disciplines")),
                 cities=parse_csv(sensor_data.get("cities")),
                 capcodes=parse_csv(sensor_data.get("capcodes")),
                 priorities=parse_csv(sensor_data.get("priorities")),
                 region=sensor_data.get("region"),
-                radius_km=parse_float(sensor_data.get("radius_km")),
-                center_lat=parse_float(sensor_data.get("center_lat")),
-                center_lon=parse_float(sensor_data.get("center_lon")),
+                zone=sensor_data.get("zone") or None,
                 text_contains=sensor_data.get("text_contains"),
             )
 
@@ -261,6 +221,7 @@ def load_sensors_from_config(config_data: list[dict[str, Any]]) -> list[SensorCo
                 filters=filters,
                 icon=sensor_data.get("icon", "mdi:radio-tower"),
                 mqtt_id=mqtt_id or None,
+                announce=sensor_data.get("announce", False),
             )
 
             sensors.append(sensor)

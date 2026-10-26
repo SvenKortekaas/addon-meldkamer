@@ -1,5 +1,5 @@
 name: Meldkamer
-version: "1.0.0"
+version: "1.1.0"
 slug: "meldkamer"
 description: "P2000 FLEX pager decoder dashboard for Home Assistant - decode Dutch emergency services messages using RTL-SDR or HackRF"
 url: https://github.com/cyberjunky/addon-meldkamer
@@ -42,28 +42,32 @@ options:
     hackrf_lna_gain: 40
     hackrf_vga_gain: 30
     hackrf_amp_enable: true
+    bias_tee: false
+    offline_after_minutes: 10
+    backup_host: ""
+    backup_port: 1234
+    backup_ppm_correction: 0
   geocoding:
     enabled: false
     opencage_token: ""
+  repeat_window_seconds: 60
+  incident_window_minutes: 15
+  ha_events: true
+  announce:
+    tts_entity: ""
+    media_players: ""
+    language: nl
   sensors_enabled: false
   sensors:
-    - name: Dordrecht e.o
-      icon: mdi:sheep
-      radius_km: 20
-      center_lat: 51.8133
-      center_lon: 4.6739
+    - name: Thuis
+      icon: mdi:home
+      zone: zone.home
     - name: GRIP
       icon: mdi:magnify
       text_contains: "GRIP"
     - name: Brandweer
       icon: mdi:fire-truck
       disciplines: "Brandweer"
-    - name: Schiphol
-      icon: mdi:airplane
-      radius_km: 3
-      center_lat: 52.3086
-      center_lon: 4.7639
-      priorities: "P1, A1"
   mqtt:
     enabled: false
     host: ""
@@ -88,9 +92,21 @@ schema:
     hackrf_lna_gain: int(0,40)?
     hackrf_vga_gain: int(0,62)?
     hackrf_amp_enable: bool?
+    bias_tee: bool?
+    offline_after_minutes: int(1,120)?
+    backup_host: 'match(^[A-Za-z0-9.:\[\]-]*$)?'
+    backup_port: int?
+    backup_ppm_correction: int?
   geocoding:
     enabled: bool
     opencage_token: password
+  repeat_window_seconds: int(0,3600)?
+  incident_window_minutes: int(1,240)?
+  ha_events: bool?
+  announce:
+    tts_entity: 'match(^(tts\.[a-z0-9_]+)?$)?'
+    media_players: str?
+    language: str?
   sensors_enabled: bool?
   sensors:
     - name: str
@@ -101,9 +117,8 @@ schema:
       priorities: str?
       text_contains: str?
       region: str?
-      radius_km: float?
-      center_lat: float?
-      center_lon: float?
+      zone: 'match(^(zone\.[a-z0-9_]+)?$)?'
+      announce: bool?
       mqtt_id: str?
   mqtt:
     enabled: bool?
