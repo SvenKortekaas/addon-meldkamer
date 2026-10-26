@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.3
+
+- The sensor filter uses exactly the same style as the view tabs.
+- Tab and filter labels are centred exactly.
+
 ## 1.2.2
 
 - The sensor filter in the top bar is a labelled, outlined control like the view tabs, so it stands out in every view.

@@ -34,7 +34,7 @@ MAX_PHOTO_SIZE = 5 * 1024 * 1024
 MAX_FORM_FIELD_SIZE = 4 * 1024
 PHOTO_MIME_TYPES = ("image/jpeg", "image/png", "image/webp", "image/gif")
 
-ADDON_VERSION = "1.2.2"
+ADDON_VERSION = "1.2.3"
 
 # The dashboard's map tiles come from Home Assistant's built-in map_tiles proxy:
 # browsers loading tiles straight from OpenStreetMap inside the ingress iframe
@@ -1369,6 +1369,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .tabs { display: flex; gap: 2px; padding: 2px; border-radius: 6px; background: var(--ha-background); border: var(--card-border); }
         .tab {
             height: 28px; padding: 0 12px; border: none; border-radius: 4px; cursor: pointer;
+            display: inline-flex; align-items: center; justify-content: center; line-height: 1; white-space: nowrap;
             background: transparent; color: var(--secondary-text-color); font-size: 12.5px; font-weight: 500;
         }
         .tab:hover { color: var(--primary-text-color); }
@@ -1384,23 +1385,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .rx.stopped { color: var(--danger-color); }
         .spacer { flex: 1; }
 
-        /* Sensor filter: a segmented control like the view tabs */
-        .topbar > .filter-pills {
-            flex-shrink: 1; min-width: 0; display: flex; align-items: center; gap: 2px; padding: 2px;
-            border-radius: 6px; background: var(--ha-background); border: 1px solid var(--primary-color);
-            overflow-x: auto; scrollbar-width: none;
-        }
-        .topbar > .filter-pills:empty { display: none; }
+        /* Sensor filter: the view tabs' segmented control, scrolling sideways when space runs out */
+        .topbar > .filter-tabs { flex-shrink: 1; min-width: 0; align-items: center; overflow-x: auto; scrollbar-width: none; }
+        .topbar > .filter-tabs:empty { display: none; }
         .filter-label {
-            padding: 0 8px 0 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.07em;
-            text-transform: uppercase; color: var(--primary-color);
+            padding: 0 8px 0 8px; font-size: 11px; font-weight: 600; letter-spacing: 0.07em;
+            text-transform: uppercase; color: var(--secondary-text-color);
         }
-        .sensor-filter-pill {
-            height: 28px; padding: 0 12px; border: none; border-radius: 4px; cursor: pointer;
-            background: transparent; color: var(--primary-text-color); font-size: 12.5px; font-weight: 500;
-        }
-        .sensor-filter-pill:hover { background: var(--hover-bg); }
-        .sensor-filter-pill.active { background: var(--primary-color); color: #fff; }
 
         .icon-btn {
             width: 28px; height: 28px; border-radius: 4px; border: var(--card-border);
@@ -1872,7 +1863,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <span class="kpi-extra">INCIDENTS <b id="kpi-incidents">0</b></span>
         </div>
         <span class="spacer"></span>
-        <div id="sensor-filter-bar" class="filter-pills" aria-label="Feed filter"></div>
+        <div id="sensor-filter-bar" class="tabs filter-tabs" aria-label="Feed filter"></div>
         <button id="sound-toggle" class="icon-btn" onclick="toggleSound()" title="Toggle notification sound">
             <span id="sound-icon">🔔</span>
         </button>
@@ -2671,7 +2662,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         let activeView = 'console';
 
         function switchTab(tabName) {
-            document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tabName));
+            document.querySelectorAll('.tab[data-tab]').forEach(t => t.classList.toggle('active', t.dataset.tab === tabName));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === 'tab-' + tabName));
             localStorage.setItem('p2000_tab', tabName);
             if (tabName === 'info' || tabName === 'settings') loadReceiver();
@@ -3633,9 +3624,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     // the feed, so showing everything by default defeats that.
                     currentSensorFilter = '__any__';
                     const pills = [
-                        `<button type="button" class="sensor-filter-pill active" data-sensor="__any__">Sensors</button>`,
-                        `<button type="button" class="sensor-filter-pill" data-sensor="">All</button>`,
-                    ].concat(sensors.map(s => `<button type="button" class="sensor-filter-pill" data-sensor="${escapeHtml(s.name)}">${escapeHtml(s.name)}</button>`));
+                        `<button type="button" class="tab sensor-filter-pill active" data-sensor="__any__">Sensors</button>`,
+                        `<button type="button" class="tab sensor-filter-pill" data-sensor="">All</button>`,
+                    ].concat(sensors.map(s => `<button type="button" class="tab sensor-filter-pill" data-sensor="${escapeHtml(s.name)}">${escapeHtml(s.name)}</button>`));
                     bar.innerHTML = '<span class="filter-label">Filter</span>' + pills.join('');
                     bar.addEventListener('click', (e) => {
                         const pill = e.target.closest('.sensor-filter-pill');
