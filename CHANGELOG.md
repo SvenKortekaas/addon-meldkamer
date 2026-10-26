@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.0
+
+- New compact dashboard with three views, switched with tabs in the top bar:
+  - **Console**: a dense message table, with the map and the full message detail (vehicle photo, incident timeline, earlier messages at the address) docked on the right.
+  - **Wallboard**: a large map with live counts, incidents sorted by priority, and a ticker of the newest messages.
+  - **Lanes**: one column each for Brandweer, Ambulance, Politie and other disciplines, next to the map.
+- Wallboard and Lanes open the message detail in a popup; Console shows it docked.
+- The theme follows Home Assistant's light/dark mode, with a button to force light or dark.
+- Fits one screen: receiver status, messages per hour, frames per minute and open incidents in the top bar; decoder and device status in a status bar.
+
 ## 1.1.1
 
 - Prebuilt images: the add-on is now pulled from `ghcr.io/cyberjunky/addon-meldkamer` instead of being compiled on your system, so installing and updating take a minute instead of a long build.

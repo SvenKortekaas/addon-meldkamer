@@ -62,6 +62,11 @@ class ReceiverStats:
         now = int(time.time() // 60)
         return [b for b in self._buckets if now - HISTORY_MINUTES <= b.minute < now]
 
+    def frames_last_minute(self) -> int:
+        """FLEX frames in the last complete minute."""
+        last = int(time.time() // 60) - 1
+        return next((b.frames for b in self._buckets if b.minute == last), 0)
+
     def messages_last_hour(self) -> int:
         now = int(time.time() // 60)
         return sum(b.messages for b in self._buckets if b.minute > now - HISTORY_MINUTES)
@@ -70,10 +75,9 @@ class ReceiverStats:
         """Summary and per-minute history for the web UI."""
         recent = self._recent()
         frames = sum(b.frames for b in recent)
-        last_minute = recent[-1] if recent and recent[-1].minute == int(time.time() // 60) - 1 else None
         return {
             "silent_for": self.silent_for(),
-            "frames_last_minute": last_minute.frames if last_minute else 0,
+            "frames_last_minute": self.frames_last_minute(),
             "messages_last_hour": self.messages_last_hour(),
             "frames_last_hour": frames,
             "failed_last_hour": sum(b.failed for b in recent),
