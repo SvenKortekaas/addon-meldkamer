@@ -1395,6 +1395,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         /* Sensor filter: the view tabs' segmented control, scrolling sideways when space runs out */
         .topbar > .filter-tabs { flex-shrink: 1; min-width: 0; align-items: center; overflow-x: auto; scrollbar-width: none; }
         .topbar > .filter-tabs:empty { display: none; }
+        /* On narrower screens the sensor buttons become a dropdown */
+        .filter-select {
+            display: none; height: 28px; padding: 0 6px 0 10px; border: 0; border-radius: 4px; cursor: pointer;
+            background: var(--primary-color); color: #fff; font: inherit; font-size: 12.5px; font-weight: 500;
+        }
+        .filter-select option { background: var(--ha-card-background); color: var(--primary-text-color); }
+        .icon-tab { width: 32px; padding: 0; font-size: 14px; }
+        .icon-tab.off { opacity: 0.45; }
         .filter-label {
             padding: 0 8px 0 8px; font-size: 11px; font-weight: 600; letter-spacing: 0.07em;
             text-transform: uppercase; color: var(--secondary-text-color);
@@ -1830,7 +1838,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         /* Smaller screens (laptops, 1280-1400 px wide or up to 800 px high) */
         @media (max-width: 1400px) {
-            .brand-name, .filter-label, .kpis .kpi-extra { display: none; }
+            .brand-name, .kpis .kpi-extra, .sensor-filter-pill { display: none; }
+            .filter-select { display: block; }
             .clock { font-size: 18px; }
             .console { grid-template-columns: minmax(0, 1fr) var(--console-side, minmax(460px, 40%)); }
             .feed-head, .feed-row { grid-template-columns: 62px 42px minmax(0, 96px) minmax(160px, 1fr) minmax(0, 150px); }
@@ -1884,18 +1893,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
         <span class="spacer"></span>
         <div id="sensor-filter-bar" class="tabs filter-tabs" aria-label="Feed filter"></div>
-        <button id="sound-toggle" class="icon-btn" onclick="toggleSound()" title="Toggle notification sound">
-            <span id="sound-icon">🔔</span>
-        </button>
-        <button id="tts-toggle" class="icon-btn off" onclick="toggleTts()" title="Toggle speech output">
-            <span id="tts-icon">🔇</span>
-        </button>
-        <button id="automap-toggle" class="icon-btn" onclick="toggleAutoMap()" title="Auto-show new messages on map">
-            <span id="automap-icon">📍</span>
-        </button>
-        <button id="theme-toggle" class="icon-btn" onclick="cycleTheme()" title="Theme">
-            <span id="theme-icon">🌓</span>
-        </button>
+        <div class="tabs" role="group" aria-label="Sound, speech, map focus and theme">
+            <button type="button" id="sound-toggle" class="tab icon-tab" onclick="toggleSound()" title="Toggle notification sound">
+                <span id="sound-icon">🔔</span>
+            </button>
+            <button type="button" id="tts-toggle" class="tab icon-tab" onclick="toggleTts()" title="Toggle speech output">
+                <span id="tts-icon">🔇</span>
+            </button>
+            <button type="button" id="automap-toggle" class="tab icon-tab" onclick="toggleAutoMap()" title="Auto-show new messages on map">
+                <span id="automap-icon">📍</span>
+            </button>
+            <button type="button" id="theme-toggle" class="tab icon-tab" onclick="cycleTheme()" title="Theme">
+                <span id="theme-icon">🌓</span>
+            </button>
+        </div>
         <span id="clock" class="clock"></span>
     </header>
 
@@ -2501,6 +2512,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         function initSoundToggle() {
             const btn = document.getElementById('sound-toggle');
             const icon = document.getElementById('sound-icon');
+            btn.classList.toggle('active', soundEnabled);
             btn.classList.toggle('off', !soundEnabled);
             icon.textContent = soundEnabled ? '🔔' : '🔕';
             btn.title = soundEnabled ? 'Sound notifications ON - click to disable' : 'Sound notifications OFF - click to enable';
@@ -2560,6 +2572,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         function initAutoMapToggle() {
             const btn = document.getElementById('automap-toggle');
             const icon = document.getElementById('automap-icon');
+            btn.classList.toggle('active', autoMapEnabled);
             btn.classList.toggle('off', !autoMapEnabled);
             icon.textContent = autoMapEnabled ? '📍' : '📌';
             btn.title = autoMapEnabled ? 'Auto-focus ON - new messages show on map' : 'Auto-focus OFF - click to enable';
@@ -2588,6 +2601,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         function initTtsToggle() {
             const btn = document.getElementById('tts-toggle');
             const icon = document.getElementById('tts-icon');
+            btn.classList.toggle('active', ttsEnabled);
             btn.classList.toggle('off', !ttsEnabled);
             icon.textContent = ttsEnabled ? '🗣️' : '🔇';
             btn.title = ttsEnabled ? 'Speech ON - new messages are read aloud' : 'Speech OFF - click to enable';
@@ -3656,6 +3670,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             document.querySelectorAll('.sensor-filter-pill').forEach(el => {
                 el.classList.toggle('active', el.dataset.sensor === name);
             });
+            document.querySelector('.filter-select').value = name;
             lastMsgsSig = null;  // force re-render even if the next batch looks identical in size/timestamps
             clearSelectedMessage();
             connectStream();
@@ -3674,11 +3689,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         `<button type="button" class="tab sensor-filter-pill active" data-sensor="__any__">Sensors</button>`,
                         `<button type="button" class="tab sensor-filter-pill" data-sensor="">All</button>`,
                     ].concat(sensors.map(s => `<button type="button" class="tab sensor-filter-pill" data-sensor="${escapeHtml(s.name)}">${escapeHtml(s.name)}</button>`));
-                    bar.innerHTML = '<span class="filter-label">Filter</span>' + pills.join('');
+                    const options = [['__any__', 'Sensors'], ['', 'All']].concat(sensors.map(s => [s.name, s.name]))
+                        .map(([value, label]) => `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`);
+                    bar.innerHTML = '<span class="filter-label">Filter</span>' + pills.join('')
+                        + `<select class="filter-select" aria-label="Feed filter">${options.join('')}</select>`;
                     bar.addEventListener('click', (e) => {
                         const pill = e.target.closest('.sensor-filter-pill');
                         if (pill) selectSensorFilter(pill.dataset.sensor);
                     });
+                    bar.querySelector('.filter-select').addEventListener('change', (e) => selectSensorFilter(e.target.value));
                 }
                 connectStream();
                 loadMessagesList();
