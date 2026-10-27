@@ -34,7 +34,7 @@ MAX_PHOTO_SIZE = 5 * 1024 * 1024
 MAX_FORM_FIELD_SIZE = 4 * 1024
 PHOTO_MIME_TYPES = ("image/jpeg", "image/png", "image/webp", "image/gif")
 
-ADDON_VERSION = "1.2.5"
+ADDON_VERSION = "1.2.6"
 
 # The dashboard's map tiles come from Home Assistant's built-in map_tiles proxy:
 # browsers loading tiles straight from OpenStreetMap inside the ingress iframe
@@ -169,6 +169,11 @@ class WebUI:
         """Apply edited global ignore filters right away."""
         self.processor.reload_ignore_filters()
 
+    def _vehicles_changed(self) -> None:
+        """Show edited vehicles on the messages already in memory too."""
+        for item in self.messages:
+            item.update(self.database.resolve_vehicle(item.get("body") or "", item.get("discipline") or ""))
+
     def _load_stats(self) -> dict:
         """Load stats from file/database and restore message history."""
         db_messages = self.database.get_recent_messages(MAX_MESSAGES)
@@ -292,6 +297,10 @@ class WebUI:
         self.app.router.add_post("/api/vehicle-photo", self._handle_set_vehicle_photo)
         self.app.router.add_delete("/api/vehicle-photo/{key_type}/{key_value}", self._handle_delete_vehicle_photo)
         self.app.router.add_get("/api/db/vehicle_photos", self._handle_list_vehicle_photos)
+        self.app.router.add_get("/api/db/vehicles", self._handle_list_vehicles)
+        self.app.router.add_post("/api/db/vehicles", self._handle_set_vehicle)
+        self.app.router.add_put("/api/db/vehicles/{number}", self._handle_update_vehicle)
+        self.app.router.add_delete("/api/db/vehicles/{number}", self._handle_delete_vehicle)
         self.app.router.add_get("/api/vehicle-categories", self._handle_list_vehicle_categories)
 
         # Database reset
@@ -702,6 +711,7 @@ class WebUI:
             "tts_replacements": self.database.export_tts_csv,
             "ignore_text": self.database.export_ignore_text_csv,
             "ignore_capcodes": self.database.export_ignore_capcodes_csv,
+            "vehicles": self.database.export_vehicles_csv,
         }
         exporter = exporters.get(table)
         if exporter is None:
@@ -727,6 +737,7 @@ class WebUI:
             "capcodes": self.database.import_capcodes_csv,
             "places": self.database.import_places_csv,
             "streets": self.database.import_streets_csv,
+            "vehicles": self.database.import_vehicles_csv,
         }
         if table == "messages":
             return web.json_response(
@@ -743,6 +754,8 @@ class WebUI:
             result = await asyncio.to_thread(importer, csv_content, replace)
         except ValueError as e:
             return web.json_response({"error": str(e)}, status=400)
+        if table == "vehicles":
+            self._vehicles_changed()
         return web.json_response(result)
 
     async def _handle_list_provinces(self, request: web.Request) -> web.Response:
@@ -900,6 +913,8 @@ class WebUI:
             self._tts_changed()
         elif table in ("ignore_text", "ignore_capcodes"):
             self._ignore_changed()
+        elif table == "vehicles":
+            self._vehicles_changed()
         return web.json_response({"success": True, "deleted": count})
 
     async def _handle_reset_database(self, request: web.Request) -> web.Response:
@@ -921,6 +936,7 @@ class WebUI:
                 "ignore_text",
                 "ignore_capcodes",
                 "vehicle_photos",
+                "vehicles",
             ]
             for table in tables:
                 with contextlib.suppress(Exception):
@@ -1174,8 +1190,8 @@ class WebUI:
         )
 
     async def _handle_resolve_stock_photo(self, request: web.Request) -> web.Response:
-        """Which bundled stock photo fits a vehicle (?category=&number=), with its credit."""
-        name = vehicle_types.stock_image_for(request.query.get("category", ""), request.query.get("number", ""))
+        """Which bundled stock photo fits a vehicle category (?category=), with its credit."""
+        name = vehicle_types.stock_image_for(request.query.get("category", ""))
         if not name:
             return web.json_response({"error": "Not found"}, status=404)
         return web.json_response({"name": name, **vehicle_types.STOCK_IMAGES[name]})
@@ -1264,6 +1280,40 @@ class WebUI:
         key_type = request.match_info.get("key_type", "")
         key_value = request.match_info.get("key_value", "")
         success = self.database.delete_vehicle_photo(key_type, key_value)
+        return web.json_response({"success": success})
+
+    async def _handle_list_vehicles(self, request: web.Request) -> web.Response:
+        """List known vehicles with pagination and search."""
+        page = _int_param(request, "page", 1, maximum=MAX_PAGE)
+        per_page = _int_param(request, "per_page", 50)
+        return web.json_response(self.database.list_vehicles(page, per_page, request.query.get("search", "")))
+
+    async def _save_vehicle(self, number: str, data: dict) -> web.Response:
+        category = str(data.get("category", "")).strip()
+        if category and category not in vehicle_types.CATEGORY_ICONS:
+            return web.json_response({"error": f"Unknown category '{category}'"}, status=400)
+        success = self.database.set_vehicle(number, category, str(data.get("description", "")).strip())
+        if success:
+            self._vehicles_changed()
+        return web.json_response({"success": success})
+
+    async def _handle_set_vehicle(self, request: web.Request) -> web.Response:
+        """Add or replace a vehicle (number, category, description)."""
+        data = await _json_object(request)
+        number = str(data.get("number", "")).strip()
+        if not number:
+            return web.json_response({"error": "Number is required"}, status=400)
+        return await self._save_vehicle(number, data)
+
+    async def _handle_update_vehicle(self, request: web.Request) -> web.Response:
+        """Edit a vehicle's category/description (the number is the key)."""
+        return await self._save_vehicle(request.match_info.get("number", ""), await _json_object(request))
+
+    async def _handle_delete_vehicle(self, request: web.Request) -> web.Response:
+        """Delete a vehicle."""
+        success = self.database.delete_vehicle(request.match_info.get("number", ""))
+        if success:
+            self._vehicles_changed()
         return web.json_response({"success": success})
 
     async def _handle_list_vehicle_categories(self, request: web.Request) -> web.Response:
@@ -2205,6 +2255,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                                     <button class="btn" onclick="dbOpenTable('vehicle_photos')">Manage</button>
                                 </div>
                             </div>
+
+                            <div class="db-card">
+                                <div class="db-card-head">
+                                    <span class="db-card-title">Vehicles</span>
+                                    <span class="db-card-status empty" id="db-status-vehicles">-</span>
+                                </div>
+                                <div class="db-card-desc">What each vehicle number is (e.g. "11-0293" → brandweer_officier). Filled from the capcode list and from messages that name a vehicle with its type ("TS 07-1782"); add, edit or import your own. Only vehicles listed here get a type and photo.</div>
+                                <div class="db-card-count"><span id="db-count-vehicles">0</span> rows</div>
+                                <div class="db-card-actions">
+                                    <button class="btn" onclick="dbOpenTable('vehicles')">Manage</button>
+                                </div>
+                            </div>
                         </div>
 
                         <div class="db-toolbar" style="margin-top: 22px;">
@@ -3040,17 +3102,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 </div>` : '';
 
             // The photo slot is always there: the recognised vehicle (photo
-            // uploadable), or an unknown unit
+            // uploadable), or an unknown unit. All alerted units are listed, the
+            // shown vehicle in bold.
             const category = msg.vehicle_category;
+            const hasVehicle = Boolean(category || msg.vehicle_number);
+            const units = (msg.vehicle_units && msg.vehicle_units.length) ? msg.vehicle_units : (msg.vehicle_number ? [msg.vehicle_number] : []);
+            const unitsHTML = units.map(u => units.length > 1 && u === msg.vehicle_number ? `<b>${escapeHtml(u)}</b>` : escapeHtml(u)).join(', ');
             const vehicleBlock = `
                 <div class="vehicle-side">
-                    <div class="vehicle-visual" id="vehicle-visual"${category ? ' onclick="openVehiclePhotoUpload()"' : ''}>
+                    <div class="vehicle-visual" id="vehicle-visual"${hasVehicle ? ' onclick="openVehiclePhotoUpload()"' : ''}>
                         <span id="vehicle-icon-fallback">${escapeHtml(msg.vehicle_icon || '📻')}</span>
                     </div>
                     <div class="vehicle-credit" id="vehicle-credit" hidden></div>
-                    <div class="vehicle-category-label">${escapeHtml(category ? prettyVehicleCategory(category) : 'Unknown unit')}</div>
-                    ${msg.vehicle_number ? `<div class="vehicle-number-label">${escapeHtml(msg.vehicle_number)}</div>` : ''}
-                    ${category ? '<button class="btn" onclick="openVehiclePhotoUpload()">Change photo</button>' : ''}
+                    <div class="vehicle-category-label">${escapeHtml(category ? prettyVehicleCategory(category) : (msg.vehicle_number ? 'Vehicle type unknown' : 'Unknown unit'))}</div>
+                    ${msg.vehicle_description ? `<div class="vehicle-number-label">${escapeHtml(msg.vehicle_description)}</div>` : ''}
+                    ${units.length ? `<div class="vehicle-number-label">${unitsHTML}</div>` : ''}
+                    ${hasVehicle ? '<button class="btn" onclick="openVehiclePhotoUpload()">Change photo</button>' : ''}
                 </div>`;
 
             const title = [msg.discipline || 'P2000', placeOf(msg)].filter(Boolean).join(' · ');
@@ -3074,7 +3141,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             `;
             renderDetailNav();
 
-            if (msg.vehicle_category) loadVehiclePhoto(msg);
+            if (msg.vehicle_category || msg.vehicle_number) loadVehiclePhoto(msg);
 
             document.getElementById('history-section').hidden = false;
 
@@ -3179,7 +3246,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         // Shows the bundled stock photo for the vehicle type, with its credit;
         // keeps the emoji fallback when there's none
         async function loadStockVehiclePhoto(msg, visual, fallback, credit) {
-            const query = new URLSearchParams({category: msg.vehicle_category || '', number: msg.vehicle_number || ''});
+            if (!msg.vehicle_category) return;
+            const query = new URLSearchParams({category: msg.vehicle_category});
             let stock;
             try {
                 const response = await fetch(`${basePath}api/vehicle-stock?${query}`);
@@ -3235,13 +3303,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         function openVehiclePhotoUpload() {
             const msg = selectedMsg;
-            if (!msg || !msg.vehicle_category) return;
+            if (!msg || !(msg.vehicle_category || msg.vehicle_number)) return;
 
             const options = [];
             if (msg.vehicle_number) {
                 options.push(`<label class="form-check"><input type="radio" name="vp-key" value="number" checked> This vehicle only (#${escapeHtml(msg.vehicle_number)})</label>`);
             }
-            options.push(`<label class="form-check"><input type="radio" name="vp-key" value="category" ${msg.vehicle_number ? '' : 'checked'}> All "${escapeHtml(prettyVehicleCategory(msg.vehicle_category))}" vehicles (fallback)</label>`);
+            if (msg.vehicle_category) {
+                options.push(`<label class="form-check"><input type="radio" name="vp-key" value="category" ${msg.vehicle_number ? '' : 'checked'}> All "${escapeHtml(prettyVehicleCategory(msg.vehicle_category))}" vehicles (fallback)</label>`);
+            }
 
             const overlay = openModal({
                 title: 'Upload vehicle photo',
@@ -3287,6 +3357,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     .catch(() => toast('Upload failed', 'error'));
             });
         }
+
+        // Vehicle categories for the Vehicles table's category field
+        let vehicleCategories = [];
+        fetch(`${basePath}api/vehicle-categories`)
+            .then(r => r.json())
+            .then(data => { vehicleCategories = (data.categories || []).map(c => c.category); })
+            .catch(() => {});
 
         // Standalone upload from the Settings tab's Vehicle Photos table (no selected message).
         function dbOpenVehiclePhotoUpload() {
@@ -3815,7 +3892,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             tts: ['pattern', 'replacement', 'enabled'],
             ignore_text: ['pattern', 'enabled'],
             ignore_capcodes: ['capcode', 'enabled'],
-            vehicle_photos: ['thumbnail', 'key_type', 'key_value', 'label']
+            vehicle_photos: ['thumbnail', 'key_type', 'key_value', 'label'],
+            vehicles: ['number', 'category', 'description', 'source']
         };
 
         const dbTitles = {
@@ -3828,7 +3906,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             tts: 'TTS Replacements',
             ignore_text: 'Ignore Text',
             ignore_capcodes: 'Ignore Capcodes',
-            vehicle_photos: 'Vehicle Photos'
+            vehicle_photos: 'Vehicle Photos',
+            vehicles: 'Vehicles'
         };
 
         const dbTableButtons = {
@@ -3885,6 +3964,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             vehicle_photos: [
                 {label: '+ Add', cls: 'btn-primary', fn: 'dbOpenVehiclePhotoUpload'},
                 {label: 'Clear table', cls: 'btn-danger', fn: 'dbClearTable'}
+            ],
+            vehicles: [
+                {label: '+ Add', cls: 'btn-primary', fn: 'dbAdd'},
+                {label: 'Export', cls: 'btn-primary', fn: 'dbExport'},
+                {label: 'Import CSV', cls: '', fn: 'dbImportDialog'},
+                {label: 'Clear table', cls: 'btn-danger', fn: 'dbClearTable'}
             ]
         };
 
@@ -3896,7 +3981,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             texts: ['abbreviation', 'full_text'],
             tts: ['pattern', 'replacement'],
             ignore_text: ['pattern'],
-            ignore_capcodes: ['capcode']
+            ignore_capcodes: ['capcode'],
+            vehicles: ['number', 'category', 'description']
         };
 
         function getApiTable(table) {
@@ -3916,7 +4002,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 ['tts_replacements', 'tts'],
                 ['ignore_text', 'ignore_text'],
                 ['ignore_capcodes', 'ignore_capcodes'],
-                ['vehicle_photos', 'vehicle_photos']
+                ['vehicle_photos', 'vehicle_photos'],
+                ['vehicles', 'vehicles']
             ];
             tables.forEach(([api, card]) => {
                 fetch(`${basePath}api/db/${api}?page=1&per_page=1`)
@@ -3973,7 +4060,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const thead = document.getElementById('db-thead');
             const tbody = document.getElementById('db-tbody');
             dbCurrentItems = data.items || [];
-            const editable = ['capcodes', 'places', 'streets', 'tts', 'ignore_text', 'ignore_capcodes'].includes(dbCurrentTable);
+            const editable = ['capcodes', 'places', 'streets', 'tts', 'ignore_text', 'ignore_capcodes', 'vehicles'].includes(dbCurrentTable);
 
             thead.innerHTML = '<tr>' + cols.map(c => `<th>${c}</th>`).join('') + `<th style="width: ${editable ? 76 : 40}px;"></th></tr>`;
 
@@ -4012,6 +4099,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         function dbRowId(item) {
             if (dbCurrentTable === 'capcodes') return item.capcode;
             if (dbCurrentTable === 'geocodes') return item.query;
+            if (dbCurrentTable === 'vehicles') return item.number;
             return item.id;
         }
 
@@ -4064,8 +4152,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             if (dbCurrentTable === 'ignore_capcodes' && f === 'capcode') {
                 return `<input type="text" class="input" data-field="${f}" list="capcode-suggestions" oninput="updateCapcodeSuggestions(this.value)"${valueAttr}>`;
             }
-            // Editing a capcode row: the capcode is the key in the URL and can't change
-            const readonly = value !== undefined && dbCurrentTable === 'capcodes' && f === 'capcode' ? ' readonly' : '';
+            if (dbCurrentTable === 'vehicles' && f === 'category') {
+                const options = ['', ...vehicleCategories].map(c =>
+                    `<option value="${escapeHtml(c)}"${c === (value || '') ? ' selected' : ''}>${c ? escapeHtml(prettyVehicleCategory(c)) : '(unknown)'}</option>`).join('');
+                return `<select class="input" data-field="${f}">${options}</select>`;
+            }
+            // Editing a capcode or vehicle row: the key is in the URL and can't change
+            const readonly = value !== undefined && ((dbCurrentTable === 'capcodes' && f === 'capcode') || (dbCurrentTable === 'vehicles' && f === 'number')) ? ' readonly' : '';
             return `<input type="text" class="input" data-field="${f}"${valueAttr}${readonly}>`;
         }
 

@@ -49,7 +49,7 @@ P2000 FLEX pager decoder dashboard for Home Assistant — decode Dutch emergency
 - 🗺️ **Map History** — Heatmap of past incidents with a time slider
 - 📶 **Reception Quality** — FLEX frames per minute, corrected bit errors and failed decodes, plus automatic ppm calibration
 - 🔀 **Receiver Failover** — Switches to a backup `rtl_tcp` receiver when the active one stops producing frames
-- 🚑 **Vehicle Classification** — Best-effort vehicle/unit recognition (ambulance, fire, helicopter, police, water rescue) with real stock photos per vehicle type (picked from the fire brigade number) and user-uploadable photos per vehicle or category
+- 🚑 **Vehicle Classification** — Best-effort vehicle/unit recognition (ambulance, fire, helicopter, police, water rescue) from a Vehicles table (number → type), with stock photos per vehicle type and user-uploadable photos per vehicle or category
 - 🔔 **Sound Notifications** — Configurable audio alerts for new messages
 - 🔍 **Message Filtering** — Filter by text patterns and capcodes, managed live from the dashboard
 
@@ -105,6 +105,7 @@ Each table gets its own card with row counts and Manage/Import actions:
 | 🙈 Ignore Text | Wildcard patterns to drop matching messages | CSV |
 | 🚫 Ignore Capcodes | Capcodes to drop | CSV |
 | 📷 Vehicle Photos | Photos you've uploaded per vehicle number or category | — (upload via message detail or +Add) |
+| 🚒 Vehicles | What each vehicle number is (type, description) | Capcode list, messages naming a vehicle ("TS 07-1782"), +Add, CSV import |
 
 Click "Manage" on any card to view/edit/delete that table's rows.
 

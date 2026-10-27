@@ -48,10 +48,12 @@ class P2000Message:
     # Expanded abbreviations found in body
     abbreviations: list[dict[str, str]] = field(default_factory=list)
 
-    # Vehicle/unit identification (best-effort, from a small known abbreviation
-    # vocabulary - see vehicle_types.py)
-    vehicle_category: str = ""  # e.g. "ambulance", "helikopter", "" if unrecognized
-    vehicle_number: str = ""  # the vehicle number token, e.g. "17106" - "" if none found
+    # Vehicle/unit identification (vehicle numbers in the text, what they are from
+    # the vehicles table - see vehicle_types.py)
+    vehicle_category: str = ""  # e.g. "ambulance", "helikopter", "" if unknown
+    vehicle_number: str = ""  # the vehicle shown, e.g. "17-106" - "" if none found
+    vehicle_units: list[str] = field(default_factory=list)  # all vehicle numbers in the message
+    vehicle_description: str = ""  # from the vehicles table
     vehicle_icon: str = ""  # fallback emoji for vehicle_category, shown until a photo is uploaded
 
     # Same text as `body`, but with any city abbreviation token (e.g. "SGRAVH")
@@ -99,6 +101,8 @@ class P2000Message:
             "abbreviations": self.abbreviations,
             "vehicle_category": self.vehicle_category,
             "vehicle_number": self.vehicle_number,
+            "vehicle_units": self.vehicle_units,
+            "vehicle_description": self.vehicle_description,
             "vehicle_icon": self.vehicle_icon,
             "tts": self.tts,
             "id": self.id,
