@@ -974,6 +974,10 @@ class Database:
                 d["capcodes"] = [c.strip() for c in raw.split(",") if c.strip()]
         else:
             d["capcodes"] = []
+        # Rows stored before distances were limited to messages with a street
+        # hold the distance to the city centre
+        if not d.get("street"):
+            d["distance_km"] = None
         # Not stored: recognised from the text, so older rows get them too
         if "body" in d:
             d.update(self.resolve_vehicle(d["body"] or "", d.get("discipline") or ""))
