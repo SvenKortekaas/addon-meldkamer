@@ -5,6 +5,9 @@
 - Real photos for vehicles without an uploaded photo: tankautospuit, autoladder, hulpverlening, haakarm, schuimblus, waterongevallen, officier van dienst, dienstbus (also used for gevaarlijke stoffen units), ambulance, traumahelikopter, KNRM reddingboot and politie. Freely licensed photos from Wikimedia Commons, cut out (transparent background) with a "MELDKAMER" licence plate, credited under the photo (see `src/vehicle_images/CREDITS.md`).
 - Fire brigade numbers pick the photo from their type digit (Nationaal Nummerplan Brandweer: RR-KKTV, e.g. 11-0293 is type 9, an OvD car), so the right vehicle shows even when the message's abbreviation says otherwise.
 - Your own uploaded photos (per vehicle number or category) still come first.
+- Vehicle numbers are now recognised in fire brigade messages: the unit numbers at the end of the message (e.g. "… Scheemda 013693 012933" → 01-2933, a tankautospuit), and the vehicle type follows from the number. Previously only "TS 07-1782"-style text matched, which real messages hardly ever contain.
+- Ambulance trip messages ("07205 - Arnhem Rit …") are now recognised as an ambulance.
+- Messages from history show their vehicle too (the vehicle wasn't stored, so it only showed on live messages); this works for all existing messages.
 
 ## 1.2.4
 

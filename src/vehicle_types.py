@@ -76,6 +76,10 @@ CATEGORY_ICONS: dict[str, str] = {
     "brandweer_dompelpomp": "🚒",
     "brandweer_riv": "🚒",
     "brandweer_haakarmbak": "🚛",
+    "brandweer_hulpverlening": "🚒",
+    "brandweer_officier": "🚒",
+    "brandweer_dienstbus": "🚐",
+    "brandweer_ogs": "🚐",
     "politie": "🚓",
     "reddingboot": "🛟",
 }
@@ -106,6 +110,19 @@ _VEHICLE_NUMBER_RE = re.compile(
 _AMBULANCE_UNIT_RE = re.compile(r"\b(\d{2})(\d{3})\s*-\s*[A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+)*\s+Rit\s+\d+\b")
 
 
+# Fire brigade messages end with the alerted units' numbers, dash omitted:
+# "P 1 BNN-01 Ongeval wegvervoer Stationsstraat Scheemda 013693 012933" is
+# 01-3693 (OvD) and 01-2933 (TS), see the Nationaal Nummerplan further down.
+_TRAILING_UNITS_RE = re.compile(r"((?:\s+\d{6})+)\s*$")
+_FIRE_PRIORITY_RE = re.compile(r"^\s*(?:P\s?[123]|PRIO\s?[123])\b", re.IGNORECASE)
+
+# Vehicle-type tokens written as words in the message text, for messages
+# whose found abbreviations aren't at hand (history read back from the database)
+_VEHICLE_TOKEN_RE = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in sorted(VEHICLE_CATEGORIES, key=len, reverse=True)) + r")\b"
+)
+
+
 def classify(abbreviations: list[dict[str, str]]) -> str:
     """Pick the first recognized vehicle category from a message's found abbreviations."""
     for item in abbreviations:
@@ -113,6 +130,43 @@ def classify(abbreviations: list[dict[str, str]]) -> str:
         if category:
             return category
     return ""
+
+
+def classify_text(text: str) -> str:
+    """Pick the first vehicle-type token in the message text."""
+    match = _VEHICLE_TOKEN_RE.search(text or "")
+    return VEHICLE_CATEGORIES[match.group(1)] if match else ""
+
+
+def is_fire_message(text: str, discipline: str = "") -> bool:
+    """Fire brigade message: by its capcodes' discipline or its "P 1"-style priority."""
+    return "brandweer" in (discipline or "").lower() or bool(_FIRE_PRIORITY_RE.match(text or ""))
+
+
+def fire_units(text: str) -> list[str]:
+    """Unit numbers listed at the end of a fire brigade message, as "RR-KKTV"."""
+    match = _TRAILING_UNITS_RE.search(text or "")
+    if not match:
+        return []
+    # Region codes run 01-25
+    return [f"{t[:2]}-{t[2:]}" for t in match.group(1).split() if 1 <= int(t[:2]) <= 25]
+
+
+def vehicle_info(text: str, discipline: str = "", abbreviations: list[dict[str, str]] | None = None) -> tuple[str, str]:
+    """(category, vehicle number) of the vehicle a message is about, "" where unknown."""
+    category = classify(abbreviations) if abbreviations is not None else classify_text(text)
+    number = extract_vehicle_number(text or "")
+    if not number and is_fire_message(text, discipline):
+        units = fire_units(text)
+        # Prefer an actual appliance over the officers' and crew cars (types 0 and 9)
+        number = next((u for u in units if u[5] not in "09"), units[0] if units else "")
+    if not category and _AMBULANCE_UNIT_RE.search(text or ""):
+        category = "ambulance"
+    # A fire brigade number's type digit is more specific than the message's abbreviation
+    match = _FIRE_NUMBER_RE.match(number)
+    if match and (not category or category.startswith("brandweer")):
+        category = FIRE_TYPE_CATEGORIES[match.group(1)]
+    return category, number
 
 
 def extract_vehicle_number(text: str) -> str:
@@ -222,6 +276,10 @@ CATEGORY_STOCK_IMAGES: dict[str, str] = {
     "brandweer_dompelpomp": "haakarm",
     "brandweer_riv": "officier",
     "brandweer_haakarmbak": "haakarm",
+    "brandweer_hulpverlening": "hulpverlening",
+    "brandweer_officier": "officier",
+    "brandweer_dienstbus": "dienstbus",
+    "brandweer_ogs": "dienstbus",
     "politie": "politie",
     "reddingboot": "reddingboot",
 }
@@ -241,6 +299,20 @@ FIRE_TYPE_STOCK_IMAGES: dict[str, str] = {
     "7": "hulpverlening",  # Hulpverleningsmaterieel
     "8": "haakarm",  # Overig materieel (haakarm, kraan)
     "9": "officier",  # Staf- en commandomaterieel (OvD, HOvD, CvD)
+}
+
+# Type digit -> vehicle category, for fire units named only by their number
+FIRE_TYPE_CATEGORIES: dict[str, str] = {
+    "0": "brandweer_dienstbus",
+    "1": "brandweer_waterongevallen",
+    "2": "brandweer_ogs",
+    "3": "brandweer_tankautospuit",
+    "4": "brandweer_tankautospuit",
+    "5": "brandweer_ladder",
+    "6": "brandweer_schuimblus",
+    "7": "brandweer_hulpverlening",
+    "8": "brandweer_haakarmbak",
+    "9": "brandweer_officier",
 }
 
 

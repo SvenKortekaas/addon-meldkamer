@@ -14,6 +14,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from . import vehicle_types
 from .abbreviation_import import DISCIPLINE_ABBREVIATION_OVERRIDES
 
 logger = logging.getLogger(__name__)
@@ -959,6 +960,10 @@ class Database:
                 d["capcodes"] = [c.strip() for c in raw.split(",") if c.strip()]
         else:
             d["capcodes"] = []
+        # Not stored: recognised from the text, so older rows get them too
+        if "body" in d:
+            d["vehicle_category"], d["vehicle_number"] = vehicle_types.vehicle_info(d["body"], d.get("discipline") or "")
+            d["vehicle_icon"] = vehicle_types.icon_for(d["vehicle_category"])
         return d
 
     def list_messages(

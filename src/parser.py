@@ -362,6 +362,7 @@ class Parser:
         """Best-effort vehicle/unit category and vehicle number, from a known abbreviation set."""
         if not msg.body:
             return
-        msg.vehicle_category = vehicle_types.classify(msg.abbreviations)
-        msg.vehicle_number = vehicle_types.extract_vehicle_number(msg.body)
+        msg.vehicle_category, msg.vehicle_number = vehicle_types.vehicle_info(
+            msg.body, msg.discipline, msg.abbreviations
+        )
         msg.vehicle_icon = vehicle_types.icon_for(msg.vehicle_category)
