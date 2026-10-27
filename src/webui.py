@@ -34,7 +34,7 @@ MAX_PHOTO_SIZE = 5 * 1024 * 1024
 MAX_FORM_FIELD_SIZE = 4 * 1024
 PHOTO_MIME_TYPES = ("image/jpeg", "image/png", "image/webp", "image/gif")
 
-ADDON_VERSION = "1.2.3"
+ADDON_VERSION = "1.2.4"
 
 # The dashboard's map tiles come from Home Assistant's built-in map_tiles proxy:
 # browsers loading tiles straight from OpenStreetMap inside the ingress iframe
@@ -2346,7 +2346,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         // =====================================================================
         // Map: one Leaflet map, moved into the active view's map slot
         // =====================================================================
-        const map = L.map('map').setView([52.2, 5.3], 8);
+        // The last view (and the zoom used to focus incidents) survives reloads;
+        // focusing a new incident only moves the map, it keeps the zoom
+        const FOCUS_ZOOM = 13;
+        let savedView = null;
+        try { savedView = JSON.parse(localStorage.getItem('p2000_map_view')); } catch (e) {}
+        const map = savedView
+            ? L.map('map').setView([savedView.lat, savedView.lng], savedView.zoom)
+            : L.map('map').setView([52.2, 5.3], 8);
+        let focusZoom = parseInt(localStorage.getItem('p2000_map_zoom'), 10) || FOCUS_ZOOM;
+        map.on('zoomend', () => {
+            focusZoom = map.getZoom();
+            localStorage.setItem('p2000_map_zoom', focusZoom);
+        });
+        map.on('moveend', () => {
+            const c = map.getCenter();
+            localStorage.setItem('p2000_map_view', JSON.stringify({lat: c.lat, lng: c.lng, zoom: map.getZoom()}));
+        });
         // Tiles come through the add-on (and Home Assistant's built-in map tile
         // proxy); OSM blocks browsers requesting them directly from here.
         L.tileLayer(basePath + 'api/map-tiles/{z}/{x}/{y}.png', {
@@ -3045,7 +3061,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         if (currentMarker) map.removeLayer(currentMarker);
                         currentMarker = L.marker([lat, lng]).addTo(map);
                         currentMarker.bindPopup(`<b>${escapeHtml(msg.discipline || 'P2000')}</b><br><small>${escapeHtml(msg.address || '')}</small><br><div style="margin-top:6px;max-width:250px;word-wrap:break-word;">${escapeHtml(msg.body || 'No message')}</div>`);
-                        map.setView([lat, lng], 13, {animate: false});
+                        map.setView([lat, lng], focusZoom, {animate: false});
                         const panel = document.getElementById('detail-float');
                         if (panel.classList.contains('open')) {
                             // Keep the location visible to the right of the floating detail

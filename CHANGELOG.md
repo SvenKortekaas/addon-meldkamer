@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.4
+
+- The map keeps your zoom level: focusing a new incident moves the map without zooming in or out, and the last map position and zoom are restored after a reload.
+
 ## 1.2.3
 
 - The sensor filter uses exactly the same style as the view tabs.
