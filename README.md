@@ -24,7 +24,7 @@ P2000 FLEX pager decoder dashboard for Home Assistant — decode Dutch emergency
 **Lanes** — one column per discipline next to the map
 ![Lanes view](https://raw.githubusercontent.com/cyberjunky/addon-meldkamer/main/screenshots/lanes.webp)
 
-**Settings** — reference data, tables and receiver tuning (ppm calibration)
+**Settings** — reference data and tables
 ![Settings tab](https://raw.githubusercontent.com/cyberjunky/addon-meldkamer/main/screenshots/settings.webp)
 
 **Info** — receiver, device, database, reception quality and statistics
@@ -47,7 +47,7 @@ P2000 FLEX pager decoder dashboard for Home Assistant — decode Dutch emergency
 - 🔁 **Repeat Suppression** — Messages the pager network resends are counted as repeats instead of being published again
 - 🗣️ **Text-to-Speech** — Browser speech and Home Assistant speakers (`tts.speak`) read new messages aloud, using editable TTS replacement rules
 - 🗺️ **Map History** — Heatmap of past incidents with a time slider
-- 📶 **Reception Quality** — FLEX frames per minute, corrected bit errors and failed decodes, plus automatic ppm calibration
+- 📶 **Reception Quality** — FLEX frames per minute, corrected bit errors and failed decodes
 - 🔀 **Receiver Failover** — Switches to a backup `rtl_tcp` receiver when the active one stops producing frames
 - 🚑 **Vehicle Classification** — Best-effort vehicle/unit recognition (ambulance, fire, helicopter, police, water rescue) from a Vehicles table (number → type), with stock photos per vehicle type and user-uploadable photos per vehicle or category
 - 🔔 **Sound Notifications** — Configurable audio alerts for new messages
@@ -80,7 +80,7 @@ Access via Home Assistant sidebar → Meldkamer:
   - **Lanes** — one column per discipline (Brandweer, Ambulance, Politie, other) next to the map
 
   The message detail shows the full message, abbreviations, vehicle photo, incident timeline and earlier messages at the address, with Previous/Next to step through the list. Console docks it under the map; on the Wallboard and Lanes it floats in the map's corner. Drag the dividers between the panes to resize them (double-click resets). The sensor filter, sound, speech and auto-focus toggles sit in the top bar. The theme follows Home Assistant's light/dark mode; the 🌓 button switches between automatic, light and dark.
-- **Settings** — Card-based data management for every table below, and receiver tuning (ppm calibration)
+- **Settings** — Card-based data management for every table below
 - **Info** — Receiver, device and database status, reception quality and message statistics
 
 ### Settings Tab
@@ -119,7 +119,7 @@ Click "Manage" on any card to view/edit/delete that table's rows.
 | `receiver.network_host` | IP address for network receiver (e.g., `192.168.1.100`) |
 | `receiver.network_port` | Port for network receiver (default: `1234`) |
 | `receiver.sdr_gain` | SDR device gain (0-100, for RTL-SDR) |
-| `receiver.ppm_correction` | Frequency correction in PPM for crystal oscillator drift (see [ppm calibration](#ppm-calibration)) |
+| `receiver.ppm_correction` | Frequency correction in PPM for crystal oscillator drift (see [Reception Quality](#reception-quality)) |
 | `receiver.bias_tee` | Power an active antenna or LNA over the coax (`rtl-sdr` only, e.g. RTL-SDR Blog V3/V4) |
 | `receiver.offline_after_minutes` | Minutes without FLEX frames before the receiver counts as offline and the decoder fails over / restarts (default: `10`) |
 | `receiver.backup_host` | Optional backup `rtl_tcp` server, used when the active receiver goes quiet |
@@ -185,10 +185,6 @@ receiver:
   backup_port: 1234
   offline_after_minutes: 10
 ```
-
-### ppm Calibration
-
-The Settings tab's **ppm calibration** tries ppm values around the current one (e.g. ±30 in steps of 5, 30 seconds each) on the active receiver and keeps the one that decodes the most FLEX frames. Decoding continues while it runs. Click **Use** next to a result to save it as `ppm_correction` (or `backup_ppm_correction`) in the add-on configuration; the receiver restarts with it right away.
 
 ### Reception Quality
 

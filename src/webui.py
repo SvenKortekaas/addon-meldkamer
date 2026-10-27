@@ -34,7 +34,7 @@ MAX_PHOTO_SIZE = 5 * 1024 * 1024
 MAX_FORM_FIELD_SIZE = 4 * 1024
 PHOTO_MIME_TYPES = ("image/jpeg", "image/png", "image/webp", "image/gif")
 
-ADDON_VERSION = "1.2.6"
+ADDON_VERSION = "1.2.7"
 
 # The dashboard's map tiles come from Home Assistant's built-in map_tiles proxy:
 # browsers loading tiles straight from OpenStreetMap inside the ingress iframe
@@ -112,10 +112,6 @@ class _DictMessageView:
 
 # Statistics kept across restarts in the stats file
 PERSISTED_STATS = ("total_messages", "by_region", "by_discipline", "start_time")
-
-# ppm calibration request limits
-CALIBRATION_MAX_SPAN = 100
-CALIBRATION_MAX_STEPS = 41
 
 
 def _float_or_none(value) -> float | None:
@@ -219,11 +215,8 @@ class WebUI:
         self.app.router.add_get("/api/map-history", self._handle_map_history)
         self.app.router.add_get("/api/incident/{incident_id}", self._handle_incident)
 
-        # Receiver quality and ppm calibration
+        # Receiver quality
         self.app.router.add_get("/api/receiver", self._handle_receiver)
-        self.app.router.add_post("/api/calibration", self._handle_start_calibration)
-        self.app.router.add_delete("/api/calibration", self._handle_cancel_calibration)
-        self.app.router.add_post("/api/calibration/apply", self._handle_apply_ppm)
 
         # Database management API
         self.app.router.add_get("/api/db/capcodes", self._handle_list_capcodes)
@@ -491,7 +484,7 @@ class WebUI:
         return web.json_response(self.database.get_map_points(hours))
 
     async def _handle_receiver(self, request: web.Request) -> web.Response:
-        """Receiver decode quality per minute and the ppm calibration state."""
+        """Receiver decode quality per minute."""
         decoder = self.decoder
         return web.json_response(
             {
@@ -502,43 +495,8 @@ class WebUI:
                     for s in decoder.sources
                 ],
                 "ppm": decoder.ppm,
-                "calibration": decoder.calibration,
-                "can_apply": self.ha_client.available,
             }
         )
-
-    async def _handle_start_calibration(self, request: web.Request) -> web.Response:
-        data = await _json_object(request)
-        try:
-            span = int(data.get("span", 30))
-            step = int(data.get("step", 5))
-            dwell = int(data.get("dwell", 30))
-        except (TypeError, ValueError):
-            raise _bad_request("span, step and dwell must be integers") from None
-        if not (1 <= step <= span <= CALIBRATION_MAX_SPAN) or 2 * span // step + 1 > CALIBRATION_MAX_STEPS:
-            raise _bad_request(f"Use a step of at least 1 and at most {CALIBRATION_MAX_STEPS} ppm values to try")
-        if not 10 <= dwell <= 600:
-            raise _bad_request("dwell must be 10-600 seconds")
-        try:
-            self.decoder.start_calibration(span, step, dwell)
-        except RuntimeError as e:
-            raise _bad_request(str(e)) from None
-        return web.json_response({"success": True})
-
-    async def _handle_cancel_calibration(self, request: web.Request) -> web.Response:
-        await self.decoder.cancel_calibration()
-        return web.json_response({"success": True})
-
-    async def _handle_apply_ppm(self, request: web.Request) -> web.Response:
-        data = await _json_object(request)
-        ppm = data.get("ppm")
-        if isinstance(ppm, bool) or not isinstance(ppm, int):
-            raise _bad_request("ppm must be an integer")
-        try:
-            await self.decoder.apply_ppm(ppm)
-        except (RuntimeError, HAClientError) as e:
-            return web.json_response({"error": f"Could not save ppm_correction: {e}"}, status=500)
-        return web.json_response({"success": True})
 
     # =========================================================================
     # Database Management API Handlers
@@ -2269,24 +2227,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                             </div>
                         </div>
 
-                        <div class="db-toolbar" style="margin-top: 22px;">
-                            <span class="db-table-title">Receiver tuning</span>
-                        </div>
-                        <div class="db-card" style="max-width: 760px;">
-                            <div class="db-card-head">
-                                <span class="db-card-title">ppm calibration</span>
-                            </div>
-                            <div class="db-card-desc">Tries ppm values around the current one on the active receiver and keeps the one that decodes the most FLEX frames. Decoding continues while it runs.</div>
-                            <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end;">
-                                <div class="form-field"><label for="cal-span">± range (ppm)</label><input id="cal-span" class="input" type="number" value="30" min="1" max="100" style="width: 90px;"></div>
-                                <div class="form-field"><label for="cal-step">Step</label><input id="cal-step" class="input" type="number" value="5" min="1" max="50" style="width: 70px;"></div>
-                                <div class="form-field"><label for="cal-dwell">Seconds each</label><input id="cal-dwell" class="input" type="number" value="30" min="10" max="600" style="width: 90px;"></div>
-                                <button id="cal-start" class="btn btn-primary" onclick="startCalibration()">Start</button>
-                                <button id="cal-cancel" class="btn btn-danger" onclick="cancelCalibration()" style="display: none;">Cancel</button>
-                            </div>
-                            <div id="cal-status" class="panel-sub"></div>
-                            <div id="cal-results"></div>
-                        </div>
                     </div>
                     <!-- Table view -->
                     <div id="db-table-view" style="display: none;">
@@ -2801,7 +2741,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             document.querySelectorAll('.tab[data-tab]').forEach(t => t.classList.toggle('active', t.dataset.tab === tabName));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === 'tab-' + tabName));
             localStorage.setItem('p2000_tab', tabName);
-            if (tabName === 'info' || tabName === 'settings') loadReceiver();
+            if (tabName === 'info') loadReceiver();
             if (VIEWS.includes(tabName)) {
                 activeView = tabName;
                 document.getElementById('slot-' + tabName).appendChild(document.getElementById('map-root'));
@@ -2912,7 +2852,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         setInterval(renderUptime, 30000);
 
         // =====================================================================
-        // Reception quality (Info tab) and ppm calibration (Settings tab)
+        // Reception quality (Info tab)
         // =====================================================================
         function formatAgo(epochSeconds) {
             if (!epochSeconds) return 'never';
@@ -2945,44 +2885,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 `<text x="${width}" y="${height + 13}" font-size="10" text-anchor="end" fill="var(--secondary-text-color)">now · max ${max}/min</text></svg>`;
         }
 
-        function renderCalibration(rx) {
-            const cal = rx.calibration;
-            const status = document.getElementById('cal-status');
-            const results = document.getElementById('cal-results');
-            const running = !!(cal && cal.running);
-            document.getElementById('cal-start').style.display = running ? 'none' : '';
-            document.getElementById('cal-cancel').style.display = running ? '' : 'none';
-            if (!cal) {
-                status.textContent = `Current ppm correction: ${rx.ppm}`;
-                results.innerHTML = '';
-                return;
-            }
-            if (running) {
-                status.textContent = `Calibrating the ${cal.source} receiver: ${cal.results.length} of ${cal.candidates.length} done, trying ${cal.current} ppm…`;
-            } else if (cal.error) {
-                status.textContent = cal.error;
-            } else {
-                status.textContent = `Best: ${cal.best} ppm (configured: ${cal.configured_ppm} ppm)`;
-            }
-            const maxFrames = Math.max(1, ...cal.results.map(r => r.frames));
-            results.innerHTML = cal.results.length ? `
-                <table class="db-table">
-                    <thead><tr><th>ppm</th><th>Frames</th><th>Failed</th><th></th></tr></thead>
-                    <tbody>${cal.results.map(r => `
-                        <tr>
-                            <td>${r.ppm}${r.ppm === cal.best ? ' ★' : ''}</td>
-                            <td><div class="progress" style="width: 120px; display: inline-block; vertical-align: middle;"><div style="width: ${r.frames / maxFrames * 100}%"></div></div> ${r.frames}</td>
-                            <td>${r.failed}</td>
-                            <td>${!running && rx.can_apply ? `<button class="btn" onclick="applyPpm(${r.ppm})">Use</button>` : ''}</td>
-                        </tr>`).join('')}
-                    </tbody>
-                </table>` : '';
-        }
-
         let receiverTimer = null;
         function loadReceiver() {
             clearTimeout(receiverTimer);
-            if (!document.querySelector('#tab-info.active, #tab-settings.active')) return;
+            if (!document.querySelector('#tab-info.active')) return;
             fetch(basePath + 'api/receiver').then(r => r.json()).then(rx => {
                 const active = rx.sources.find(src => src.active);
                 document.getElementById('rx-source').textContent = active
@@ -2995,43 +2901,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 document.getElementById('rx-failed').textContent = rx.failed_last_hour;
                 document.getElementById('rx-sync').textContent = rx.sync_lost_last_hour;
                 renderFramesChart(rx.history);
-                renderCalibration(rx);
             }).catch(() => {}).finally(() => { receiverTimer = setTimeout(loadReceiver, 5000); });
-        }
-
-        function startCalibration() {
-            const body = {
-                span: Number(document.getElementById('cal-span').value),
-                step: Number(document.getElementById('cal-step').value),
-                dwell: Number(document.getElementById('cal-dwell').value),
-            };
-            fetch(basePath + 'api/calibration', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) })
-                .then(r => r.json())
-                .then(result => {
-                    if (result.error) toast(result.error, 'error');
-                    loadReceiver();
-                })
-                .catch(() => toast('Failed to start calibration', 'error'));
-        }
-
-        function cancelCalibration() {
-            fetch(basePath + 'api/calibration', { method: 'DELETE' }).then(() => loadReceiver());
-        }
-
-        async function applyPpm(ppm) {
-            const ok = await confirmDialog({
-                title: 'Use this ppm correction?',
-                message: `Saves ${ppm} ppm in the add-on configuration and restarts the receiver with it.`,
-                confirmLabel: 'Save',
-            });
-            if (!ok) return;
-            fetch(basePath + 'api/calibration/apply', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ppm}) })
-                .then(r => r.json())
-                .then(result => {
-                    toast(result.error || `ppm correction set to ${ppm}`, result.error ? 'error' : 'success');
-                    loadReceiver();
-                })
-                .catch(() => toast('Failed to save ppm correction', 'error'));
         }
 
         // =====================================================================

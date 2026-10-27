@@ -34,13 +34,12 @@ class Source:
     label: str  # "primary" or "backup"
     receiver_type: str  # rtl-sdr, hackrf, soapysdr, network
     ppm: int
-    options_key: str  # receiver option holding this source's ppm correction
     host: str = ""
     port: int = 0
 
 
 class Decoder:
-    """Runs the SDR | multimon-ng pipeline, fails over between receivers and calibrates ppm."""
+    """Runs the SDR | multimon-ng pipeline and fails over between receivers."""
 
     def __init__(self, config: Config, ha_client: HAClient):
         self.config = config
@@ -52,7 +51,6 @@ class Decoder:
                 "primary",
                 config.receiver_type,
                 config.ppm_correction,
-                "ppm_correction",
                 config.network_host,
                 config.network_port,
             )
@@ -63,7 +61,6 @@ class Decoder:
                     "backup",
                     "network",
                     config.backup_ppm_correction,
-                    "backup_ppm_correction",
                     config.backup_host,
                     config.backup_port,
                 )
@@ -79,14 +76,6 @@ class Decoder:
 
         self._process: asyncio.subprocess.Process | None = None
         self._running = False
-        self._restart_requested = False
-
-        # ppm calibration: overrides the active source's ppm while it runs
-        self._ppm_override: int | None = None
-        self._calibration_task: asyncio.Task | None = None
-        self.calibration: dict | None = None
-        self._calibration_frames = 0
-        self._calibration_failed = 0
 
         # Last fatal SDR error (e.g. "No supported devices found"), shown in the UI
         self.last_error = ""
@@ -108,7 +97,7 @@ class Decoder:
 
     @property
     def ppm(self) -> int:
-        return self.source.ppm if self._ppm_override is None else self._ppm_override
+        return self.source.ppm
 
     def validate(self) -> None:
         """Raise RuntimeError for receiver settings that can't work."""
@@ -181,8 +170,6 @@ class Decoder:
 
             if not self._running:
                 break  # Intentional stop() - do not restart
-            if outcome == "restart":
-                continue
 
             if outcome == "stalled":
                 logger.warning(
@@ -204,7 +191,7 @@ class Decoder:
 
     def _switch_source(self) -> None:
         """Move on to the next receiver (the same one again when there is no backup)."""
-        if len(self.sources) == 1 or self._calibration_task:
+        if len(self.sources) == 1:
             return
         self._active = (self._active + 1) % len(self.sources)
         logger.warning(f"Switching to the {self.source.label} receiver: {self.device_type}")
@@ -235,18 +222,16 @@ class Decoder:
         elif line.startswith("FLEX: FrameInfoWord"):
             self.last_error = ""
             self.stats.frame()
-            self._calibration_frames += 1
         elif line.startswith("FLEX:"):
             if corrected := _CORRECTED_RE.match(line):
                 self.stats.corrected(int(corrected.group(1)))
             elif any(marker in line for marker in _FAILED_MARKERS):
                 self.stats.failed()
-                self._calibration_failed += 1
             elif "Synchronisation Lost" in line:
                 self.stats.sync_lost()
 
     async def _run_process(self) -> str:
-        """Run the pipeline once. Returns why it ended: "exit", "stalled" or "restart"."""
+        """Run the pipeline once. Returns why it ended: "exit" or "stalled"."""
         command = self.command
         logger.info(f"Command: {command}")
         self._process = await asyncio.create_subprocess_shell(
@@ -270,23 +255,19 @@ class Decoder:
                 except TimeoutError:
                     line = None
                 if line == b"":
-                    if not self._restart_requested:
-                        logger.warning(f"Decoder process exited with code {process.returncode}")
+                    logger.warning(f"Decoder process exited with code {process.returncode}")
                     break
                 if line:
                     decoded = line.decode("utf-8", errors="ignore").strip()
                     if decoded:
                         logger.debug(f"multimon-ng: {decoded[:100]}")
                         self._handle_line(decoded)
-                # Watchdog: calibration judges silence itself, per candidate ppm
+                # Watchdog
                 last_activity = max(self.stats.last_activity or 0, started)
-                if not self._calibration_task and time.time() - last_activity > offline_after:
+                if time.time() - last_activity > offline_after:
                     outcome = "stalled"
                     break
         finally:
-            if self._restart_requested:
-                self._restart_requested = False
-                outcome = "restart"
             if not stderr_task.done():
                 stderr_task.cancel()
             # Make sure the whole pipeline is really dead before a possible restart
@@ -298,12 +279,6 @@ class Decoder:
             self._process = None
 
         return outcome
-
-    async def _restart(self) -> None:
-        """Restart the pipeline right away (e.g. with a new ppm), without failover or backoff."""
-        if self._process and self._process.returncode is None:
-            self._restart_requested = True
-            await self._stop_process(self._process)
 
     async def _log_stderr(self, process: asyncio.subprocess.Process) -> None:
         """Log stderr output for debugging."""
@@ -343,83 +318,6 @@ class Decoder:
             except Exception as e:
                 logger.debug(f"Error reading stderr: {e}")
                 break
-
-    # =========================================================================
-    # ppm calibration
-    # =========================================================================
-
-    def start_calibration(self, span: int, step: int, dwell: int) -> None:
-        """Try ppm values around the active source's ppm and find the one decoding the most frames."""
-        if self._calibration_task:
-            raise RuntimeError("A calibration is already running")
-        if not self.is_running:
-            raise RuntimeError("The decoder is not running")
-        center = self.source.ppm
-        candidates = list(range(center - span, center + span + 1, step))
-        self.calibration = {
-            "running": True,
-            "source": self.source.label,
-            "options_key": self.source.options_key,
-            "configured_ppm": center,
-            "candidates": candidates,
-            "dwell": dwell,
-            "current": None,
-            "results": [],
-            "best": None,
-            "error": "",
-        }
-        self._calibration_task = asyncio.create_task(self._calibrate(candidates, dwell))
-
-    async def cancel_calibration(self) -> None:
-        if self._calibration_task:
-            self._calibration_task.cancel()
-            await asyncio.gather(self._calibration_task, return_exceptions=True)
-
-    async def _calibrate(self, candidates: list[int], dwell: int) -> None:
-        calibration = self.calibration
-        try:
-            for ppm in candidates:
-                calibration["current"] = ppm
-                self._ppm_override = ppm
-                await self._restart()
-                # Let the tuner settle and multimon-ng lock on before counting
-                await asyncio.sleep(3)
-                self._calibration_frames = 0
-                self._calibration_failed = 0
-                await asyncio.sleep(dwell)
-                calibration["results"].append(
-                    {"ppm": ppm, "frames": self._calibration_frames, "failed": self._calibration_failed}
-                )
-            configured = calibration["configured_ppm"]
-            best = max(
-                calibration["results"],
-                key=lambda r: (r["frames"], -r["failed"], -abs(r["ppm"] - configured)),
-            )
-            calibration["best"] = best["ppm"] if best["frames"] else None
-            if calibration["best"] is None:
-                calibration["error"] = "No FLEX frames decoded at any ppm - check the antenna and gain"
-            logger.info(f"ppm calibration finished: {calibration['results']}, best: {calibration['best']}")
-        except asyncio.CancelledError:
-            calibration["error"] = "Cancelled"
-        finally:
-            calibration["running"] = False
-            calibration["current"] = None
-            self._ppm_override = None
-            self._calibration_task = None
-            if self._running:
-                await self._restart()
-
-    async def apply_ppm(self, ppm: int) -> None:
-        """Store a ppm correction in the add-on options and use it right away."""
-        if self._calibration_task:
-            raise RuntimeError("Wait for the calibration to finish")
-        source = self.source
-        options = await self.ha_client.get_addon_options()
-        options.setdefault("receiver", {})[source.options_key] = ppm
-        await self.ha_client.set_addon_options(options)
-        source.ppm = ppm
-        logger.info(f"Set {source.options_key} to {ppm}")
-        await self._restart()
 
     # =========================================================================
     # Process control
@@ -515,7 +413,6 @@ class Decoder:
     async def stop(self) -> None:
         """Stop the decoder subprocess."""
         self._running = False
-        await self.cancel_calibration()
 
         if self._process:
             try:

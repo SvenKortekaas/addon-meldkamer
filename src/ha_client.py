@@ -116,19 +116,6 @@ class HAClient:
             raise HAClientError(f"HA API error {status} for map tile {z}/{x}/{y}")
         return body
 
-    async def get_addon_options(self) -> dict[str, Any]:
-        """Read this add-on's options from the Supervisor."""
-        status, body = await self._request("GET", f"{SUPERVISOR_URL}/addons/self/info")
-        if status != 200:
-            raise HAClientError(f"Supervisor error {status}: {body}")
-        return body["data"]["options"]
-
-    async def set_addon_options(self, options: dict[str, Any]) -> None:
-        """Replace this add-on's options (takes effect in /data/options.json immediately)."""
-        status, body = await self._request("POST", f"{SUPERVISOR_URL}/addons/self/options", {"options": options})
-        if status != 200:
-            raise HAClientError(f"Supervisor error {status}: {body}")
-
     async def close(self):
         """Close the HTTP session."""
         if self._session and not self._session.closed:
