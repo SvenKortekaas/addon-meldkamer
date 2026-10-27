@@ -41,6 +41,9 @@ ADDON_VERSION = "1.2.3"
 # get 403 "Access blocked", and core identifies its requests the way OSM's
 # tile usage policy requires.
 MAP_MAX_ZOOM = 19
+# Seconds between live-stream heartbeats while nothing changes, so the
+# dashboard can tell a quiet feed from a dropped connection
+STREAM_HEARTBEAT = 15
 # OSM asks consumers to cache tiles for at least a week
 MAP_TILE_MAX_AGE = 7 * 24 * 60 * 60
 
@@ -438,15 +441,20 @@ class WebUI:
         await response.prepare(request)
         sensor_name = request.query.get("sensor", "")
         last_sent = None
+        last_write = time.monotonic()
         try:
             while True:
                 latest = self._filter_by_sensor(list(self.messages), sensor_name)[:50]
                 data = json.dumps({"stats": self._stats_payload(), "latest": self._with_fresh_abbreviations(latest)})
-                # Only push when something changed; the client recomputes
-                # uptime locally so idle periods need no traffic
+                # Only push when something changed (the client recomputes uptime
+                # locally), with a heartbeat in between
                 if data != last_sent:
                     await response.write(f"data: {data}\n\n".encode())
                     last_sent = data
+                    last_write = time.monotonic()
+                elif time.monotonic() - last_write >= STREAM_HEARTBEAT:
+                    await response.write(b"event: ping\ndata: {}\n\n")
+                    last_write = time.monotonic()
                 await asyncio.sleep(2)
         except (ConnectionResetError, TimeoutError, asyncio.CancelledError):
             pass
@@ -1360,7 +1368,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
         .topbar > * { flex-shrink: 0; }
         @media (max-width: 1600px) { .brand-sub { display: none; } }
-        @media (max-width: 1360px) { .kpis .kpi-extra { display: none; } }
         .brand { display: flex; align-items: center; gap: 8px; }
         .brand svg { width: 20px; height: 20px; color: var(--primary-color); }
         .brand-name { font-weight: 600; letter-spacing: 0.04em; }
@@ -1821,6 +1828,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .db-card-count span { font-family: var(--mono); color: var(--primary-text-color); font-size: 15px; font-weight: 500; }
         .db-card-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: auto; }
 
+        /* Smaller screens (laptops, 1280-1400 px wide or up to 800 px high) */
+        @media (max-width: 1400px) {
+            .brand-name, .filter-label, .kpis .kpi-extra { display: none; }
+            .clock { font-size: 18px; }
+            .console { grid-template-columns: minmax(0, 1fr) var(--console-side, minmax(460px, 40%)); }
+            .feed-head, .feed-row { grid-template-columns: 62px 42px minmax(0, 96px) minmax(160px, 1fr) minmax(0, 150px); }
+            .feed-head .unit, .feed-row .unit { display: none; }
+        }
+        @media (max-height: 800px) {
+            .ticker { height: 108px; }
+            .tick { padding: 10px 14px; gap: 5px; }
+            .tick .text { font-size: 14px; -webkit-line-clamp: 2; }
+        }
         @media (max-width: 1200px) {
             .console { grid-template-columns: minmax(0, 1fr) var(--console-side, 420px); }
             .lanes { grid-template-columns: repeat(4, minmax(0, 1fr)) var(--lanes-side, 380px); }
@@ -3567,25 +3587,52 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             return basePath + 'api/stream' + (currentSensorFilter ? `?sensor=${encodeURIComponent(currentSensorFilter)}` : '');
         }
 
+        // The server sends data or a heartbeat at least every 15 s. When nothing
+        // arrives for longer, the connection was dropped without the browser
+        // noticing (e.g. by the ingress proxy): reconnect and reload.
+        const STREAM_TIMEOUT_MS = 45000;
+        let lastStreamActivity = Date.now();
+
         function connectStream() {
             if (evtSource) evtSource.close();
+            lastStreamActivity = Date.now();
             evtSource = new EventSource(streamUrl());
             evtSource.onopen = () => {
                 streamStatusEl.className = 'conn live';
                 streamStatusText.textContent = 'Live';
             };
-            evtSource.onmessage = (e) => update(JSON.parse(e.data));
+            evtSource.onmessage = (e) => {
+                lastStreamActivity = Date.now();
+                update(JSON.parse(e.data));
+            };
+            evtSource.addEventListener('ping', () => { lastStreamActivity = Date.now(); });
             evtSource.onerror = () => {
                 streamStatusEl.className = 'conn reconnecting';
                 streamStatusText.textContent = 'Reconnecting…';
             };
         }
 
-        function loadMessagesList() {
+        setInterval(() => {
+            if (evtSource && Date.now() - lastStreamActivity > STREAM_TIMEOUT_MS) {
+                connectStream();
+                loadMessagesList();
+            }
+        }, 15000);
+
+        // A failure right after waking up is usually Home Assistant's ingress
+        // session being renewed: retry a few times before reporting it
+        function loadMessagesList(attempt = 1) {
             const url = basePath + 'api/messages' + (currentSensorFilter ? `?sensor=${encodeURIComponent(currentSensorFilter)}` : '');
-            fetch(url).then(r => r.json()).then(msgs => {
-                renderMessagesList((msgs || []).slice(0, 50));
-            }).catch(() => toast('Failed to load messages', 'error'));
+            fetch(url)
+                .then(r => {
+                    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                    return r.json();
+                })
+                .then(msgs => renderMessagesList(msgs.slice(0, 50)))
+                .catch(e => {
+                    if (attempt < 4) setTimeout(() => loadMessagesList(attempt + 1), attempt * 2000);
+                    else toast(`Failed to load messages (${e.message})`, 'error');
+                });
         }
 
         function clearSelectedMessage() {
