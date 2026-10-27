@@ -4,12 +4,13 @@ Maps the small set of vehicle-type abbreviations already in
 abbreviation_import.py to a broad category, used to pick a fallback icon and
 as a lookup key for user-uploaded vehicle photos (see database.py's
 vehicle_photos table). This is deliberately a coarse classification, not a
-decode of the official "Nationaal Nummerplan Brandweer Nederland" numbering
-scheme - real per-vehicle photos aren't available from any open/licensed
-source, so the practical path is category-level defaults plus optional
-user-uploaded photos keyed by the exact vehicle number token.
+decode of every vehicle. Per vehicle type there's a bundled, freely licensed
+stock photo (see STOCK_IMAGES), picked from the fire brigade number's type
+digit where there is one; user-uploaded photos keyed by the exact vehicle
+number or the category take precedence.
 """
 
+import os
 import re
 
 # Abbreviation -> broad vehicle category. Only codes that identify a
@@ -137,3 +138,119 @@ def extract_vehicle_number(text: str) -> str:
 def icon_for(category: str) -> str:
     """Fallback emoji for a vehicle category ("" gives a generic radio icon)."""
     return CATEGORY_ICONS.get(category, DEFAULT_ICON)
+
+
+# Bundled stock photos (vehicle_images/<name>.webp): freely licensed photos
+# from Wikimedia Commons, background removed and licence plates replaced.
+# Shown when the user hasn't uploaded a photo for the vehicle or category.
+STOCK_IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vehicle_images")
+STOCK_IMAGES: dict[str, dict[str, str]] = {
+    "tankautospuit": {
+        "author": "Alf van Beem",
+        "license": "CC0",
+        "source": "https://commons.wikimedia.org/wiki/File:Volvo_FE_Ziegler_Brandweer_Midden-_en_West_Brabant,_Gilze_en_Rijen.JPG",
+    },
+    "ladder": {
+        "author": "Alf van Beem",
+        "license": "CC0",
+        "source": "https://commons.wikimedia.org/wiki/File:Ladderwagen_Brandweer_Velsen_Unit_6602.JPG",
+    },
+    "hulpverlening": {
+        "author": "Alf van Beem",
+        "license": "CC0",
+        "source": "https://commons.wikimedia.org/wiki/File:Brandweer_Kennemerland_Hoofddorp_12-4270_Volvo_FM_Ziegler_foto1.jpg",
+    },
+    "haakarm": {
+        "author": "Alf van Beem",
+        "license": "Public domain",
+        "source": "https://commons.wikimedia.org/wiki/File:Volvo_FM,_Unit_17-1381_%26_Unit_17-1362,_Gezamenlijke_Brandweer_Kazerne_Prinses_M%C3%A1ximaweg_pic1.JPG",
+    },
+    "schuimblus": {
+        "author": "S.J. de Waard",
+        "license": "CC BY-SA 4.0",
+        "source": "https://commons.wikimedia.org/wiki/File:Schuimblusaanhanger_17-1865_van_Brandweer_Rotterdam-Rijnmond_(01).jpg",
+    },
+    "waterongevallen": {
+        "author": "Alf van Beem",
+        "license": "CC0",
+        "source": "https://commons.wikimedia.org/wiki/File:Brandweer_Kennemerland_Hoofddorp_Mercedes_416_BS-GJ-48_car_354_Waterongevallen.JPG",
+    },
+    "officier": {
+        "author": "Alf van Beem",
+        "license": "Public domain",
+        "source": "https://commons.wikimedia.org/wiki/File:Nissan_Brandweer_Kennemerland_Officier_van_Dienst_unit_12-1293_foto_2.JPG",
+    },
+    "ambulance": {
+        "author": "Joost J. Bakker IJmuiden",
+        "license": "CC BY 2.0",
+        "source": "https://commons.wikimedia.org/wiki/File:Kennemerland_Mercedes_Benz_Sprinter_Ambulance_12-511.jpg",
+    },
+    "helikopter": {
+        "author": "BoasB112",
+        "license": "CC BY-SA 4.0",
+        "source": "https://commons.wikimedia.org/wiki/File:Lifeliner_2_na_een_inzet.jpg",
+    },
+    "reddingboot": {
+        "author": "Joost J. Bakker IJmuiden",
+        "license": "CC BY 2.0",
+        "source": "https://commons.wikimedia.org/wiki/File:KNRM_Christien.jpg",
+    },
+    "dienstbus": {
+        "author": "Alf van Beem",
+        "license": "CC0",
+        "source": "https://commons.wikimedia.org/wiki/File:VW_Brandweer_35-GTK-7_Zwanenburg.JPG",
+    },
+    "politie": {
+        "author": "Joost J. Bakker",
+        "license": "CC BY 2.0",
+        "source": "https://commons.wikimedia.org/wiki/File:BMW_X1_Politie.jpg",
+    },
+}
+
+# Vehicle category -> stock photo
+CATEGORY_STOCK_IMAGES: dict[str, str] = {
+    "ambulance": "ambulance",
+    "helikopter": "helikopter",
+    "brandweer_tankautospuit": "tankautospuit",
+    "brandweer_ladder": "ladder",
+    "brandweer_hoogwerker": "ladder",
+    "brandweer_slangenwagen": "hulpverlening",
+    "brandweer_waterongevallen": "waterongevallen",
+    "brandweer_poederblus": "schuimblus",
+    "brandweer_schuimblus": "schuimblus",
+    "brandweer_motorspuit": "tankautospuit",
+    "brandweer_dompelpomp": "haakarm",
+    "brandweer_riv": "officier",
+    "brandweer_haakarmbak": "haakarm",
+    "politie": "politie",
+    "reddingboot": "reddingboot",
+}
+
+# Fire brigade vehicle numbers follow the Nationaal Nummerplan Brandweer
+# Nederland: RR-KKTV = region, station, type of equipment, sequence number.
+# The type digit tells the kind of vehicle even when the abbreviation doesn't.
+_FIRE_NUMBER_RE = re.compile(r"^\d{2}-\d{2}(\d)\d$")
+FIRE_TYPE_STOCK_IMAGES: dict[str, str] = {
+    "0": "dienstbus",  # Personenvervoer (dienstauto, dienstbus)
+    "1": "waterongevallen",  # Waterongevallen
+    "2": "dienstbus",  # Ongeval gevaarlijke stoffen (mostly vans: WVD, AGS, meetploeg)
+    "3": "tankautospuit",  # Tankautospuit
+    "4": "tankautospuit",  # TS voor bos/duinbrandbestrijding
+    "5": "ladder",  # Redmaterieel (autoladder, hoogwerker)
+    "6": "schuimblus",  # Bijzonder brandbestrijdingsmaterieel
+    "7": "hulpverlening",  # Hulpverleningsmaterieel
+    "8": "haakarm",  # Overig materieel (haakarm, kraan)
+    "9": "officier",  # Staf- en commandomaterieel (OvD, HOvD, CvD)
+}
+
+
+def stock_image_for(category: str, number: str) -> str:
+    """Name of the bundled photo for a vehicle ("" if none fits).
+
+    A fire brigade number's type digit is more specific than the category,
+    which only reflects the abbreviation in the message.
+    """
+    match = _FIRE_NUMBER_RE.match(number or "")
+    if match and (category or "").startswith("brandweer"):
+        return FIRE_TYPE_STOCK_IMAGES[match.group(1)]
+    return CATEGORY_STOCK_IMAGES.get(category, "")

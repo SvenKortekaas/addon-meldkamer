@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.5
+
+- Real photos for vehicles without an uploaded photo: tankautospuit, autoladder, hulpverlening, haakarm, schuimblus, waterongevallen, officier van dienst, dienstbus (also used for gevaarlijke stoffen units), ambulance, traumahelikopter, KNRM reddingboot and politie. Freely licensed photos from Wikimedia Commons, cut out (transparent background) with a "MELDKAMER" licence plate, credited under the photo (see `src/vehicle_images/CREDITS.md`).
+- Fire brigade numbers pick the photo from their type digit (Nationaal Nummerplan Brandweer: RR-KKTV, e.g. 11-0293 is type 9, an OvD car), so the right vehicle shows even when the message's abbreviation says otherwise.
+- Your own uploaded photos (per vehicle number or category) still come first.
+
 ## 1.2.4
 
 - The map keeps your zoom level: focusing a new incident moves the map without zooming in or out, and the last map position and zoom are restored after a reload.
