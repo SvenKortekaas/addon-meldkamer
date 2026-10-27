@@ -1745,6 +1745,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .info-label { color: var(--secondary-text-color); }
         .info-value { color: var(--primary-text-color); font-family: var(--mono); font-size: 13.5px; text-align: right; }
 
+        .info-value a { color: var(--primary-color); text-decoration: none; }
+        .info-value a:hover { text-decoration: underline; }
+        .support-links { display: flex; gap: 8px; flex-wrap: wrap; }
+        .support-links .btn { text-decoration: none; }
+
         .stats-panel { margin-top: 14px; }
         .stats-charts-grid {
             display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
@@ -2066,6 +2071,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         <div>
                             <div class="chart-title">By discipline</div>
                             <div id="discipline-chart"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="info-grid" style="margin-top: 14px;">
+                <div class="panel info-card">
+                    <div class="panel-body">
+                        <h3>Support</h3>
+                        <div class="info-row"><span class="info-label">Documentation</span><span class="info-value"><a href="https://github.com/cyberjunky/addon-meldkamer#readme" target="_blank" rel="noopener">README on GitHub</a></span></div>
+                        <div class="info-row"><span class="info-label">Problem or idea</span><span class="info-value"><a href="https://github.com/cyberjunky/addon-meldkamer/issues" target="_blank" rel="noopener">Open an issue</a></span></div>
+                        <div class="info-row"><span class="info-label">Version</span><span class="info-value">v__ADDON_VERSION__ · <a href="https://github.com/cyberjunky/addon-meldkamer/blob/main/CHANGELOG.md" target="_blank" rel="noopener">changelog</a></span></div>
+                    </div>
+                </div>
+
+                <div class="panel info-card">
+                    <div class="panel-body">
+                        <h3>Donate</h3>
+                        <div class="panel-sub" style="margin-bottom: 12px;">Meldkamer is free and open source. If it's useful to you, please consider supporting its development.</div>
+                        <div class="support-links">
+                            <a class="btn btn-primary" href="https://www.paypal.me/cyberjunkynl/" target="_blank" rel="noopener">Donate via PayPal</a>
+                            <a class="btn" href="https://github.com/sponsors/cyberjunky" target="_blank" rel="noopener">Sponsor on GitHub</a>
                         </div>
                     </div>
                 </div>

@@ -2,6 +2,7 @@
 
 ## 1.2.7
 
+- Support and Donate cards on the Info tab: documentation, reporting a problem, the version and changelog, and donating via PayPal or GitHub Sponsors.
 - Removed the ppm calibration from the Settings tab. Set `ppm_correction` (and `backup_ppm_correction`) in the add-on configuration; the Info tab's reception quality shows whether a value decodes well.
 
 ## 1.2.6
