@@ -130,7 +130,9 @@ class MessageProcessor:
             return
 
         geocoded = await self._locate(msg)
-        if self.home:
+        # Only for a street: a message naming just a city is placed at the city
+        # centre, so its distance from home would be that of the centre
+        if self.home and msg.street:
             msg.distance_km = distance_km(msg, self.home.latitude, self.home.longitude)
         msg.tts = self.speech.speak(msg)
         incident, escalation = self.incidents.assign(msg)

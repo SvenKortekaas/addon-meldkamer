@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.8
+
+- "km from home" is only shown for messages with a street. A message naming just a city is placed at the city centre, so its distance was that of the centre (e.g. "3.9 km from home" for any Amsterdam message). Also for the `distance_km` attribute, and for messages already in the history.
+
 ## 1.2.7
 
 - Support and Donate cards on the Info tab: documentation, reporting a problem, the version and changelog, and donating via PayPal or GitHub Sponsors.
