@@ -3612,6 +3612,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             lastStreamActivity = Date.now();
             evtSource = new EventSource(streamUrl());
             evtSource.onopen = () => {
+                lastStreamActivity = Date.now();
                 streamStatusEl.className = 'conn live';
                 streamStatusText.textContent = 'Live';
             };
@@ -3623,6 +3624,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             evtSource.onerror = () => {
                 streamStatusEl.className = 'conn reconnecting';
                 streamStatusText.textContent = 'Reconnecting…';
+                // A rejected reconnect (e.g. while Home Assistant renews the
+                // ingress session) makes the browser give up for good: retry
+                const source = evtSource;
+                if (source.readyState === EventSource.CLOSED) {
+                    setTimeout(() => {
+                        if (evtSource !== source) return;
+                        connectStream();
+                        loadMessagesList();
+                    }, 5000);
+                }
             };
         }
 

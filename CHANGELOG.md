@@ -6,7 +6,7 @@
 - Tab and filter labels are centred exactly.
 - The sound, speech, auto-focus and theme buttons form one group in the tab style; enabled ones are highlighted.
 - On screens up to 1400 px wide the sensor filter is a dropdown instead of a row of buttons.
-- The live feed no longer freezes when the connection is silently dropped (e.g. overnight): the add-on sends a heartbeat and the dashboard reconnects by itself when it stops hearing from it.
+- The live feed no longer freezes when the connection is silently dropped (e.g. overnight): the add-on sends a heartbeat and the dashboard reconnects by itself when it stops hearing from it. A rejected reconnect (shown as a lasting "Reconnecting…") is retried after 5 seconds.
 - Loading the message list retries before showing "Failed to load messages", which now includes the reason.
 - Fits smaller screens (1280–1400 px wide, up to 800 px high): compact top bar, slimmer Console side column, shorter Wallboard ticker.
 
