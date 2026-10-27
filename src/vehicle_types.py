@@ -191,9 +191,14 @@ STOCK_IMAGES: dict[str, dict[str, str]] = {
         "source": "https://commons.wikimedia.org/wiki/File:Lifeliner_2_na_een_inzet.jpg",
     },
     "reddingboot": {
-        "author": "kees torn",
-        "license": "CC BY-SA 2.0",
-        "source": "https://commons.wikimedia.org/wiki/File:Open_dag_KNRM_Hoek_van_Holland_30-4-2016._(26126938383).jpg",
+        "author": "Joost J. Bakker IJmuiden",
+        "license": "CC BY 2.0",
+        "source": "https://commons.wikimedia.org/wiki/File:KNRM_Christien.jpg",
+    },
+    "dienstbus": {
+        "author": "Alf van Beem",
+        "license": "CC0",
+        "source": "https://commons.wikimedia.org/wiki/File:VW_Brandweer_35-GTK-7_Zwanenburg.JPG",
     },
     "politie": {
         "author": "Joost J. Bakker",
@@ -226,9 +231,9 @@ CATEGORY_STOCK_IMAGES: dict[str, str] = {
 # The type digit tells the kind of vehicle even when the abbreviation doesn't.
 _FIRE_NUMBER_RE = re.compile(r"^\d{2}-\d{2}(\d)\d$")
 FIRE_TYPE_STOCK_IMAGES: dict[str, str] = {
-    "0": "officier",  # Personenvervoer (dienstauto, dienstbus)
+    "0": "dienstbus",  # Personenvervoer (dienstauto, dienstbus)
     "1": "waterongevallen",  # Waterongevallen
-    "2": "hulpverlening",  # Ongeval gevaarlijke stoffen
+    "2": "dienstbus",  # Ongeval gevaarlijke stoffen (mostly vans: WVD, AGS, meetploeg)
     "3": "tankautospuit",  # Tankautospuit
     "4": "tankautospuit",  # TS voor bos/duinbrandbestrijding
     "5": "ladder",  # Redmaterieel (autoladder, hoogwerker)

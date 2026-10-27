@@ -16,5 +16,6 @@ Edited versions of CC BY-SA photos are shared under the same licence.
 | `officier.webp` | Alf van Beem | Public domain | [Commons](https://commons.wikimedia.org/wiki/File:Nissan_Brandweer_Kennemerland_Officier_van_Dienst_unit_12-1293_foto_2.JPG) |
 | `ambulance.webp` | Joost J. Bakker IJmuiden | CC BY 2.0 | [Commons](https://commons.wikimedia.org/wiki/File:Kennemerland_Mercedes_Benz_Sprinter_Ambulance_12-511.jpg) |
 | `helikopter.webp` | BoasB112 | CC BY-SA 4.0 | [Commons](https://commons.wikimedia.org/wiki/File:Lifeliner_2_na_een_inzet.jpg) |
-| `reddingboot.webp` | kees torn | CC BY-SA 2.0 | [Commons](https://commons.wikimedia.org/wiki/File:Open_dag_KNRM_Hoek_van_Holland_30-4-2016._(26126938383).jpg) |
+| `reddingboot.webp` | Joost J. Bakker IJmuiden | CC BY 2.0 | [Commons](https://commons.wikimedia.org/wiki/File:KNRM_Christien.jpg) |
+| `dienstbus.webp` | Alf van Beem | CC0 | [Commons](https://commons.wikimedia.org/wiki/File:VW_Brandweer_35-GTK-7_Zwanenburg.JPG) |
 | `politie.webp` | Joost J. Bakker | CC BY 2.0 | [Commons](https://commons.wikimedia.org/wiki/File:BMW_X1_Politie.jpg) |
