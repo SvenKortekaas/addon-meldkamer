@@ -34,7 +34,7 @@ MAX_PHOTO_SIZE = 5 * 1024 * 1024
 MAX_FORM_FIELD_SIZE = 4 * 1024
 PHOTO_MIME_TYPES = ("image/jpeg", "image/png", "image/webp", "image/gif")
 
-ADDON_VERSION = "1.2.4"
+ADDON_VERSION = "1.2.5"
 
 # The dashboard's map tiles come from Home Assistant's built-in map_tiles proxy:
 # browsers loading tiles straight from OpenStreetMap inside the ingress iframe
@@ -286,6 +286,8 @@ class WebUI:
         self.app.router.add_delete("/api/db/ignore_capcodes", self._handle_delete_all_ignore_capcodes)
 
         # Vehicle photos
+        self.app.router.add_get("/api/vehicle-stock", self._handle_resolve_stock_photo)
+        self.app.router.add_get("/api/vehicle-stock/{name}", self._handle_get_stock_photo)
         self.app.router.add_get("/api/vehicle-photo/{key_type}/{key_value}", self._handle_get_vehicle_photo)
         self.app.router.add_post("/api/vehicle-photo", self._handle_set_vehicle_photo)
         self.app.router.add_delete("/api/vehicle-photo/{key_type}/{key_value}", self._handle_delete_vehicle_photo)
@@ -1171,6 +1173,23 @@ class WebUI:
             headers={"Cache-Control": f"private, max-age={MAP_TILE_MAX_AGE}"},
         )
 
+    async def _handle_resolve_stock_photo(self, request: web.Request) -> web.Response:
+        """Which bundled stock photo fits a vehicle (?category=&number=), with its credit."""
+        name = vehicle_types.stock_image_for(request.query.get("category", ""), request.query.get("number", ""))
+        if not name:
+            return web.json_response({"error": "Not found"}, status=404)
+        return web.json_response({"name": name, **vehicle_types.STOCK_IMAGES[name]})
+
+    async def _handle_get_stock_photo(self, request: web.Request) -> web.Response:
+        """Serve a bundled stock photo."""
+        name = request.match_info.get("name", "")
+        if name not in vehicle_types.STOCK_IMAGES:
+            return web.json_response({"error": "Not found"}, status=404)
+        return web.FileResponse(
+            Path(vehicle_types.STOCK_IMAGES_DIR) / f"{name}.webp",
+            headers={"Content-Type": "image/webp", "Cache-Control": "public, max-age=86400"},
+        )
+
     async def _handle_get_vehicle_photo(self, request: web.Request) -> web.Response:
         """Serve a stored vehicle photo's raw image bytes."""
         key_type = request.match_info.get("key_type", "")
@@ -1629,6 +1648,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
         .vehicle-visual:hover { opacity: 0.85; }
         .vehicle-visual img { width: 100%; height: 100%; object-fit: cover; }
+        /* Stock photos are cut out: show the whole vehicle on the slot's background */
+        .vehicle-visual img.stock { object-fit: contain; padding: 6px; }
+        .vehicle-credit { font-size: 10px; color: var(--secondary-text-color); margin-top: -2px; }
+        .vehicle-credit[hidden] { display: none; }
+        .vehicle-credit a { color: inherit; }
         .vehicle-category-label { font-size: 12px; font-weight: 600; }
         .vehicle-number-label { font-size: 11px; color: var(--secondary-text-color); font-family: var(--mono); }
         .vehicle-side .btn { justify-content: center; padding: 4px 10px; font-size: 11.5px; }
@@ -3023,6 +3047,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     <div class="vehicle-visual" id="vehicle-visual"${category ? ' onclick="openVehiclePhotoUpload()"' : ''}>
                         <span id="vehicle-icon-fallback">${escapeHtml(msg.vehicle_icon || '📻')}</span>
                     </div>
+                    <div class="vehicle-credit" id="vehicle-credit" hidden></div>
                     <div class="vehicle-category-label">${escapeHtml(category ? prettyVehicleCategory(category) : 'Unknown unit')}</div>
                     ${msg.vehicle_number ? `<div class="vehicle-number-label">${escapeHtml(msg.vehicle_number)}</div>` : ''}
                     ${category ? '<button class="btn" onclick="openVehiclePhotoUpload()">Change photo</button>' : ''}
@@ -3151,11 +3176,39 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             return `${basePath}api/vehicle-photo/${keyType}/${encodeURIComponent(keyValue)}`;
         }
 
+        // Shows the bundled stock photo for the vehicle type, with its credit;
+        // keeps the emoji fallback when there's none
+        async function loadStockVehiclePhoto(msg, visual, fallback, credit) {
+            const query = new URLSearchParams({category: msg.vehicle_category || '', number: msg.vehicle_number || ''});
+            let stock;
+            try {
+                const response = await fetch(`${basePath}api/vehicle-stock?${query}`);
+                if (!response.ok) return;
+                stock = await response.json();
+            } catch (e) {
+                return;
+            }
+            const img = new Image();
+            img.onload = () => {
+                fallback.style.display = 'none';
+                img.alt = prettyVehicleCategory(msg.vehicle_category);
+                img.className = 'stock';
+                visual.appendChild(img);
+                if (credit) {
+                    credit.innerHTML = `Photo: <a href="${escapeHtml(stock.source)}" target="_blank" rel="noopener">${escapeHtml(stock.author)}</a>, ${escapeHtml(stock.license)}`;
+                    credit.hidden = false;
+                }
+            };
+            img.src = `${basePath}api/vehicle-stock/${encodeURIComponent(stock.name)}`;
+        }
+
         // Tries the exact vehicle number photo first, falls back to the category
-        // photo, and finally leaves the emoji fallback showing.
+        // photo, then the bundled stock photo, and finally leaves the emoji
+        // fallback showing.
         function loadVehiclePhoto(msg) {
             const visual = document.getElementById('vehicle-visual');
             const fallback = document.getElementById('vehicle-icon-fallback');
+            const credit = document.getElementById('vehicle-credit');
             if (!visual || !fallback) return;
 
             const tryUrls = [];
@@ -3163,7 +3216,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             if (msg.vehicle_category) tryUrls.push(['category', msg.vehicle_category]);
 
             const attempt = (i) => {
-                if (i >= tryUrls.length) return; // nothing found, keep the emoji fallback
+                if (i >= tryUrls.length) {
+                    loadStockVehiclePhoto(msg, visual, fallback, credit);
+                    return;
+                }
                 const [keyType, keyValue] = tryUrls[i];
                 const img = new Image();
                 img.onload = () => {
