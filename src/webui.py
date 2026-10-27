@@ -34,13 +34,16 @@ MAX_PHOTO_SIZE = 5 * 1024 * 1024
 MAX_FORM_FIELD_SIZE = 4 * 1024
 PHOTO_MIME_TYPES = ("image/jpeg", "image/png", "image/webp", "image/gif")
 
-ADDON_VERSION = "1.2.2"
+ADDON_VERSION = "1.2.3"
 
 # The dashboard's map tiles come from Home Assistant's built-in map_tiles proxy:
 # browsers loading tiles straight from OpenStreetMap inside the ingress iframe
 # get 403 "Access blocked", and core identifies its requests the way OSM's
 # tile usage policy requires.
 MAP_MAX_ZOOM = 19
+# Seconds between live-stream heartbeats while nothing changes, so the
+# dashboard can tell a quiet feed from a dropped connection
+STREAM_HEARTBEAT = 15
 # OSM asks consumers to cache tiles for at least a week
 MAP_TILE_MAX_AGE = 7 * 24 * 60 * 60
 
@@ -438,15 +441,20 @@ class WebUI:
         await response.prepare(request)
         sensor_name = request.query.get("sensor", "")
         last_sent = None
+        last_write = time.monotonic()
         try:
             while True:
                 latest = self._filter_by_sensor(list(self.messages), sensor_name)[:50]
                 data = json.dumps({"stats": self._stats_payload(), "latest": self._with_fresh_abbreviations(latest)})
-                # Only push when something changed; the client recomputes
-                # uptime locally so idle periods need no traffic
+                # Only push when something changed (the client recomputes uptime
+                # locally), with a heartbeat in between
                 if data != last_sent:
                     await response.write(f"data: {data}\n\n".encode())
                     last_sent = data
+                    last_write = time.monotonic()
+                elif time.monotonic() - last_write >= STREAM_HEARTBEAT:
+                    await response.write(b"event: ping\ndata: {}\n\n")
+                    last_write = time.monotonic()
                 await asyncio.sleep(2)
         except (ConnectionResetError, TimeoutError, asyncio.CancelledError):
             pass
@@ -1360,7 +1368,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
         .topbar > * { flex-shrink: 0; }
         @media (max-width: 1600px) { .brand-sub { display: none; } }
-        @media (max-width: 1360px) { .kpis .kpi-extra { display: none; } }
         .brand { display: flex; align-items: center; gap: 8px; }
         .brand svg { width: 20px; height: 20px; color: var(--primary-color); }
         .brand-name { font-weight: 600; letter-spacing: 0.04em; }
@@ -1369,6 +1376,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .tabs { display: flex; gap: 2px; padding: 2px; border-radius: 6px; background: var(--ha-background); border: var(--card-border); }
         .tab {
             height: 28px; padding: 0 12px; border: none; border-radius: 4px; cursor: pointer;
+            display: inline-flex; align-items: center; justify-content: center; line-height: 1; white-space: nowrap;
             background: transparent; color: var(--secondary-text-color); font-size: 12.5px; font-weight: 500;
         }
         .tab:hover { color: var(--primary-text-color); }
@@ -1384,23 +1392,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .rx.stopped { color: var(--danger-color); }
         .spacer { flex: 1; }
 
-        /* Sensor filter: a segmented control like the view tabs */
-        .topbar > .filter-pills {
-            flex-shrink: 1; min-width: 0; display: flex; align-items: center; gap: 2px; padding: 2px;
-            border-radius: 6px; background: var(--ha-background); border: 1px solid var(--primary-color);
-            overflow-x: auto; scrollbar-width: none;
+        /* Sensor filter: the view tabs' segmented control, scrolling sideways when space runs out */
+        .topbar > .filter-tabs { flex-shrink: 1; min-width: 0; align-items: center; overflow-x: auto; scrollbar-width: none; }
+        .topbar > .filter-tabs:empty { display: none; }
+        /* On narrower screens the sensor buttons become a dropdown */
+        .filter-select {
+            display: none; height: 28px; padding: 0 6px 0 10px; border: 0; border-radius: 4px; cursor: pointer;
+            background: var(--primary-color); color: #fff; font: inherit; font-size: 12.5px; font-weight: 500;
         }
-        .topbar > .filter-pills:empty { display: none; }
+        .filter-select option { background: var(--ha-card-background); color: var(--primary-text-color); }
+        .icon-tab { width: 32px; padding: 0; font-size: 14px; }
+        .icon-tab.off { opacity: 0.45; }
         .filter-label {
-            padding: 0 8px 0 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.07em;
-            text-transform: uppercase; color: var(--primary-color);
+            padding: 0 8px 0 8px; font-size: 11px; font-weight: 600; letter-spacing: 0.07em;
+            text-transform: uppercase; color: var(--secondary-text-color);
         }
-        .sensor-filter-pill {
-            height: 28px; padding: 0 12px; border: none; border-radius: 4px; cursor: pointer;
-            background: transparent; color: var(--primary-text-color); font-size: 12.5px; font-weight: 500;
-        }
-        .sensor-filter-pill:hover { background: var(--hover-bg); }
-        .sensor-filter-pill.active { background: var(--primary-color); color: #fff; }
 
         .icon-btn {
             width: 28px; height: 28px; border-radius: 4px; border: var(--card-border);
@@ -1830,6 +1836,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .db-card-count span { font-family: var(--mono); color: var(--primary-text-color); font-size: 15px; font-weight: 500; }
         .db-card-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: auto; }
 
+        /* Smaller screens (laptops, 1280-1400 px wide or up to 800 px high) */
+        @media (max-width: 1400px) {
+            .brand-name, .kpis .kpi-extra, .sensor-filter-pill { display: none; }
+            .filter-select { display: block; }
+            .clock { font-size: 18px; }
+            .console { grid-template-columns: minmax(0, 1fr) var(--console-side, minmax(460px, 40%)); }
+            .feed-head, .feed-row { grid-template-columns: 62px 42px minmax(0, 96px) minmax(160px, 1fr) minmax(0, 150px); }
+            .feed-head .unit, .feed-row .unit { display: none; }
+        }
+        @media (max-height: 800px) {
+            .ticker { height: 108px; }
+            .tick { padding: 10px 14px; gap: 5px; }
+            .tick .text { font-size: 14px; -webkit-line-clamp: 2; }
+        }
         @media (max-width: 1200px) {
             .console { grid-template-columns: minmax(0, 1fr) var(--console-side, 420px); }
             .lanes { grid-template-columns: repeat(4, minmax(0, 1fr)) var(--lanes-side, 380px); }
@@ -1872,19 +1892,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <span class="kpi-extra">INCIDENTS <b id="kpi-incidents">0</b></span>
         </div>
         <span class="spacer"></span>
-        <div id="sensor-filter-bar" class="filter-pills" aria-label="Feed filter"></div>
-        <button id="sound-toggle" class="icon-btn" onclick="toggleSound()" title="Toggle notification sound">
-            <span id="sound-icon">🔔</span>
-        </button>
-        <button id="tts-toggle" class="icon-btn off" onclick="toggleTts()" title="Toggle speech output">
-            <span id="tts-icon">🔇</span>
-        </button>
-        <button id="automap-toggle" class="icon-btn" onclick="toggleAutoMap()" title="Auto-show new messages on map">
-            <span id="automap-icon">📍</span>
-        </button>
-        <button id="theme-toggle" class="icon-btn" onclick="cycleTheme()" title="Theme">
-            <span id="theme-icon">🌓</span>
-        </button>
+        <div id="sensor-filter-bar" class="tabs filter-tabs" aria-label="Feed filter"></div>
+        <div class="tabs" role="group" aria-label="Sound, speech, map focus and theme">
+            <button type="button" id="sound-toggle" class="tab icon-tab" onclick="toggleSound()" title="Toggle notification sound">
+                <span id="sound-icon">🔔</span>
+            </button>
+            <button type="button" id="tts-toggle" class="tab icon-tab" onclick="toggleTts()" title="Toggle speech output">
+                <span id="tts-icon">🔇</span>
+            </button>
+            <button type="button" id="automap-toggle" class="tab icon-tab" onclick="toggleAutoMap()" title="Auto-show new messages on map">
+                <span id="automap-icon">📍</span>
+            </button>
+            <button type="button" id="theme-toggle" class="tab icon-tab" onclick="cycleTheme()" title="Theme">
+                <span id="theme-icon">🌓</span>
+            </button>
+        </div>
         <span id="clock" class="clock"></span>
     </header>
 
@@ -2490,6 +2512,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         function initSoundToggle() {
             const btn = document.getElementById('sound-toggle');
             const icon = document.getElementById('sound-icon');
+            btn.classList.toggle('active', soundEnabled);
             btn.classList.toggle('off', !soundEnabled);
             icon.textContent = soundEnabled ? '🔔' : '🔕';
             btn.title = soundEnabled ? 'Sound notifications ON - click to disable' : 'Sound notifications OFF - click to enable';
@@ -2549,6 +2572,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         function initAutoMapToggle() {
             const btn = document.getElementById('automap-toggle');
             const icon = document.getElementById('automap-icon');
+            btn.classList.toggle('active', autoMapEnabled);
             btn.classList.toggle('off', !autoMapEnabled);
             icon.textContent = autoMapEnabled ? '📍' : '📌';
             btn.title = autoMapEnabled ? 'Auto-focus ON - new messages show on map' : 'Auto-focus OFF - click to enable';
@@ -2577,6 +2601,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         function initTtsToggle() {
             const btn = document.getElementById('tts-toggle');
             const icon = document.getElementById('tts-icon');
+            btn.classList.toggle('active', ttsEnabled);
             btn.classList.toggle('off', !ttsEnabled);
             icon.textContent = ttsEnabled ? '🗣️' : '🔇';
             btn.title = ttsEnabled ? 'Speech ON - new messages are read aloud' : 'Speech OFF - click to enable';
@@ -2671,7 +2696,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         let activeView = 'console';
 
         function switchTab(tabName) {
-            document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tabName));
+            document.querySelectorAll('.tab[data-tab]').forEach(t => t.classList.toggle('active', t.dataset.tab === tabName));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === 'tab-' + tabName));
             localStorage.setItem('p2000_tab', tabName);
             if (tabName === 'info' || tabName === 'settings') loadReceiver();
@@ -3576,25 +3601,63 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             return basePath + 'api/stream' + (currentSensorFilter ? `?sensor=${encodeURIComponent(currentSensorFilter)}` : '');
         }
 
+        // The server sends data or a heartbeat at least every 15 s. When nothing
+        // arrives for longer, the connection was dropped without the browser
+        // noticing (e.g. by the ingress proxy): reconnect and reload.
+        const STREAM_TIMEOUT_MS = 45000;
+        let lastStreamActivity = Date.now();
+
         function connectStream() {
             if (evtSource) evtSource.close();
+            lastStreamActivity = Date.now();
             evtSource = new EventSource(streamUrl());
             evtSource.onopen = () => {
+                lastStreamActivity = Date.now();
                 streamStatusEl.className = 'conn live';
                 streamStatusText.textContent = 'Live';
             };
-            evtSource.onmessage = (e) => update(JSON.parse(e.data));
+            evtSource.onmessage = (e) => {
+                lastStreamActivity = Date.now();
+                update(JSON.parse(e.data));
+            };
+            evtSource.addEventListener('ping', () => { lastStreamActivity = Date.now(); });
             evtSource.onerror = () => {
                 streamStatusEl.className = 'conn reconnecting';
                 streamStatusText.textContent = 'Reconnecting…';
+                // A rejected reconnect (e.g. while Home Assistant renews the
+                // ingress session) makes the browser give up for good: retry
+                const source = evtSource;
+                if (source.readyState === EventSource.CLOSED) {
+                    setTimeout(() => {
+                        if (evtSource !== source) return;
+                        connectStream();
+                        loadMessagesList();
+                    }, 5000);
+                }
             };
         }
 
-        function loadMessagesList() {
+        setInterval(() => {
+            if (evtSource && Date.now() - lastStreamActivity > STREAM_TIMEOUT_MS) {
+                connectStream();
+                loadMessagesList();
+            }
+        }, 15000);
+
+        // A failure right after waking up is usually Home Assistant's ingress
+        // session being renewed: retry a few times before reporting it
+        function loadMessagesList(attempt = 1) {
             const url = basePath + 'api/messages' + (currentSensorFilter ? `?sensor=${encodeURIComponent(currentSensorFilter)}` : '');
-            fetch(url).then(r => r.json()).then(msgs => {
-                renderMessagesList((msgs || []).slice(0, 50));
-            }).catch(() => toast('Failed to load messages', 'error'));
+            fetch(url)
+                .then(r => {
+                    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                    return r.json();
+                })
+                .then(msgs => renderMessagesList(msgs.slice(0, 50)))
+                .catch(e => {
+                    if (attempt < 4) setTimeout(() => loadMessagesList(attempt + 1), attempt * 2000);
+                    else toast(`Failed to load messages (${e.message})`, 'error');
+                });
         }
 
         function clearSelectedMessage() {
@@ -3618,6 +3681,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             document.querySelectorAll('.sensor-filter-pill').forEach(el => {
                 el.classList.toggle('active', el.dataset.sensor === name);
             });
+            document.querySelector('.filter-select').value = name;
             lastMsgsSig = null;  // force re-render even if the next batch looks identical in size/timestamps
             clearSelectedMessage();
             connectStream();
@@ -3633,14 +3697,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     // the feed, so showing everything by default defeats that.
                     currentSensorFilter = '__any__';
                     const pills = [
-                        `<button type="button" class="sensor-filter-pill active" data-sensor="__any__">Sensors</button>`,
-                        `<button type="button" class="sensor-filter-pill" data-sensor="">All</button>`,
-                    ].concat(sensors.map(s => `<button type="button" class="sensor-filter-pill" data-sensor="${escapeHtml(s.name)}">${escapeHtml(s.name)}</button>`));
-                    bar.innerHTML = '<span class="filter-label">Filter</span>' + pills.join('');
+                        `<button type="button" class="tab sensor-filter-pill active" data-sensor="__any__">Sensors</button>`,
+                        `<button type="button" class="tab sensor-filter-pill" data-sensor="">All</button>`,
+                    ].concat(sensors.map(s => `<button type="button" class="tab sensor-filter-pill" data-sensor="${escapeHtml(s.name)}">${escapeHtml(s.name)}</button>`));
+                    const options = [['__any__', 'Sensors'], ['', 'All']].concat(sensors.map(s => [s.name, s.name]))
+                        .map(([value, label]) => `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`);
+                    bar.innerHTML = '<span class="filter-label">Filter</span>' + pills.join('')
+                        + `<select class="filter-select" aria-label="Feed filter">${options.join('')}</select>`;
                     bar.addEventListener('click', (e) => {
                         const pill = e.target.closest('.sensor-filter-pill');
                         if (pill) selectSensorFilter(pill.dataset.sensor);
                     });
+                    bar.querySelector('.filter-select').addEventListener('change', (e) => selectSensorFilter(e.target.value));
                 }
                 connectStream();
                 loadMessagesList();
