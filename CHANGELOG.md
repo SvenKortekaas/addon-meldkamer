@@ -1,11 +1,16 @@
 # Changelog
 
-## 1.2.5
+## 1.2.6
 
-- New **Vehicles** table (Settings → Database): what each vehicle number is (type and description). A vehicle only gets a type and photo when it's in this table or the message names its type ("TS 07-1782"); nothing is guessed from the number. Filled automatically from the capcode list (descriptions such as "TS 01-2632" or "Ambulance-07-101") and from messages that name a vehicle with its type; add, edit, export or import (CSV) your own.
+- New **Vehicles** table (Settings → Database): what each vehicle number is (type and description). A vehicle only gets a type and photo when it's in this table or the message names its type ("TS 07-1782"); the type is no longer derived from the number's digits (1.2.5 did that, and regions don't apply the numbering plan consistently). Filled automatically from the capcode list (descriptions such as "TS 01-2632" or "Ambulance-07-101") and from messages that name a vehicle with its type; add, edit, export or import (CSV) your own.
 - Vehicle numbers are now found in fire brigade messages: the alerted units at the end (e.g. "… Scheemda 013693 012933" → 01-3693, 01-2933). The message detail lists all units; the first one known in the Vehicles table is shown with its type and photo.
 - Messages from history show their vehicles too (they weren't stored, so they only showed on live messages); this works for all existing messages.
-- Real photos for known vehicle types without an uploaded photo: tankautospuit, autoladder/hoogwerker, hulpverlening, haakarm, schuimblus, waterongevallen, officier van dienst, dienstbus, ambulance, traumahelikopter, KNRM reddingboot and politie. Freely licensed photos from Wikimedia Commons, cut out with a "MELDKAMER" licence plate, credited under the photo (see `src/vehicle_images/CREDITS.md`). Your own uploaded photos (per vehicle number or category) still come first.
+
+## 1.2.5
+
+- Real photos for vehicles without an uploaded photo: tankautospuit, autoladder, hulpverlening, haakarm, schuimblus, waterongevallen, officier van dienst, dienstbus (also used for gevaarlijke stoffen units), ambulance, traumahelikopter, KNRM reddingboot and politie. Freely licensed photos from Wikimedia Commons, cut out (transparent background) with a "MELDKAMER" licence plate, credited under the photo (see `src/vehicle_images/CREDITS.md`).
+- Fire brigade numbers pick the photo from their type digit (Nationaal Nummerplan Brandweer: RR-KKTV, e.g. 11-0293 is type 9, an OvD car), so the right vehicle shows even when the message's abbreviation says otherwise.
+- Your own uploaded photos (per vehicle number or category) still come first.
 
 ## 1.2.4
 
