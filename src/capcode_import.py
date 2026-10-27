@@ -148,6 +148,9 @@ def import_all_capcodes(database) -> dict[str, Any]:
         )
 
         logger.info(f"Capcode import complete: {total_imported} imported, {total_skipped} skipped")
+        vehicles = database.learn_vehicles_from_capcodes()
+        if vehicles:
+            logger.info(f"Vehicles named in the capcode list: {vehicles} added")
 
     except Exception as e:
         logger.error(f"Capcode import failed: {e}")

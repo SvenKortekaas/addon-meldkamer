@@ -189,6 +189,17 @@ class Database:
         enabled INTEGER NOT NULL DEFAULT 1
     );
 
+    -- Known vehicles: what a vehicle number is. source = 'user' (added or
+    -- edited by hand or CSV import), 'capcode' (named in the capcode list)
+    -- or 'message' (named with its type in a message, e.g. "TS 07-1782").
+    -- Only 'user' rows are kept when the others are refreshed.
+    CREATE TABLE IF NOT EXISTS vehicles (
+        number TEXT PRIMARY KEY,
+        category TEXT NOT NULL DEFAULT '',
+        description TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL DEFAULT 'user'
+    );
+
     -- User-uploaded vehicle photos, keyed by exact vehicle number ('number')
     -- or by broad category ('category', e.g. "ambulance") as a fallback.
     CREATE TABLE IF NOT EXISTS vehicle_photos (
@@ -208,10 +219,13 @@ class Database:
         self._lock = threading.RLock()
         self._cursors = {}
         self._text_caches = {}
+        self._vehicle_cache: dict[str, dict] | None = None
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self.conn = _LockedConnection(self._conn, self._lock)
         self._migrate_schema()
+        # Capcodes imported before the vehicles table existed
+        self.learn_vehicles_from_capcodes()
 
     @property
     def cursor(self) -> _LockedCursor:
@@ -962,8 +976,7 @@ class Database:
             d["capcodes"] = []
         # Not stored: recognised from the text, so older rows get them too
         if "body" in d:
-            d["vehicle_category"], d["vehicle_number"] = vehicle_types.vehicle_info(d["body"], d.get("discipline") or "")
-            d["vehicle_icon"] = vehicle_types.icon_for(d["vehicle_category"])
+            d.update(self.resolve_vehicle(d["body"] or "", d.get("discipline") or ""))
         return d
 
     def list_messages(
@@ -2065,6 +2078,145 @@ class Database:
             logger.error(f"Failed to list vehicle photos: {e}")
             return {"items": [], "total": 0, "page": 1, "per_page": per_page, "pages": 0}
 
+    # =========================================================================
+    # VEHICLES (vehicle number -> what it is)
+    # =========================================================================
+
+    def _known_vehicles(self) -> dict[str, dict]:
+        """All known vehicles by number (cached; messages look them up per row)."""
+        if self._vehicle_cache is None:
+            self.cursor.execute("SELECT number, category, description FROM vehicles")
+            self._vehicle_cache = {row["number"]: dict(row) for row in self.cursor.fetchall()}
+        return self._vehicle_cache
+
+    def resolve_vehicle(self, text: str, discipline: str = "", abbreviations: list | None = None) -> dict:
+        """A message's vehicle fields (see vehicle_types.resolve_vehicle)."""
+        return vehicle_types.resolve_vehicle(text, discipline, abbreviations, self._known_vehicles())
+
+    def list_vehicles(self, page: int = 1, per_page: int = 50, search: str = "") -> dict:
+        """List known vehicles with pagination and search."""
+        try:
+            where = ""
+            params = []
+            if search:
+                where = "WHERE number LIKE ? OR category LIKE ? OR description LIKE ?"
+                params = [f"%{search}%"] * 3
+            self.cursor.execute(f"SELECT COUNT(*) FROM vehicles {where}", params)
+            total = self.cursor.fetchone()[0]
+            offset = (page - 1) * per_page
+            self.cursor.execute(
+                f"SELECT number, category, description, source FROM vehicles {where} ORDER BY number LIMIT ? OFFSET ?",
+                [*params, per_page, offset],
+            )
+            items = [dict(row) for row in self.cursor.fetchall()]
+            return {"items": items, "total": total, "page": page, "per_page": per_page}
+        except Exception as e:
+            logger.error(f"Failed to list vehicles: {e}")
+            return {"items": [], "total": 0, "page": page, "per_page": per_page}
+
+    def set_vehicle(self, number: str, category: str = "", description: str = "") -> bool:
+        """Add or replace a vehicle by hand (source 'user', never overwritten by learning)."""
+        try:
+            self.cursor.execute(
+                "INSERT OR REPLACE INTO vehicles (number, category, description, source) VALUES (?, ?, ?, 'user')",
+                (number, category, description),
+            )
+            self._commit()
+            self._vehicle_cache = None
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set vehicle: {e}")
+            return False
+
+    def delete_vehicle(self, number: str) -> bool:
+        """Delete a vehicle by number."""
+        try:
+            self.cursor.execute("DELETE FROM vehicles WHERE number = ?", (number,))
+            self._commit()
+            self._vehicle_cache = None
+            return self.cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Failed to delete vehicle: {e}")
+            return False
+
+    def learn_vehicles(self, vehicles: list[tuple[str, str, str]], source: str) -> int:
+        """Store (number, category, description) seen in real data; existing rows are kept.
+
+        Only complete numbers ("RR-NNNN", "RR-NNN") - short local numbers like
+        "TS 303" can't be matched to the numbers in messages.
+        """
+        count = 0
+        try:
+            with self._transaction() as conn:
+                for number, category, description in vehicles:
+                    if not vehicle_types.is_full_number(number):
+                        continue
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO vehicles (number, category, description, source) VALUES (?, ?, ?, ?)",
+                        (number, category, description, source),
+                    )
+                    count += cur.rowcount
+        except Exception as e:
+            logger.error(f"Failed to store vehicles: {e}")
+            return 0
+        if count:
+            self._vehicle_cache = None
+        return count
+
+    def learn_vehicles_from_capcodes(self) -> int:
+        """Vehicles named in capcode descriptions, e.g. "TS 01-2632" or "OvD - 15-9591"."""
+        self.cursor.execute("SELECT description, region, location FROM capcodes WHERE description != ''")
+        found = []
+        for row in self.cursor.fetchall():
+            description = row["description"].strip()
+            place = " ".join(p.strip() for p in (row["region"], row["location"]) if p and p.strip())
+            # The type only where the description names it: a code right before
+            # the number ("TS 01-2632") or spelled out ("Ambulance-07-101")
+            named = dict(vehicle_types.named_vehicles(description))
+            spelled = vehicle_types.classify_description(description)
+            for number in vehicle_types.full_numbers(description):
+                category = named.get(number) or spelled
+                found.append((number, category, f"{description} ({place})" if place else description))
+        return self.learn_vehicles(found, "capcode")
+
+    def export_vehicles_csv(self) -> str:
+        """Export all vehicles to CSV string."""
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["number", "category", "description", "source"])
+        try:
+            self.cursor.execute("SELECT number, category, description, source FROM vehicles ORDER BY number")
+            for row in self.cursor.fetchall():
+                writer.writerow(list(row))
+        except Exception as e:
+            logger.error(f"Export vehicles failed: {e}")
+        return output.getvalue()
+
+    def import_vehicles_csv(self, csv_content: str, replace: bool = False) -> dict[str, int]:
+        """Import vehicles (number, category, description) from CSV as the user's own rows.
+
+        With replace=True all vehicles not in the CSV are removed. Raises
+        ValueError for invalid CSV; nothing is changed then.
+        """
+        rows = self._read_csv(csv_content, ("number",))
+        imported = 0
+        skipped = 0
+        with self._transaction() as conn:
+            if replace:
+                conn.execute("DELETE FROM vehicles")
+            for row in rows:
+                number = (row.get("number") or "").strip()
+                if not number:
+                    skipped += 1
+                    continue
+                conn.execute(
+                    "INSERT OR REPLACE INTO vehicles (number, category, description, source) VALUES (?, ?, ?, 'user')",
+                    (number, (row.get("category") or "").strip(), (row.get("description") or "").strip()),
+                )
+                imported += 1
+        self._vehicle_cache = None
+        return {"imported": imported, "skipped": skipped}
+
     def clear_table(self, table: str) -> int:
         """Delete all rows from a whitelisted table. Returns count deleted, -1 on error."""
         allowed = {
@@ -2078,6 +2230,7 @@ class Database:
             "ignore_text",
             "ignore_capcodes",
             "vehicle_photos",
+            "vehicles",
         }
         if table not in allowed:
             logger.warning(f"clear_table rejected for table: {table}")
@@ -2089,6 +2242,8 @@ class Database:
             self._commit()
             if table == "abbreviations":
                 self.invalidate_text_caches()
+            if table == "vehicles":
+                self._vehicle_cache = None
             logger.info(f"Cleared table {table}: {count} rows deleted")
             return count
         except Exception as e:

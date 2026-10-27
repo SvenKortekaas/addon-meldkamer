@@ -362,7 +362,13 @@ class Parser:
         """Best-effort vehicle/unit category and vehicle number, from a known abbreviation set."""
         if not msg.body:
             return
-        msg.vehicle_category, msg.vehicle_number = vehicle_types.vehicle_info(
-            msg.body, msg.discipline, msg.abbreviations
-        )
-        msg.vehicle_icon = vehicle_types.icon_for(msg.vehicle_category)
+        # Vehicles the message names with their type ("TS 07-1782") are real data: remember them
+        named = vehicle_types.named_vehicles(msg.body)
+        if named:
+            self.database.learn_vehicles([(number, category, "") for number, category in named], "message")
+        info = self.database.resolve_vehicle(msg.body, msg.discipline, msg.abbreviations)
+        msg.vehicle_category = info["vehicle_category"]
+        msg.vehicle_number = info["vehicle_number"]
+        msg.vehicle_units = info["vehicle_units"]
+        msg.vehicle_description = info["vehicle_description"]
+        msg.vehicle_icon = info["vehicle_icon"]

@@ -1,13 +1,11 @@
-"""Best-effort vehicle/unit classification and vehicle number extraction.
+"""Vehicle/unit recognition: vehicle numbers in a message and what they are.
 
-Maps the small set of vehicle-type abbreviations already in
-abbreviation_import.py to a broad category, used to pick a fallback icon and
-as a lookup key for user-uploaded vehicle photos (see database.py's
-vehicle_photos table). This is deliberately a coarse classification, not a
-decode of every vehicle. Per vehicle type there's a bundled, freely licensed
-stock photo (see STOCK_IMAGES), picked from the fire brigade number's type
-digit where there is one; user-uploaded photos keyed by the exact vehicle
-number or the category take precedence.
+What a vehicle is comes only from real data: the vehicles table (filled by
+the user, CSV import, the capcode list and messages that name a vehicle, like
+"TS 07-1782") or the type code the message itself names. Nothing is derived
+from the number. The broad category picks the fallback icon, a bundled stock
+photo (see STOCK_IMAGES) and is a lookup key for user-uploaded photos (see
+database.py's vehicle_photos table).
 """
 
 import os
@@ -51,6 +49,10 @@ VEHICLE_CATEGORIES: dict[str, str] = {
     "VZH": "brandweer_haakarmbak",
     "LHH": "brandweer_haakarmbak",
     "CHH": "brandweer_haakarmbak",
+    "HV": "brandweer_hulpverlening",
+    "OvD": "brandweer_officier",
+    "HOvD": "brandweer_officier",
+    "CvD": "brandweer_officier",
     # Police
     "POL": "politie",
     "AE": "politie",
@@ -92,9 +94,9 @@ DEFAULT_ICON = "📻"
 # Longer codes (AL-42, ...) are tried first so e.g. "AL-42" isn't matched as
 # bare "AL", and the dashed number form is tried before the bare-digits one.
 _VEHICLE_NUMBER_RE = re.compile(
-    r"\b(?:"
+    r"\b("
     + "|".join(re.escape(k) for k in sorted(VEHICLE_CATEGORIES, key=len, reverse=True))
-    + r")\s+(\d{2,4}-\d{3,4}|\d{3,6})\b"
+    + r")\s+(?:-\s+)?(\d{2,4}-\d{3,4}|\d{3,6})\b"
 )
 
 # Fallback for ambulance "ritmelding" messages that carry the vehicle number
@@ -111,8 +113,8 @@ _AMBULANCE_UNIT_RE = re.compile(r"\b(\d{2})(\d{3})\s*-\s*[A-Za-zÀ-ÿ'\-]+(?:\s+
 
 
 # Fire brigade messages end with the alerted units' numbers, dash omitted:
-# "P 1 BNN-01 Ongeval wegvervoer Stationsstraat Scheemda 013693 012933" is
-# 01-3693 (OvD) and 01-2933 (TS), see the Nationaal Nummerplan further down.
+# "P 1 BNN-01 Ongeval wegvervoer Stationsstraat Scheemda 013693 012933"
+# alerts 01-3693 and 01-2933.
 _TRAILING_UNITS_RE = re.compile(r"((?:\s+\d{6})+)\s*$")
 _FIRE_PRIORITY_RE = re.compile(r"^\s*(?:P\s?[123]|PRIO\s?[123])\b", re.IGNORECASE)
 
@@ -144,7 +146,7 @@ def is_fire_message(text: str, discipline: str = "") -> bool:
 
 
 def fire_units(text: str) -> list[str]:
-    """Unit numbers listed at the end of a fire brigade message, as "RR-KKTV"."""
+    """Unit numbers listed at the end of a fire brigade message, as "RR-NNNN"."""
     match = _TRAILING_UNITS_RE.search(text or "")
     if not match:
         return []
@@ -152,37 +154,105 @@ def fire_units(text: str) -> list[str]:
     return [f"{t[:2]}-{t[2:]}" for t in match.group(1).split() if 1 <= int(t[:2]) <= 25]
 
 
-def vehicle_info(text: str, discipline: str = "", abbreviations: list[dict[str, str]] | None = None) -> tuple[str, str]:
-    """(category, vehicle number) of the vehicle a message is about, "" where unknown."""
-    category = classify(abbreviations) if abbreviations is not None else classify_text(text)
-    number = extract_vehicle_number(text or "")
-    if not number and is_fire_message(text, discipline):
-        units = fire_units(text)
-        # Prefer an actual appliance over the officers' and crew cars (types 0 and 9)
-        number = next((u for u in units if u[5] not in "09"), units[0] if units else "")
-    if not category and _AMBULANCE_UNIT_RE.search(text or ""):
-        category = "ambulance"
-    # A fire brigade number's type digit is more specific than the message's abbreviation
-    match = _FIRE_NUMBER_RE.match(number)
-    if match and (not category or category.startswith("brandweer")):
-        category = FIRE_TYPE_CATEGORIES[match.group(1)]
-    return category, number
+_FULL_NUMBER_RE = re.compile(r"\b\d{2}-\d{3,4}\b")
+
+
+# Vehicle types written out in capcode descriptions ("Ambulance-07-101",
+# "Zorgambulance-07-401", "Reddingsboot 01-2616"); only unambiguous words
+_DESCRIPTION_CATEGORIES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"ambulance|sololance|rapid responder", re.IGNORECASE), "ambulance"),
+    (re.compile(r"\breddings?boot\b", re.IGNORECASE), "reddingboot"),
+]
+
+
+def classify_description(text: str) -> str:
+    """Vehicle category a capcode description spells out in words, "" if none."""
+    for pattern, category in _DESCRIPTION_CATEGORIES:
+        if pattern.search(text or ""):
+            return category
+    return ""
+
+
+def is_full_number(number: str) -> bool:
+    """Region-prefixed vehicle number, e.g. "11-0293" or ambulance "17-106"."""
+    return bool(_FULL_NUMBER_RE.fullmatch(number or ""))
+
+
+def full_numbers(text: str) -> list[str]:
+    """Region-prefixed vehicle numbers written in a text."""
+    return _FULL_NUMBER_RE.findall(text or "")
+
+
+def _normalize_number(number: str) -> str:
+    # Bare 5-digit ambulance numbers (e.g. "AMBU 18187") are RRNNN - the same
+    # 2-digit region + 3-digit sequence scheme as the "<RRNNN> - <plaats> Rit"
+    # format below, just written without a dash. Numbers that already contain
+    # a dash or aren't 5 digits are left as-is.
+    if "-" not in number and len(number) == 5:
+        return f"{number[:2]}-{number[2:]}"
+    return number
+
+
+def named_vehicles(text: str) -> list[tuple[str, str]]:
+    """(number, category) for each vehicle the text names with its type, e.g. "TS 07-1782"."""
+    return [
+        (_normalize_number(m.group(2)), VEHICLE_CATEGORIES[m.group(1)])
+        for m in _VEHICLE_NUMBER_RE.finditer(text or "")
+    ]
+
+
+def message_units(text: str, discipline: str = "") -> list[str]:
+    """All vehicle numbers in a message, in the order they appear."""
+    units = [number for number, _ in named_vehicles(text)]
+    match = _AMBULANCE_UNIT_RE.search(text or "")
+    if match:
+        units.append(f"{match.group(1)}-{match.group(2)}")
+    if is_fire_message(text, discipline):
+        units += fire_units(text)
+    return list(dict.fromkeys(units))
+
+
+def resolve_vehicle(
+    text: str,
+    discipline: str = "",
+    abbreviations: list[dict[str, str]] | None = None,
+    known: dict[str, dict] | None = None,
+) -> dict:
+    """The message's vehicle fields, from the vehicles table (`known`) and the text.
+
+    The shown vehicle is the first unit found in the vehicles table, else the
+    first unit the message names with its type, else the first unit (no type).
+    A message without any unit number keeps the type code it names, if any.
+    """
+    known = known or {}
+    units = message_units(text, discipline)
+    named = dict(named_vehicles(text))
+    number = next((u for u in units if u in known), "")
+    category = description = ""
+    if number:
+        category = known[number].get("category", "")
+        description = known[number].get("description", "")
+    elif named:
+        number = next(iter(named))
+        category = named[number]
+    elif units:
+        number = units[0]
+    else:
+        category = classify(abbreviations) if abbreviations is not None else classify_text(text)
+    return {
+        "vehicle_category": category,
+        "vehicle_number": number,
+        "vehicle_units": units,
+        "vehicle_description": description,
+        "vehicle_icon": icon_for(category),
+    }
 
 
 def extract_vehicle_number(text: str) -> str:
     """Extract a vehicle number following a known vehicle-type token, if present."""
-    match = _VEHICLE_NUMBER_RE.search(text)
-    if match:
-        number = match.group(1)
-        # Bare 5-digit ambulance numbers (e.g. "AMBU 18187") are RRNNN - the
-        # same 2-digit region + 3-digit sequence scheme confirmed for the
-        # "<RRNNN> - <plaats> Rit <ritnummer>" format below, just written
-        # without a dash here. Reformat for consistency. Numbers that already
-        # contain a dash (fire brigade "RR-XXXX") or aren't 5 digits are left
-        # as-is - unverified for those cases.
-        if "-" not in number and len(number) == 5:
-            number = f"{number[:2]}-{number[2:]}"
-        return number
+    named = named_vehicles(text)
+    if named:
+        return named[0][0]
     match = _AMBULANCE_UNIT_RE.search(text)
     if match:
         return f"{match.group(1)}-{match.group(2)}"
@@ -284,45 +354,6 @@ CATEGORY_STOCK_IMAGES: dict[str, str] = {
     "reddingboot": "reddingboot",
 }
 
-# Fire brigade vehicle numbers follow the Nationaal Nummerplan Brandweer
-# Nederland: RR-KKTV = region, station, type of equipment, sequence number.
-# The type digit tells the kind of vehicle even when the abbreviation doesn't.
-_FIRE_NUMBER_RE = re.compile(r"^\d{2}-\d{2}(\d)\d$")
-FIRE_TYPE_STOCK_IMAGES: dict[str, str] = {
-    "0": "dienstbus",  # Personenvervoer (dienstauto, dienstbus)
-    "1": "waterongevallen",  # Waterongevallen
-    "2": "dienstbus",  # Ongeval gevaarlijke stoffen (mostly vans: WVD, AGS, meetploeg)
-    "3": "tankautospuit",  # Tankautospuit
-    "4": "tankautospuit",  # TS voor bos/duinbrandbestrijding
-    "5": "ladder",  # Redmaterieel (autoladder, hoogwerker)
-    "6": "schuimblus",  # Bijzonder brandbestrijdingsmaterieel
-    "7": "hulpverlening",  # Hulpverleningsmaterieel
-    "8": "haakarm",  # Overig materieel (haakarm, kraan)
-    "9": "officier",  # Staf- en commandomaterieel (OvD, HOvD, CvD)
-}
-
-# Type digit -> vehicle category, for fire units named only by their number
-FIRE_TYPE_CATEGORIES: dict[str, str] = {
-    "0": "brandweer_dienstbus",
-    "1": "brandweer_waterongevallen",
-    "2": "brandweer_ogs",
-    "3": "brandweer_tankautospuit",
-    "4": "brandweer_tankautospuit",
-    "5": "brandweer_ladder",
-    "6": "brandweer_schuimblus",
-    "7": "brandweer_hulpverlening",
-    "8": "brandweer_haakarmbak",
-    "9": "brandweer_officier",
-}
-
-
-def stock_image_for(category: str, number: str) -> str:
-    """Name of the bundled photo for a vehicle ("" if none fits).
-
-    A fire brigade number's type digit is more specific than the category,
-    which only reflects the abbreviation in the message.
-    """
-    match = _FIRE_NUMBER_RE.match(number or "")
-    if match and (category or "").startswith("brandweer"):
-        return FIRE_TYPE_STOCK_IMAGES[match.group(1)]
+def stock_image_for(category: str) -> str:
+    """Name of the bundled photo for a vehicle category ("" if none fits)."""
     return CATEGORY_STOCK_IMAGES.get(category, "")
