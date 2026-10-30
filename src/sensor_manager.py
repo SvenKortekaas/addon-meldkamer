@@ -14,6 +14,10 @@ logger = logging.getLogger(__name__)
 # Priority filter entries: optional P/A/B/PRIO prefix + digit ("P1", "a 1", "PRIO 2", "1")
 _PRIORITY_ENTRY_RE = re.compile(r"^(PRIO|P|A|B)?\s*([0-9])$", re.IGNORECASE)
 
+# A street can lie a few km from its city's centre: a message placed at its city's
+# centre may still match a zone filter up to this far outside the zone's radius
+POSSIBLE_ZONE_MARGIN_KM = 2
+
 
 def slugify(value: str) -> str:
     """Reduce a string to a valid HA object id: [a-z0-9_], no leading/trailing/double underscores.
@@ -108,10 +112,11 @@ class SensorManager:
             logger.debug(f"Message matched sensor: {sensor.entity_id}")
         return matching
 
-    def matches(self, msg: P2000Message, sensor: SensorConfig, zone_margin_km: float = 0) -> bool:
+    def matches(self, msg: P2000Message, sensor: SensorConfig, possible: bool = False) -> bool:
         """Check if message matches all filter criteria (AND logic).
 
-        zone_margin_km widens zone filters, for messages placed only at their city's centre.
+        possible: whether it may match once geocoded (the message is at most at its city's
+        centre) - zone filters then get POSSIBLE_ZONE_MARGIN_KM extra, and pass without coordinates.
         """
         filters = sensor.filters
 
@@ -156,8 +161,13 @@ class SensorManager:
 
         # Zone filter: inside the zone's radius (never matches until the zone is read from HA)
         if filters.zone:
+            if sensor.zone is None:
+                return False
             distance = self.zone_distance(msg, sensor)
-            if distance is None or distance > sensor.zone.radius_km + zone_margin_km:
+            if distance is None:
+                if not possible:
+                    return False
+            elif distance > sensor.zone.radius_km + (POSSIBLE_ZONE_MARGIN_KM if possible else 0):
                 return False
 
         # Text contains filter (case-insensitive)

@@ -34,7 +34,7 @@ MAX_PHOTO_SIZE = 5 * 1024 * 1024
 MAX_FORM_FIELD_SIZE = 4 * 1024
 PHOTO_MIME_TYPES = ("image/jpeg", "image/png", "image/webp", "image/gif")
 
-ADDON_VERSION = "1.2.8"
+ADDON_VERSION = "1.2.9"
 
 # The dashboard's map tiles come from Home Assistant's built-in map_tiles proxy:
 # browsers loading tiles straight from OpenStreetMap inside the ingress iframe
@@ -365,6 +365,8 @@ class WebUI:
             "geocoding_enabled": geocoder.enabled,
             "geocode_rate_remaining": geocoder.rate_remaining,
             "geocode_rate_limited": geocoder.rate_limited,
+            "geocode_only_sensor_matches": config.geocode_only_sensor_matches,
+            "geocode_skipped": self.processor.geocode_skipped,
             "sensor_zones": [
                 {
                     "name": s.name,
@@ -2015,6 +2017,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         <div class="info-row"><span class="info-label">Status</span><span class="info-value" id="info-status">-</span></div>
                         <div class="info-row"><span class="info-label">Geocoding</span><span class="info-value" id="info-geocoding">-</span></div>
                         <div class="info-row"><span class="info-label">OpenCage quota</span><span class="info-value" id="info-geocode-quota">-</span></div>
+                        <div class="info-row"><span class="info-label">OpenCage skipped</span><span class="info-value" id="info-geocode-skipped">-</span></div>
                     </div>
                 </div>
 
@@ -2950,6 +2953,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             set('geocode-quota', !(stats.geocoding_configured && stats.geocoding_enabled)
                 ? '-'
                 : (stats.geocode_rate_limited ? 'Exhausted - resets at midnight UTC' : stats.geocode_rate_remaining + ' left today'));
+            // Only with geocoding.only_sensor_matches: requests saved on messages no sensor matches
+            set('geocode-skipped', !(stats.geocoding_configured && stats.geocoding_enabled && stats.geocode_only_sensor_matches)
+                ? '-'
+                : stats.geocode_skipped + ' since start (no sensor match)');
             set('places', stats.db_places);
             set('streets', stats.db_streets);
             set('capcodes', stats.db_capcodes);

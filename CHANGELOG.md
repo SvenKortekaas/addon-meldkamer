@@ -2,7 +2,7 @@
 
 ## 1.2.9
 
-- New option `geocoding.only_sensor_matches` (default off): OpenCage is only asked for messages that match at least one sensor, so a busy receiver no longer uses up the free tier's daily quota. Other messages are placed at their city's centre, or at their street when it's already in the geocode cache. Zone filters are checked on the city centre with 2 km extra, so a street near the edge of a zone still gets geocoded.
+- New option `geocoding.only_sensor_matches` (default off): OpenCage is only asked for messages that match at least one sensor, so a busy receiver no longer uses up the free tier's daily quota. Other messages are placed at their city's centre, or at their street when it's already in the geocode cache. Zone filters are checked on the city centre with 2 km extra, so a street near the edge of a zone still gets geocoded. A message without city coordinates is always geocoded. The Info tab shows how many OpenCage requests were skipped.
 
 ## 1.2.8
 

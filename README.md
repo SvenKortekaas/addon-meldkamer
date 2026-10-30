@@ -196,7 +196,7 @@ The Info tab shows FLEX frames per minute for the last hour, messages per hour, 
 | ------ | ----------- |
 | `geocoding.enabled` | Enable/disable geocoding |
 | `geocoding.opencage_token` | OpenCage API key for address lookup |
-| `geocoding.only_sensor_matches` | Call OpenCage only for messages that match at least one sensor, to save the daily quota (default: `false`). Other messages are placed at their city's centre, or at a street already in the geocode cache. Zone filters count as a possible match up to 2 km outside the zone, since the message's street can lie that far from its city's centre |
+| `geocoding.only_sensor_matches` | Call OpenCage only for messages that match at least one sensor, to save the daily quota (default: `false`). Other messages are placed at their city's centre, or at a street already in the geocode cache. Zone filters count as a possible match up to 2 km outside the zone, since the message's street can lie that far from its city's centre; a message without city coordinates (city not in the Places table) is always geocoded. The Info tab shows how many OpenCage requests were skipped since the add-on started |
 
 ### Filters
 

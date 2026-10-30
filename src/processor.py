@@ -22,10 +22,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_IGNORE_TEXT = ["*TESTOPROEP*", "*MOB*"]
 
-# A street can lie a few km from its city's centre: with geocoding.only_sensor_matches,
-# a zone sensor counts as a possible match up to this far outside its radius
-CITY_ZONE_MARGIN_KM = 2
-
 
 class MessageProcessor:
     """Parse, filter, enrich, store and publish messages."""
@@ -47,6 +43,8 @@ class MessageProcessor:
 
         # Only enable geocoder if opencage is enabled and token is provided
         self.geocoder = Geocoder(config.opencage_token if config.opencage_enabled else "", database)
+        # OpenCage requests saved by geocoding.only_sensor_matches since start (Info tab)
+        self.geocode_skipped = 0
 
         self.home: Zone | None = None
         self.incidents = IncidentTracker(config.incident_window_minutes)
@@ -183,10 +181,8 @@ class MessageProcessor:
         # only_sensor_matches: spend an OpenCage request only on messages a sensor may
         # match, judged on the city-level coordinates (the cache is free, always used)
         use_api = not self.config.geocode_only_sensor_matches or any(
-            self.sensor_manager.matches(msg, sensor, CITY_ZONE_MARGIN_KM) for sensor in self.sensor_manager.sensors
+            self.sensor_manager.matches(msg, sensor, possible=True) for sensor in self.sensor_manager.sensors
         )
-        if not use_api:
-            logger.debug(f"No sensor match, geocoding from cache only: {msg.address}")
 
         # The OpenCage request is synchronous - run it off the event loop
         geo = await asyncio.to_thread(self.geocoder.geocode, msg.address, use_api)
@@ -195,4 +191,7 @@ class MessageProcessor:
             msg.longitude = geo["longitude"]
             msg.mapurl = geo["mapurl"]
             msg.location_accuracy = accuracy
+        elif not use_api:
+            self.geocode_skipped += 1
+            logger.debug(f"No sensor match, OpenCage skipped: {msg.address}")
         return self.geocoder.geocoded
