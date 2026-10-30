@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_IGNORE_TEXT = ["*TESTOPROEP*", "*MOB*"]
 
+# A street can lie a few km from its city's centre: with geocoding.only_sensor_matches,
+# a zone sensor counts as a possible match up to this far outside its radius
+CITY_ZONE_MARGIN_KM = 2
+
 
 class MessageProcessor:
     """Parse, filter, enrich, store and publish messages."""
@@ -163,22 +167,32 @@ class MessageProcessor:
 
     async def _locate(self, msg: P2000Message) -> bool:
         """Set the message's coordinates. Returns whether OpenCage geocoded it."""
-        geocoded = False
-        if msg.address and self.geocoder.enabled:
-            # The OpenCage request is synchronous - run it off the event loop
-            geo = await asyncio.to_thread(self.geocoder.geocode, msg.address)
-            geocoded = self.geocoder.geocoded
-            if geo:
-                msg.latitude = geo["latitude"]
-                msg.longitude = geo["longitude"]
-                msg.mapurl = geo["mapurl"]
-
+        accuracy = msg.location_accuracy
         # City-level coordinates from the local places database, so the map and
         # auto-focus also work with geocoding disabled or failed lookups
-        if msg.latitude is None and msg.city:
+        if msg.city:
             coords = self.database.get_place_coordinates(msg.city)
             if coords:
                 msg.latitude = coords["latitude"]
                 msg.longitude = coords["longitude"]
                 msg.location_accuracy = "city"
-        return geocoded
+
+        if not (msg.address and self.geocoder.enabled):
+            return False
+
+        # only_sensor_matches: spend an OpenCage request only on messages a sensor may
+        # match, judged on the city-level coordinates (the cache is free, always used)
+        use_api = not self.config.geocode_only_sensor_matches or any(
+            self.sensor_manager.matches(msg, sensor, CITY_ZONE_MARGIN_KM) for sensor in self.sensor_manager.sensors
+        )
+        if not use_api:
+            logger.debug(f"No sensor match, geocoding from cache only: {msg.address}")
+
+        # The OpenCage request is synchronous - run it off the event loop
+        geo = await asyncio.to_thread(self.geocoder.geocode, msg.address, use_api)
+        if geo:
+            msg.latitude = geo["latitude"]
+            msg.longitude = geo["longitude"]
+            msg.mapurl = geo["mapurl"]
+            msg.location_accuracy = accuracy
+        return self.geocoder.geocoded

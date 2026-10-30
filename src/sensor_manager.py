@@ -108,8 +108,11 @@ class SensorManager:
             logger.debug(f"Message matched sensor: {sensor.entity_id}")
         return matching
 
-    def matches(self, msg: P2000Message, sensor: SensorConfig) -> bool:
-        """Check if message matches all filter criteria (AND logic)."""
+    def matches(self, msg: P2000Message, sensor: SensorConfig, zone_margin_km: float = 0) -> bool:
+        """Check if message matches all filter criteria (AND logic).
+
+        zone_margin_km widens zone filters, for messages placed only at their city's centre.
+        """
         filters = sensor.filters
 
         # Discipline filter (msg.discipline may hold multiple, ", "-joined disciplines)
@@ -154,7 +157,7 @@ class SensorManager:
         # Zone filter: inside the zone's radius (never matches until the zone is read from HA)
         if filters.zone:
             distance = self.zone_distance(msg, sensor)
-            if distance is None or distance > sensor.zone.radius_km:
+            if distance is None or distance > sensor.zone.radius_km + zone_margin_km:
                 return False
 
         # Text contains filter (case-insensitive)

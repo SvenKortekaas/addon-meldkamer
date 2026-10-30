@@ -29,11 +29,11 @@ class Geocoder:
         self._rate_limited_on = None  # UTC date when the rate limit was hit
         self._backoff_until = 0.0  # monotonic time until which requests are paused (HTTP 429)
 
-    def geocode(self, address: str) -> dict | None:
+    def geocode(self, address: str, use_api: bool = True) -> dict | None:
         """
         Geocode an address. Returns dict with lat, lon, mapurl or None.
 
-        First checks database cache, then calls OpenCage API if needed.
+        First checks database cache, then calls OpenCage API if needed (and use_api).
         """
         logger.debug(f"Geocode request: enabled={self.enabled}, address='{address}'")
         self.geocoded = False
@@ -53,6 +53,9 @@ class Geocoder:
                 return {"latitude": lat, "longitude": lon, "mapurl": cached["mapurl"]}
             else:
                 logger.warning(f"Cached geocode outside Netherlands, ignoring: {lat}, {lon}")
+
+        if not use_api:
+            return None
 
         # Clear the rate limit flag if the daily quota has reset (midnight UTC)
         self._check_rate_limit_reset()

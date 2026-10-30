@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.9
+
+- New option `geocoding.only_sensor_matches` (default off): OpenCage is only asked for messages that match at least one sensor, so a busy receiver no longer uses up the free tier's daily quota. Other messages are placed at their city's centre, or at their street when it's already in the geocode cache. Zone filters are checked on the city centre with 2 km extra, so a street near the edge of a zone still gets geocoded.
+
 ## 1.2.8
 
 - "km from home" is only shown for messages with a street. A message naming just a city is placed at the city centre, so its distance was that of the centre (e.g. "3.9 km from home" for any Amsterdam message). Also for the `distance_km` attribute, and for messages already in the history.
